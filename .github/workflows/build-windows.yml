@@ -37,11 +37,19 @@ jobs:
           restore-keys: |
             rust-${{ runner.os }}-
 
+      - name: Cache Rinf CLI
+        id: cache-rinf
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/rinf.exe
+          key: rinf-cli-${{ runner.os }}-8.9.0
+
       # ── Flutter SDK ──
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          cache: true
 
       - name: Flutter version info
         run: flutter --version
@@ -51,7 +59,8 @@ jobs:
 
       # ── Rinf code generation ──
       - name: Install Rinf CLI
-        run: cargo install rinf_cli
+        if: steps.cache-rinf.outputs.cache-hit != 'true'
+        run: cargo install rinf_cli@8.9.0
 
       - name: Generate Rinf bindings
         run: rinf gen

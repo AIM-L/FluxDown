@@ -23,7 +23,7 @@ export function FloatingNavbar({
 
   const navItems = [
     { name: t("nav.features"), link: "#features" },
-    { name: t("nav.extension"), link: "#extension" },
+    { name: t("nav.extension"), link: "#download" },
     { name: t("nav.download"), link: "#download" },
   ];
 

@@ -1,5 +1,5 @@
 import { motion, AnimatePresence } from "framer-motion";
-import { MousePointerClick, Shield, Filter, Chrome } from "lucide-react";
+import { MousePointerClick, Shield, Filter } from "lucide-react";
 import { DotBackground } from "@/components/ui/grid-background";
 import { useState, useEffect } from "react";
 import { useLocale } from "@/lib/i18n";
@@ -118,17 +118,7 @@ export default function ExtensionSection() {
               ))}
             </div>
 
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ delay: 0.5, duration: 0.5 }}
-            >
-              <a href="#" className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-[#38bdf8] to-[#06b6d4] px-6 py-3 text-sm font-semibold text-white hover:opacity-90 transition-opacity shadow-lg shadow-[#38bdf8]/20">
-                <Chrome className="w-4 h-4" />
-                {t("ext.addToChrome")}
-              </a>
-            </motion.div>
+
           </motion.div>
 
           {/* Right: Interactive Extension Popup Mockup */}
