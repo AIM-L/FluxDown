@@ -111,8 +111,8 @@ def generate_release_notes(version: str, commits: str, prev_tag: str | None) -> 
 
 
 def create_tag(version: str, message: str) -> None:
-    """创建 annotated tag"""
-    run(["git", "tag", "-a", version, "-m", message])
+    """创建 annotated tag（使用 --cleanup=verbatim 保留 # 开头的 Markdown 标题）"""
+    run(["git", "tag", "-a", version, "-m", message, "--cleanup=verbatim"])
     print(f"已创建 annotated tag: {version}")
 
 
