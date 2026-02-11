@@ -128,8 +128,7 @@ export default defineBackground(() => {
         break;
       case 'fluxdown-download-page':
         if (tab?.id) {
-          // TODO: 实现全部链接提取
-          notify(t('notify.featureInDev'), t('notify.batchDownloadComing'));
+          await handleDownloadPageLinks(tab.id, tab.url);
         }
         return;
     }
@@ -245,6 +244,93 @@ export default defineBackground(() => {
     handlePopupMessage(message).then(sendResponse);
     return true; // 保持消息通道开放（异步响应）
   });
+
+  // ===== 下载此页面所有链接 =====
+  async function handleDownloadPageLinks(tabId: number, pageUrl?: string) {
+    try {
+      // 注入脚本提取页面中所有可下载链接
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const links = new Set<string>();
+
+          // 提取所有 <a> 标签的 href
+          for (const a of document.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+            const href = a.href;
+            if (href && (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('ftp://'))) {
+              links.add(href);
+            }
+          }
+
+          // 提取所有 <video> / <audio> / <source> 的 src
+          for (const el of document.querySelectorAll<HTMLMediaElement | HTMLSourceElement>('video[src], audio[src], source[src]')) {
+            const src = el.src;
+            if (src && (src.startsWith('http://') || src.startsWith('https://'))) {
+              links.add(src);
+            }
+          }
+
+          return Array.from(links);
+        },
+      });
+
+      const allLinks: string[] = results?.[0]?.result || [];
+      if (allLinks.length === 0) {
+        notify(t('notify.batchNoLinks'), t('notify.batchNoLinksDetail'));
+        return;
+      }
+
+      // 过滤出可下载的链接（排除页面导航链接）
+      const downloadableExts = [
+        '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
+        '.exe', '.msi', '.dmg', '.deb', '.rpm', '.appimage',
+        '.iso', '.img',
+        '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm',
+        '.mp3', '.flac', '.wav', '.aac', '.ogg',
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+        '.bin', '.apk', '.ipa', '.torrent',
+      ];
+
+      const downloadLinks = allLinks.filter((link) => {
+        try {
+          const pathname = new URL(link).pathname.toLowerCase();
+          return downloadableExts.some((ext) => pathname.endsWith(ext));
+        } catch {
+          return false;
+        }
+      });
+
+      if (downloadLinks.length === 0) {
+        notify(t('notify.batchNoLinks'), t('notify.batchNoDownloadableLinks'));
+        return;
+      }
+
+      // 批量发送到 FluxDown
+      let sentCount = 0;
+      let failedCount = 0;
+
+      for (const link of downloadLinks) {
+        try {
+          await sendToFluxDown(link, pageUrl);
+          sentCount++;
+        } catch {
+          failedCount++;
+        }
+      }
+
+      notify(
+        t('notify.batchComplete'),
+        t('notify.batchResult', {
+          total: String(downloadLinks.length),
+          sent: String(sentCount),
+          failed: String(failedCount),
+        }),
+      );
+    } catch (e) {
+      console.error('[FluxDown] Failed to extract page links:', e);
+      notify(t('notify.sendFailed'), t('notify.batchExtractFailed'));
+    }
+  }
 
   // ===== 核心：发送下载请求到 FluxDown App =====
   async function sendToFluxDown(

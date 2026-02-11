@@ -61,8 +61,12 @@ const zhCN = {
   'contextMenu.downloadPage': '使用 FluxDown 下载此页面所有链接',
 
   // Notifications
-  'notify.featureInDev': '功能开发中',
-  'notify.batchDownloadComing': '批量下载页面链接功能即将推出',
+  'notify.batchNoLinks': '未找到链接',
+  'notify.batchNoLinksDetail': '当前页面未发现任何链接',
+  'notify.batchNoDownloadableLinks': '当前页面未发现可下载的文件链接',
+  'notify.batchComplete': '批量下载完成',
+  'notify.batchResult': '共 {total} 个文件，成功 {sent} 个，失败 {failed} 个',
+  'notify.batchExtractFailed': '提取页面链接失败，请检查页面权限',
   'notify.downloadSent': '下载已发送',
   'notify.sentToFluxDown': '{name} 已发送到 FluxDown',
   'notify.sendFailed': '发送失败',

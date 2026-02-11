@@ -63,8 +63,12 @@ const en: Record<MessageKey, string> = {
   'contextMenu.downloadPage': 'Download all links on this page with FluxDown',
 
   // Notifications
-  'notify.featureInDev': 'Coming Soon',
-  'notify.batchDownloadComing': 'Batch download page links coming soon',
+  'notify.batchNoLinks': 'No Links Found',
+  'notify.batchNoLinksDetail': 'No links found on this page',
+  'notify.batchNoDownloadableLinks': 'No downloadable file links found on this page',
+  'notify.batchComplete': 'Batch Download Complete',
+  'notify.batchResult': '{total} files total, {sent} sent, {failed} failed',
+  'notify.batchExtractFailed': 'Failed to extract page links, check page permissions',
   'notify.downloadSent': 'Download Sent',
   'notify.sentToFluxDown': '{name} sent to FluxDown',
   'notify.sendFailed': 'Send Failed',

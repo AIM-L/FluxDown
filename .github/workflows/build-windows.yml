@@ -16,11 +16,28 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Get version from tag
         id: version
         shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract tag message for release notes
+        id: tag_message
+        shell: bash
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          # 获取 annotated tag 的 message（去掉第一行 tag 名）
+          TAG_MSG=$(git tag -l --format='%(contents)' "$TAG_NAME" 2>/dev/null || echo "")
+          if [ -z "$TAG_MSG" ]; then
+            TAG_MSG="Release $TAG_NAME"
+          fi
+          # 写入多行输出
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$TAG_MSG" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       # ── Rust toolchain ──
       - name: Setup Rust toolchain
@@ -107,5 +124,5 @@ jobs:
           files: |
             build/installer/FluxDown-*.exe
             build/installer/FluxDown-*-portable.zip
+          body: ${{ steps.tag_message.outputs.body }}
           draft: false
-          generate_release_notes: true

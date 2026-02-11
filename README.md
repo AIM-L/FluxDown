@@ -55,3 +55,20 @@ flutter run
 
 For detailed instructions on writing Rust and Flutter together,
 please refer to Rinf's [documentation](https://rinf.cunarist.org).
+
+## 发布版本
+
+项目使用 `scripts/release_tag.py` 脚本发布新版本。脚本会自动提取 commit 记录，调用 Claude CLI 生成中文 Release Notes，创建 annotated tag 后推送触发 CI 构建。
+
+前置要求：本地已安装 [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli)。
+
+```shell
+# 预览 Release Notes（不创建 tag）
+python scripts/release_tag.py v0.0.5 --dry-run
+
+# 生成 Release Notes 并创建 tag（会提示确认）
+python scripts/release_tag.py v0.0.5
+
+# 生成 + 创建 + 自动推送到远程（触发 CI）
+python scripts/release_tag.py v0.0.5 --push
+```

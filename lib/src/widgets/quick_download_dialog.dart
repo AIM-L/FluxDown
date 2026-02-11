@@ -1,5 +1,16 @@
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/material.dart';
+import 'package:flutter/material.dart'
+    show
+        Colors,
+        DefaultMaterialLocalizations,
+        InputDecoration,
+        Material,
+        MaterialType,
+        OutlineInputBorder,
+        TextField,
+        TextSelectionTheme,
+        TextSelectionThemeData;
+import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
 import '../bindings/bindings.dart';
@@ -10,6 +21,9 @@ import '../theme/app_colors.dart';
 ///
 /// 在主窗口内以 Dialog 形式弹出，无需创建独立子窗口，
 /// 延迟从 3-4 秒降低到 <100ms。
+///
+/// 支持多行 URL 输入，批量下载时使用 [BatchCreateTask] 信号，
+/// 单条下载时使用 [ConfirmExternalDownload] 信号。
 void showQuickDownloadDialog(
   BuildContext context, {
   required String url,
@@ -59,21 +73,63 @@ class _QuickDownloadDialogContent extends StatefulWidget {
 
 class _QuickDownloadDialogContentState
     extends State<_QuickDownloadDialogContent> {
+  final _urlController = TextEditingController();
+  final _urlFocusNode = FocusNode();
   final _saveDirController = TextEditingController();
   final _renameController = TextEditingController();
   String? selectedThreads;
 
+  /// 解析出的有效 URL 数量（实时计算）
+  int _urlCount = 0;
+
   @override
   void initState() {
     super.initState();
+    _urlController.text = widget.url;
     _saveDirController.text = widget.defaultSaveDir;
     if (widget.filename.isNotEmpty) {
       _renameController.text = widget.filename;
     }
+    _urlController.addListener(_onUrlChanged);
+    // 初始化时计算一次
+    _onUrlChanged();
+  }
+
+  void _onUrlChanged() {
+    final urls = _parseUrls(_urlController.text);
+    final count = urls.length;
+    if (count != _urlCount) {
+      setState(() {
+        _urlCount = count;
+      });
+    }
+  }
+
+  /// 从文本中解析所有有效的 URL（http/https/ftp/magnet）
+  static List<String> _parseUrls(String text) {
+    final lines = text.split('\n');
+    final urls = <String>[];
+    final urlPattern = RegExp(r'^(https?|ftp)://\S+', caseSensitive: false);
+    for (final line in lines) {
+      final trimmed = line.trim();
+      if (trimmed.isEmpty) continue;
+      if (trimmed.toLowerCase().startsWith('magnet:?')) {
+        urls.add(trimmed);
+      } else {
+        final match = urlPattern.firstMatch(trimmed);
+        if (match != null) {
+          urls.add(match.group(0)!);
+        }
+      }
+    }
+    return urls;
   }
 
   @override
   void dispose() {
+    _urlController.removeListener(_onUrlChanged);
+    _urlController.dispose();
+    _urlFocusNode.dispose();
     _saveDirController.dispose();
     _renameController.dispose();
     super.dispose();
@@ -91,11 +147,15 @@ class _QuickDownloadDialogContentState
     }
   }
 
+  bool get _isBatch => _urlCount > 1;
+
   void _startDownload() {
     final saveDir = _saveDirController.text.trim();
     if (saveDir.isEmpty) return;
 
-    final rename = _renameController.text.trim();
+    final urls = _parseUrls(_urlController.text);
+    if (urls.isEmpty) return;
+
     final segments = switch (selectedThreads) {
       'auto' => 0,
       '4' => 4,
@@ -106,14 +166,24 @@ class _QuickDownloadDialogContentState
       _ => 0,
     };
 
-    // 直接发送确认信号到 Rust，无需跨窗口 IPC
-    ConfirmExternalDownload(
-      url: widget.url,
-      saveDir: saveDir,
-      fileName: rename,
-      segments: segments,
-      cookies: widget.cookies,
-    ).sendSignalToRust();
+    if (urls.length == 1) {
+      // 单条 — 使用 ConfirmExternalDownload，支持重命名和 cookies
+      final rename = _renameController.text.trim();
+      ConfirmExternalDownload(
+        url: urls.first,
+        saveDir: saveDir,
+        fileName: rename,
+        segments: segments,
+        cookies: widget.cookies,
+      ).sendSignalToRust();
+    } else {
+      // 多条 — 使用 BatchCreateTask
+      BatchCreateTask(
+        urls: urls,
+        saveDir: saveDir,
+        segments: segments,
+      ).sendSignalToRust();
+    }
 
     Navigator.of(context).pop();
   }
@@ -133,6 +203,7 @@ class _QuickDownloadDialogContentState
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
+    final s = LocaleScope.of(context);
 
     return ShadDialog(
       title: Row(
@@ -147,7 +218,7 @@ class _QuickDownloadDialogContentState
             child: Icon(LucideIcons.download, size: 14, color: c.accent),
           ),
           const SizedBox(width: 10),
-          Text(LocaleScope.of(context).newDownload),
+          Text(s.newDownload),
           const SizedBox(width: 8),
           if (widget.fileSize > 0)
             _InfoTag(text: _formatFileSize(widget.fileSize), c: c),
@@ -156,11 +227,11 @@ class _QuickDownloadDialogContentState
           if (widget.mimeType.isNotEmpty) _InfoTag(text: widget.mimeType, c: c),
         ],
       ),
-      description: Text(LocaleScope.of(context).fromBrowserExtension),
+      description: Text(s.fromBrowserExtension),
       actions: [
         ShadButton.outline(
           onPressed: () => Navigator.of(context).pop(),
-          child: Text(LocaleScope.of(context).cancel),
+          child: Text(s.cancel),
         ),
         ShadButton(
           onPressed: _startDownload,
@@ -170,7 +241,7 @@ class _QuickDownloadDialogContentState
               const Icon(LucideIcons.download, size: 13, color: Colors.white),
               const SizedBox(width: 6),
               Text(
-                LocaleScope.of(context).startDownload,
+                _isBatch ? s.startBatchDownload(_urlCount) : s.startDownload,
                 style: const TextStyle(color: Colors.white),
               ),
             ],
@@ -183,28 +254,72 @@ class _QuickDownloadDialogContentState
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // URL 显示
-            _SectionLabel(text: LocaleScope.of(context).downloadUrl, c: c),
+            // URL 输入区 — 多行可编辑
+            Row(
+              children: [
+                _SectionLabel(text: s.downloadUrl, c: c),
+                const Spacer(),
+                if (_urlCount > 0)
+                  Text(
+                    s.urlCount(_urlCount),
+                    style: TextStyle(fontSize: 11, color: c.textMuted),
+                  ),
+              ],
+            ),
             const SizedBox(height: 6),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                color: c.surface2,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: c.border.withValues(alpha: 0.6)),
-              ),
-              child: SelectableText(
-                widget.url,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: c.textSecondary,
-                  fontFamily: 'monospace',
-                  height: 1.5,
+            SizedBox(
+              height: 120,
+              child: Localizations(
+                locale: const Locale('en'),
+                delegates: const [
+                  DefaultWidgetsLocalizations.delegate,
+                  DefaultMaterialLocalizations.delegate,
+                ],
+                child: Material(
+                  type: MaterialType.transparency,
+                  child: TextSelectionTheme(
+                    data: TextSelectionThemeData(
+                      selectionColor: c.accent.withValues(alpha: 0.25),
+                      cursorColor: c.accent,
+                      selectionHandleColor: c.accent,
+                    ),
+                    child: TextField(
+                      controller: _urlController,
+                      focusNode: _urlFocusNode,
+                      maxLines: null,
+                      expands: true,
+                      textAlignVertical: TextAlignVertical.top,
+                      cursorColor: c.accent,
+                      style: TextStyle(fontSize: 13, color: c.textPrimary),
+                      decoration: InputDecoration(
+                        hintText: s.batchUrlPlaceholder,
+                        hintStyle: TextStyle(
+                          fontSize: 12.5,
+                          color: c.textMuted,
+                        ),
+                        hintMaxLines: 5,
+                        contentPadding: const EdgeInsets.all(10),
+                        filled: true,
+                        fillColor: c.surface1,
+                        hoverColor: Colors.transparent,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(color: c.border),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(color: c.border),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(color: c.accent),
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
-                maxLines: 2,
               ),
             ),
-
             const SizedBox(height: 14),
 
             // 保存目录 + 线程数
@@ -215,19 +330,14 @@ class _QuickDownloadDialogContentState
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      _SectionLabel(
-                        text: LocaleScope.of(context).saveDir,
-                        c: c,
-                      ),
+                      _SectionLabel(text: s.saveDir, c: c),
                       const SizedBox(height: 6),
                       GestureDetector(
                         onTap: _pickSaveDir,
                         child: AbsorbPointer(
                           child: ShadInput(
                             controller: _saveDirController,
-                            placeholder: Text(
-                              LocaleScope.of(context).selectSaveDir,
-                            ),
+                            placeholder: Text(s.selectSaveDir),
                             readOnly: true,
                             trailing: Padding(
                               padding: const EdgeInsets.only(right: 4),
@@ -249,22 +359,17 @@ class _QuickDownloadDialogContentState
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      _SectionLabel(
-                        text: LocaleScope.of(context).threads,
-                        c: c,
-                      ),
+                      _SectionLabel(text: s.threads, c: c),
                       const SizedBox(height: 6),
                       ShadSelect<String>(
-                        placeholder: Text(LocaleScope.of(context).auto),
+                        placeholder: Text(s.auto),
                         options: ['auto', '4', '8', '16', '32', '64'].map((v) {
-                          final s = LocaleScope.of(context);
                           return ShadOption(
                             value: v,
                             child: Text(v == 'auto' ? s.auto : v),
                           );
                         }).toList(),
                         selectedOptionBuilder: (context, value) {
-                          final s = LocaleScope.of(context);
                           return Text(value == 'auto' ? s.auto : value);
                         },
                         onChanged: (v) => setState(() => selectedThreads = v),
@@ -275,15 +380,16 @@ class _QuickDownloadDialogContentState
               ],
             ),
 
-            const SizedBox(height: 14),
-
-            // 文件名
-            _SectionLabel(text: LocaleScope.of(context).filenameOptional, c: c),
-            const SizedBox(height: 6),
-            ShadInput(
-              controller: _renameController,
-              placeholder: Text(LocaleScope.of(context).autoDetectFilename),
-            ),
+            // 重命名 — 仅单条时显示
+            if (!_isBatch) ...[
+              const SizedBox(height: 14),
+              _SectionLabel(text: s.filenameOptional, c: c),
+              const SizedBox(height: 6),
+              ShadInput(
+                controller: _renameController,
+                placeholder: Text(s.autoDetectFilename),
+              ),
+            ],
           ],
         ),
       ),
