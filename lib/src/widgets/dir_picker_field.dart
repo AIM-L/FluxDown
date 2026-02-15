@@ -29,40 +29,38 @@ class DirPickerField extends StatelessWidget {
     final hasPath = path.isNotEmpty;
     final displayText = hasPath ? path : (placeholder ?? s.selectSaveDir);
 
-    return Container(
-      height: 36,
-      decoration: BoxDecoration(
-        color: c.surface1,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: c.border, width: 1),
-      ),
-      child: Row(
-        children: [
-          // 路径文本
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Text(
-                displayText,
-                style: TextStyle(
-                  fontSize: 13,
-                  color: hasPath ? c.textPrimary : c.textMuted,
-                ),
-                overflow: TextOverflow.ellipsis,
-                maxLines: 1,
-              ),
-            ),
+    return GestureDetector(
+      onTap: enabled ? onTap : null,
+      child: MouseRegion(
+        cursor: enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+        child: Container(
+          height: 36,
+          decoration: BoxDecoration(
+            color: c.surface1,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: c.border, width: 1),
           ),
-          // 竖分隔线
-          Container(width: 1, height: 20, color: c.border),
-          // 浏览按钮区域
-          GestureDetector(
-            onTap: enabled ? onTap : null,
-            child: MouseRegion(
-              cursor: enabled
-                  ? SystemMouseCursors.click
-                  : SystemMouseCursors.basic,
-              child: Padding(
+          child: Row(
+            children: [
+              // 路径文本
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Text(
+                    displayText,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: hasPath ? c.textPrimary : c.textMuted,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                  ),
+                ),
+              ),
+              // 竖分隔线
+              Container(width: 1, height: 20, color: c.border),
+              // 浏览按钮区域
+              Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 10),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
@@ -87,9 +85,9 @@ class DirPickerField extends StatelessWidget {
                   ],
                 ),
               ),
-            ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }

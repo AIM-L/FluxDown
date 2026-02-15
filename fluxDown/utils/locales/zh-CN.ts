@@ -98,6 +98,8 @@ const zhCN = {
   'panel.tabDocs': '文档',
   'panel.tabArchive': '压缩包',
   'panel.tabStream': '流媒体',
+  'panel.tabSubtitle': '字幕',
+  'panel.tabMagnet': '磁力',
   'panel.tabOther': '其他',
 
   // Manifest

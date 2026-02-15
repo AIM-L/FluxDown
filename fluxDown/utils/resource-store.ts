@@ -145,14 +145,20 @@ export function getTabsWithResources(): number[] {
 
 // ===== Badge 更新 =====
 
+// chrome.action (MV3) 或 chrome.browserAction (Firefox MV2)
+const actionApi: typeof chrome.action | undefined =
+  chrome.action ?? (chrome as any).browserAction;
+
 export async function updateBadgeForTab(tabId: number): Promise<void> {
+  if (!actionApi) return;
+
   const count = getResourceCountForTab(tabId);
   const text = count > 0 ? String(count) : '';
 
   try {
-    await chrome.action.setBadgeText({ text, tabId });
+    await actionApi.setBadgeText({ text, tabId });
     if (count > 0) {
-      await chrome.action.setBadgeBackgroundColor({ color: '#3B82F6', tabId });
+      await actionApi.setBadgeBackgroundColor({ color: '#3B82F6', tabId });
     }
   } catch {
     // tab 可能已关闭

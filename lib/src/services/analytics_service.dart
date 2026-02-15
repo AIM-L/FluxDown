@@ -266,6 +266,7 @@ class AnalyticsService {
         '_os': Platform.operatingSystem,
         '_os_version': Platform.operatingSystemVersion,
         '_app_version': _appVersion,
+        '_architecture': _cpuArchitecture,
         '_error': '$message\n${stackTrace ?? ''}',
         '_nonfatal': !isFatal,
         '_run': _runDurationSeconds,
@@ -295,6 +296,7 @@ class AnalyticsService {
       '_os_version': Platform.operatingSystemVersion,
       '_app_version': _appVersion,
       '_resolution': _screenResolution,
+      '_architecture': _cpuArchitecture,
     };
 
     final consent = <String, bool>{for (final f in _consentFeatures) f: true};
@@ -553,6 +555,17 @@ class AnalyticsService {
 
   int get _runDurationSeconds =>
       DateTime.now().difference(_appStartTime).inSeconds;
+
+  String get _cpuArchitecture {
+    // Windows: PROCESSOR_ARCHITECTURE = AMD64 | ARM64 | x86
+    final arch = Platform.environment['PROCESSOR_ARCHITECTURE'] ?? '';
+    return switch (arch.toUpperCase()) {
+      'AMD64' => 'x64',
+      'ARM64' => 'arm64',
+      'X86' => 'x86',
+      _ => arch.isNotEmpty ? arch.toLowerCase() : 'unknown',
+    };
+  }
 
   String get _screenResolution {
     try {

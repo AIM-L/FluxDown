@@ -266,6 +266,32 @@ pub struct SystemProxyInfo {
     pub no_proxy_list: String,
 }
 
+// ========== HLS quality selection signals ==========
+
+/// HLS master playlist parsed — send available quality options to Dart (Rust → Dart).
+/// Dart should display a selection dialog and respond with [SelectHlsQuality].
+#[derive(Serialize, RustSignal)]
+pub struct HlsQualityOptions {
+    pub task_id: String,
+    pub options: Vec<HlsQualityOption>,
+}
+
+#[derive(Serialize, Deserialize, SignalPiece)]
+pub struct HlsQualityOption {
+    pub index: i32,
+    pub bandwidth: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+/// User selected an HLS quality variant (Dart → Rust).
+#[derive(Deserialize, DartSignal)]
+pub struct SelectHlsQuality {
+    pub task_id: String,
+    /// Index of the selected variant (from [HlsQualityOption.index]).
+    pub selected_index: i32,
+}
+
 // ========== File association signals ==========
 
 /// Set or remove .torrent file association (Dart → Rust).

@@ -1,6 +1,6 @@
 import { motion } from "framer-motion";
 import { BentoGrid, BentoGridItem } from "@/components/ui/bento-grid";
-import { Cpu, Layers, Globe, Gauge, RefreshCw, Chrome } from "lucide-react";
+import { Cpu, Layers, Globe, Gauge, RefreshCw, Chrome, Palette, ShieldCheck } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
 
 /** Mini terminal output — Rust engine card */
@@ -20,9 +20,9 @@ const ProtocolBadges = () => (
       { name: "HTTP/2", color: "text-brand-sky bg-brand-sky/10 border-brand-sky/20" },
       { name: "HTTPS", color: "text-success bg-success/10 border-success/20" },
       { name: "FTP", color: "text-warning bg-warning/10 border-warning/20" },
-      { name: "HTTP/3", color: "text-dark-text-muted bg-dark-surface3 border-dark-border", dashed: true },
+      { name: "BitTorrent", color: "text-[#A855F7] bg-[#A855F7]/10 border-[#A855F7]/20" },
     ].map((p) => (
-      <span key={p.name} className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium border ${p.color} ${"dashed" in p ? "border-dashed" : ""}`}>
+      <span key={p.name} className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium border ${p.color}`}>
         {p.name}
       </span>
     ))}
@@ -63,6 +63,60 @@ const ResumeProgress = () => (
       <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-sm bg-success/40 inline-block" /> Resuming</span>
       <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-sm bg-dark-surface3 inline-block" /> Pending</span>
     </div>
+  </div>
+);
+
+/** Color scheme swatches — Beautiful Interface card */
+const ColorSchemes = () => {
+  const schemes = [
+    { name: "Blue", color: "#3B82F6" },
+    { name: "Green", color: "#22C55E" },
+    { name: "Violet", color: "#8B5CF6" },
+    { name: "Rose", color: "#F43F5E" },
+    { name: "Orange", color: "#F97316" },
+    { name: "Cyan", color: "#06B6D4" },
+  ];
+  return (
+    <div className="rounded-lg border border-dark-border bg-dark-bg p-2.5 space-y-2">
+      <div className="flex items-center justify-between text-[10px]">
+        <span className="text-dark-text-muted">Color Scheme</span>
+        <span className="text-dark-text font-medium">12 themes</span>
+      </div>
+      <div className="flex gap-1.5">
+        {schemes.map((s) => (
+          <motion.div
+            key={s.name}
+            className="flex-1 h-5 rounded-sm cursor-pointer"
+            style={{ backgroundColor: s.color }}
+            initial={{ opacity: 0, scale: 0.8 }}
+            whileInView={{ opacity: 1, scale: 1 }}
+            viewport={{ once: true }}
+            transition={{ delay: schemes.indexOf(s) * 0.06, duration: 0.25 }}
+            whileHover={{ scale: 1.15 }}
+          />
+        ))}
+      </div>
+      <div className="flex gap-3 text-[9px] text-dark-text-muted">
+        <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-dark-text inline-block" /> Dark</span>
+        <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-dark-surface3 border border-dark-border inline-block" /> Light</span>
+      </div>
+    </div>
+  );
+};
+
+/** Privacy badges — Clean & Private card */
+const PrivacyBadges = () => (
+  <div className="flex flex-wrap gap-1.5">
+    {[
+      { label: "Zero Ads", color: "text-success bg-success/10 border-success/20" },
+      { label: "Zero Tracking", color: "text-brand-sky bg-brand-sky/10 border-brand-sky/20" },
+      { label: "No Account", color: "text-[#A855F7] bg-[#A855F7]/10 border-[#A855F7]/20" },
+      { label: "Local-First", color: "text-warning bg-warning/10 border-warning/20" },
+    ].map((b) => (
+      <span key={b.label} className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium border ${b.color}`}>
+        {b.label}
+      </span>
+    ))}
   </div>
 );
 
@@ -149,6 +203,21 @@ export default function FeaturesSection() {
       description: t("features.browserDesc"),
       icon: <div className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#EC4899]/10"><Chrome className="w-5 h-5 text-[#EC4899]" /></div>,
       className: "md:col-span-2 lg:col-span-2",
+    },
+    // Row 3: 2 double-col cards — UI & Privacy
+    {
+      title: t("features.uiTitle"),
+      description: t("features.uiDesc"),
+      icon: <div className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#8B5CF6]/10"><Palette className="w-5 h-5 text-[#8B5CF6]" /></div>,
+      className: "md:col-span-2 lg:col-span-2",
+      header: <ColorSchemes />,
+    },
+    {
+      title: t("features.cleanTitle"),
+      description: t("features.cleanDesc"),
+      icon: <div className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#22C55E]/10"><ShieldCheck className="w-5 h-5 text-[#22C55E]" /></div>,
+      className: "md:col-span-2 lg:col-span-2",
+      header: <PrivacyBadges />,
     },
   ];
 

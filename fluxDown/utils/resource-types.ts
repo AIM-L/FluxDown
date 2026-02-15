@@ -18,6 +18,8 @@ export type ResourceType =
   | 'executable'
   | 'torrent'
   | 'stream'
+  | 'subtitle'
+  | 'magnet'
   | 'other';
 
 /** 资源检测来源 */
@@ -27,7 +29,8 @@ export type DetectionMethod =
   | 'mutation-observer'
   | 'fetch-intercept'
   | 'xhr-intercept'
-  | 'blob-intercept';
+  | 'blob-intercept'
+  | 'mse-intercept';
 
 /**
  * 资源可信度等级
@@ -87,7 +90,7 @@ export interface ResourceMessagePayload {
 
 /** Main World → Content Script 的 CustomEvent detail 格式 */
 export interface FetchInterceptDetail {
-  type: 'fetch-detected' | 'xhr-detected' | 'blob-detected' | 'hls-manifest' | 'dash-manifest';
+  type: 'fetch-detected' | 'xhr-detected' | 'blob-detected' | 'hls-manifest' | 'dash-manifest' | 'mse-detected';
   url: string;
   contentType?: string;
   size?: number;
@@ -105,6 +108,8 @@ const EXTENSION_CATEGORIES: Record<ResourceType, string[]> = {
   executable: ['exe', 'msi', 'dmg', 'deb', 'rpm', 'appimage', 'apk', 'ipa', 'snap', 'flatpak'],
   torrent: ['torrent'],
   stream: ['m3u8', 'mpd'],
+  subtitle: ['vtt', 'srt', 'ass', 'ssa', 'sub', 'idx', 'sup', 'lrc'],
+  magnet: [],
   other: [],
 };
 
@@ -170,6 +175,12 @@ const MIME_CATEGORIES: Record<string, ResourceType> = {
   'application/vnd.debian.binary-package': 'executable',
   // 种子
   'application/x-bittorrent': 'torrent',
+  // 字幕
+  'text/vtt': 'subtitle',
+  'application/x-subrip': 'subtitle',
+  'text/x-ssa': 'subtitle',
+  'text/x-ass': 'subtitle',
+  'application/x-subtitle': 'subtitle',
 };
 
 // ===== 分类型大小阈值 =====
@@ -177,15 +188,17 @@ const MIME_CATEGORIES: Record<string, ResourceType> = {
 
 /** 分类型最低大小阈值（字节），-1 表示不限 */
 const SIZE_THRESHOLDS: Record<ResourceType, number> = {
-  video: 500 * 1024,    // 500KB — 过滤预加载小片段
-  audio: 100 * 1024,    // 100KB — 过滤通知音效等
-  document: -1,          // 不限 — PDF 可能很小
-  archive: -1,           // 不限
-  image: 100 * 1024,     // 100KB — 过滤图标/验证码/追踪像素
-  executable: -1,        // 不限
-  torrent: -1,           // 不限
-  stream: -1,            // 不限 — manifest 文件本身很小
-  other: 50 * 1024,      // 50KB — 未知类型要更严格
+  video: 500 * 1024,
+  audio: 100 * 1024,
+  document: -1,
+  archive: -1,
+  image: 100 * 1024,
+  executable: -1,
+  torrent: -1,
+  stream: -1,
+  subtitle: -1,
+  magnet: -1,
+  other: 50 * 1024,
 };
 
 /**
@@ -486,6 +499,7 @@ export function isSniffableContentType(contentType: string): boolean {
 
   if (ct === 'application/vnd.apple.mpegurl' || ct === 'application/x-mpegurl') return true;
   if (ct === 'application/dash+xml') return true;
+  if (ct === 'text/vtt' || ct === 'application/x-subrip' || ct === 'text/x-ssa' || ct === 'text/x-ass') return true;
 
   const downloadTypes = [
     'application/octet-stream',
@@ -544,8 +558,8 @@ export function computeConfidence(
   // stream manifest 高可信度
   if (type === 'stream') return 'high';
 
-  // torrent / executable 高可信度
-  if (type === 'torrent' || type === 'executable') return 'high';
+  // torrent / executable / subtitle / magnet 高可信度
+  if (type === 'torrent' || type === 'executable' || type === 'subtitle' || type === 'magnet') return 'high';
 
   // 已知类型 + 超过阈值 → high
   const threshold = SIZE_THRESHOLDS[type];
@@ -578,6 +592,9 @@ export function computeConfidence(
  * 判断资源是否值得展示给用户（v2 — 多维过滤）
  */
 export function isWorthShowing(resource: DetectedResource): boolean {
+  // magnet: URI 始终展示
+  if (resource.type === 'magnet') return true;
+
   // 1. blob: / data: URL 不展示
   if (resource.url.startsWith('blob:') || resource.url.startsWith('data:')) {
     return false;
@@ -650,6 +667,8 @@ export function getResourceTypeIcon(type: ResourceType): string {
     executable: '\u{2699}',
     torrent: '\u{1F9F2}',
     stream: '\u{1F4FA}',
+    subtitle: '\u{1F4DD}',
+    magnet: '\u{1F9F2}',
     other: '\u{1F4CE}',
   };
   return icons[type];

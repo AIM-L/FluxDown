@@ -15,7 +15,6 @@ export default defineConfig({
       "notifications",
       "activeTab",
       "tabs",
-      "scripting",
     ],
     host_permissions: ["<all_urls>"],
     web_accessible_resources: [
@@ -37,6 +36,16 @@ export default defineConfig({
       32: "/icon/32.png",
       48: "/icon/48.png",
       128: "/icon/128.png",
+    },
+    browser_specific_settings: {
+      gecko: {
+        id: "fluxdown@fluxdown.app",
+        strict_min_version: "140.0",
+        // @ts-expect-error AMO requires data_collection_permissions since Nov 2025, WXT types not yet updated
+        data_collection_permissions: {
+          required: ["none"],
+        },
+      },
     },
   },
 });

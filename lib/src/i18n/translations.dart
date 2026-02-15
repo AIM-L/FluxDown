@@ -609,6 +609,18 @@ class S {
   String feedbackDescCount(int n) => _t('$n/5000', '$n/5000');
 
   // ─────────────────────────────────────────────
+  // HLS 画质选择
+  // ─────────────────────────────────────────────
+
+  String get hlsQualityTitle => _t('选择画质', 'Select Quality');
+  String get hlsQualityDesc => _t(
+    '检测到多个画质版本，请选择要下载的画质',
+    'Multiple quality options detected. Choose the one to download',
+  );
+  String hlsQualityResolution(int w, int h) => '${w}x$h';
+  String hlsQualityBandwidth(String speed) => _t(speed, speed);
+
+  // ─────────────────────────────────────────────
   // TrayService
   // ─────────────────────────────────────────────
 

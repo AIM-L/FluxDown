@@ -5,6 +5,8 @@ mod download_manager;
 mod downloader;
 mod file_association;
 mod ftp_downloader;
+mod hls_downloader;
+mod dash_downloader;
 mod native_messaging;
 mod proxy_config;
 mod segment_advisor;

@@ -100,6 +100,8 @@ const en: Record<MessageKey, string> = {
   'panel.tabDocs': 'Docs',
   'panel.tabArchive': 'Archive',
   'panel.tabStream': 'Stream',
+  'panel.tabSubtitle': 'Subtitle',
+  'panel.tabMagnet': 'Magnet',
   'panel.tabOther': 'Other',
 
   // Manifest

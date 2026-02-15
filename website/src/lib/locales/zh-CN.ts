@@ -13,14 +13,14 @@ const zhCN: Messages = {
   "hero.title1": "下载，",
   "hero.title2": "全面加速。",
   "hero.subtitle":
-    "一款现代化的下载管理器，支持多线程加速、智能分段和浏览器集成。极速下载，永久免费。",
+    "Rust 驱动的多协议下载管理器，支持 HTTP/FTP/BitTorrent 磁力链接，智能多线程加速与浏览器无缝集成。精美界面，极致性能，永久免费，零广告。",
   "hero.cta": "下载 Windows 版",
   "hero.stat1.value": "10x",
-  "hero.stat1.label": "下载加速",
-  "hero.stat2.value": "100%",
-  "hero.stat2.label": "完全免费",
-  "hero.stat3.value": "多协议",
-  "hero.stat3.label": "全面支持",
+  "hero.stat1.label": "极速下载",
+  "hero.stat2.value": "零",
+  "hero.stat2.label": "广告与追踪",
+  "hero.stat3.value": "100%",
+  "hero.stat3.label": "永久免费",
 
   // Hero mockup
   "mockup.category": "分类",
@@ -79,10 +79,10 @@ const zhCN: Messages = {
     "基于 Rust 和 Tokio 构建，实现最大吞吐量。零开销抽象在保证内存安全的同时，提供原生级别的并发下载性能。",
   "features.segTitle": "智能分段",
   "features.segDesc":
-    "IDM 风格的智能文件分段。根据文件大小、CPU 核心数和可用带宽，自动计算最优分段数量。",
+    "IDM 风格的智能分段与运行时动态拆分。空闲线程自动接管慢速分段，连接复用避免重建开销，榨取每一份带宽。",
   "features.protoTitle": "多协议支持",
   "features.protoDesc":
-    "开箱即用的 HTTP、HTTPS 和 FTP 支持。每种协议都有专属的优化下载引擎，确保最大传输速率。",
+    "全面支持 HTTP、HTTPS、FTP 和 BitTorrent 磁力链接。每种协议都有专属优化引擎——从 HTTP Range 请求到 DHT 节点发现，开箱即用。",
   "features.speedTitle": "速度控制",
   "features.speedDesc":
     "基于令牌桶算法的全局限速器。设置带宽限制，让下载在后台运行的同时保持流畅的浏览体验。",
@@ -91,7 +91,13 @@ const zhCN: Messages = {
     "完整的断点续传支持。所有下载状态持久化到 SQLite — 安全关闭和重启，不丢失任何一个字节。",
   "features.browserTitle": "浏览器集成",
   "features.browserDesc":
-    "Chrome 扩展自动拦截下载。可配置文件类型过滤器、域名规则和大小阈值，实现无缝工作流。",
+    "Chrome/Firefox 扩展三层拦截引擎，自动识别流媒体资源（HLS/DASH）。智能文件类型过滤、域名规则，一键加速。",
+  "features.uiTitle": "精美界面",
+  "features.uiDesc":
+    "精心打磨的视觉体验——深色与浅色主题、12 套配色方案、可调节面板的响应式布局。一款真正赏心悦目的下载工具。",
+  "features.cleanTitle": "纯净安心",
+  "features.cleanDesc":
+    "零广告、零追踪、无需注册账号。所有数据留在本地——基于 SQLite 的本地优先架构。你的下载，只属于你。",
 
   // Extension
   "ext.badge": "浏览器扩展",
@@ -353,7 +359,7 @@ const zhCN: Messages = {
   "terms.s10.desc": "如果您对本服务条款有任何疑问，请通过我们网站的反馈页面与我们联系。",
 
   // Footer
-  "footer.desc": "基于 Rust 构建的开源下载管理器，多线程加速、智能分段、浏览器无缝集成。极速、可靠，永久免费。",
+  "footer.desc": "基于 Rust 构建的开源下载管理器，支持 HTTP/FTP/BT 多协议加速、智能分段、浏览器无缝集成。极速可靠，零广告，永久免费。",
   "footer.product": "产品",
   "footer.features": "功能特性",
   "footer.browserExtension": "浏览器扩展",

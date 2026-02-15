@@ -527,7 +527,8 @@ export default defineBackground(() => {
   // === 第二层：onDeterminingFilename（主拦截） ===
   // 在浏览器弹出「另存为」对话框之前触发，
   // suggest({ cancel: true }) 可以在不弹出任何浏览器下载 UI 的情况下直接取消下载。
-  chrome.downloads.onDeterminingFilename.addListener(
+  // Firefox 不支持此 API，完全依赖第三层兜底拦截
+  if (chrome.downloads.onDeterminingFilename) chrome.downloads.onDeterminingFilename.addListener(
     (downloadItem, suggest) => {
       const url = downloadItem.url;
 
@@ -631,33 +632,7 @@ export default defineBackground(() => {
   // ===== 下载此页面所有链接 =====
   async function handleDownloadPageLinks(tabId: number, pageUrl?: string) {
     try {
-      // 注入脚本提取页面中所有可下载链接
-      const results = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const links = new Set<string>();
-
-          // 提取所有 <a> 标签的 href
-          for (const a of document.querySelectorAll<HTMLAnchorElement>('a[href]')) {
-            const href = a.href;
-            if (href && (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('ftp://'))) {
-              links.add(href);
-            }
-          }
-
-          // 提取所有 <video> / <audio> / <source> 的 src
-          for (const el of document.querySelectorAll<HTMLMediaElement | HTMLSourceElement>('video[src], audio[src], source[src]')) {
-            const src = el.src;
-            if (src && (src.startsWith('http://') || src.startsWith('https://'))) {
-              links.add(src);
-            }
-          }
-
-          return Array.from(links);
-        },
-      });
-
-      const allLinks: string[] = results?.[0]?.result || [];
+      const allLinks: string[] = await extractPageLinks(tabId);
       if (allLinks.length === 0) {
         notify(t('notify.batchNoLinks'), t('notify.batchNoLinksDetail'));
         return;
@@ -917,6 +892,40 @@ export default defineBackground(() => {
 
   // ===== 工具函数 =====
 
+  async function extractPageLinks(tabId: number): Promise<string[]> {
+    const extractFn = () => {
+      const links = new Set<string>();
+      for (const a of document.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+        const href = a.href;
+        if (href && (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('ftp://'))) {
+          links.add(href);
+        }
+      }
+      for (const el of document.querySelectorAll<HTMLMediaElement | HTMLSourceElement>('video[src], audio[src], source[src]')) {
+        const src = el.src;
+        if (src && (src.startsWith('http://') || src.startsWith('https://'))) {
+          links.add(src);
+        }
+      }
+      return Array.from(links);
+    };
+
+    if (chrome.scripting?.executeScript) {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: extractFn,
+      });
+      return results?.[0]?.result || [];
+    }
+
+    // Firefox MV2 fallback
+    const code = `(${extractFn.toString()})()`;
+    const results = await new Promise<any[]>((resolve) => {
+      (chrome as any).tabs.executeScript(tabId, { code }, (res: any[]) => resolve(res || []));
+    });
+    return results?.[0] || [];
+  }
+
   function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -1057,14 +1066,15 @@ export default defineBackground(() => {
 
   function updateIcon(enabled: boolean) {
     const suffix = enabled ? '' : '-disabled';
-    chrome.action.setIcon({
-      path: {
-        16: `/icon/16${suffix}.png`,
-        32: `/icon/32${suffix}.png`,
-        48: `/icon/48${suffix}.png`,
-        128: `/icon/128${suffix}.png`,
-      },
-    });
+    const iconPath = {
+      16: `/icon/16${suffix}.png`,
+      32: `/icon/32${suffix}.png`,
+      48: `/icon/48${suffix}.png`,
+      128: `/icon/128${suffix}.png`,
+    };
+    // chrome.action (MV3) / chrome.browserAction (Firefox MV2)
+    const api = chrome.action ?? (chrome as any).browserAction;
+    if (api) api.setIcon({ path: iconPath });
   }
 
   // 启动时检查连接状态

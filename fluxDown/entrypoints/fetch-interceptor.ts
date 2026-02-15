@@ -164,5 +164,22 @@ export default defineUnlistedScript(() => {
     return blobUrl;
   };
 
-  console.log('[FluxDown] Fetch/XHR/Blob interceptor injected');
+  // ===== 拦截 MediaSource API =====
+
+  try {
+    const OrigMediaSource = window.MediaSource;
+    if (OrigMediaSource) {
+      const origAddSourceBuffer = OrigMediaSource.prototype.addSourceBuffer;
+      OrigMediaSource.prototype.addSourceBuffer = function (mimeType: string) {
+        try {
+          if (mimeType && (mimeType.startsWith('video/') || mimeType.startsWith('audio/'))) {
+            notify('mse-detected', window.location.href, mimeType);
+          }
+        } catch { /* */ }
+        return origAddSourceBuffer.call(this, mimeType);
+      };
+    }
+  } catch { /* MediaSource 不可用 */ }
+
+  console.log('[FluxDown] Fetch/XHR/Blob/MSE interceptor injected');
 });

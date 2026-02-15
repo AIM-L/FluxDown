@@ -37,7 +37,7 @@ export default defineContentScript({
           if (!(node instanceof HTMLElement)) continue;
           found.push(...checkElement(node));
           // 检查子元素
-          const children = node.querySelectorAll('video, audio, source, a[href], embed, object');
+          const children = node.querySelectorAll('video, audio, source, track[src], a[href], embed, object');
           for (const child of children) {
             found.push(...checkElement(child as HTMLElement));
           }
@@ -76,9 +76,14 @@ export default defineContentScript({
       const detail = (event as CustomEvent).detail as FetchInterceptDetail | undefined;
       if (!detail || !detail.url) return;
 
+      const mappedType = mapFetchEventType(detail.type, detail.contentType);
+
+      // MSE is a page-level capability signal (URL = page URL), not a downloadable resource
+      if (detail.type === 'mse-detected') return;
+
       const payload: ResourceMessagePayload = {
         url: detail.url,
-        type: mapFetchEventType(detail.type),
+        type: mappedType,
         mimeType: detail.contentType,
         size: detail.size,
         detectedBy: detail.type.startsWith('xhr') ? 'xhr-intercept'
@@ -146,19 +151,40 @@ export default defineContentScript({
         }
       }
 
-      // <a> 标签中的下载链接
+      // <track> 字幕元素（视频播放器的字幕轨道）
+      for (const track of document.querySelectorAll<HTMLTrackElement>('track[src]')) {
+        if (track.src && track.src.startsWith('http')) {
+          resources.push({
+            url: track.src,
+            type: 'subtitle',
+            filename: track.label
+              ? `${track.label}${track.srclang ? `.${track.srclang}` : ''}.vtt`
+              : undefined,
+            detectedBy: 'dom-scan',
+          });
+        }
+      }
+
+      // <a> 标签中的下载链接 + 磁力链接
       for (const a of document.querySelectorAll<HTMLAnchorElement>('a[href]')) {
         const href = a.href;
         if (!href || href.startsWith('blob:') || href.startsWith('data:')
           || href.startsWith('javascript:') || href.startsWith('#')) continue;
+
+        // 磁力链接
+        if (href.toLowerCase().startsWith('magnet:')) {
+          resources.push({
+            url: href,
+            type: 'magnet',
+            filename: parseMagnetDisplayName(href),
+            detectedBy: 'dom-scan',
+          });
+          continue;
+        }
+
         if (!href.startsWith('http://') && !href.startsWith('https://') && !href.startsWith('ftp://')) continue;
 
-        // 收集有下载意图的链接：
-        // 1. 有 download 属性（HTML5 明确标注为下载）
-        // 2. URL 包含已知可下载扩展名（含查询参数中的文件名）
-        // 3. URL 路径含下载关键词（/download, /file/ 等）
         if (a.download || isDownloadableUrl(href)) {
-          // download 属性可能包含建议的文件名
           const filename = a.download || undefined;
           const type = classifyByUrlExtension(href);
           resources.push({
@@ -210,9 +236,28 @@ export default defineContentScript({
             detectedBy: 'mutation-observer',
           });
         }
-    } else if (tag === 'a') {
+    } else if (tag === 'track') {
+        const track = el as HTMLTrackElement;
+        if (track.src && track.src.startsWith('http')) {
+          results.push({
+            url: track.src,
+            type: 'subtitle',
+            filename: track.label
+              ? `${track.label}${track.srclang ? `.${track.srclang}` : ''}.vtt`
+              : undefined,
+            detectedBy: 'mutation-observer',
+          });
+        }
+      } else if (tag === 'a') {
         const a = el as HTMLAnchorElement;
-        if (a.href
+        if (a.href?.toLowerCase().startsWith('magnet:')) {
+          results.push({
+            url: a.href,
+            type: 'magnet',
+            filename: parseMagnetDisplayName(a.href),
+            detectedBy: 'mutation-observer',
+          });
+        } else if (a.href
           && (a.href.startsWith('http://') || a.href.startsWith('https://') || a.href.startsWith('ftp://'))
           && (a.download || isDownloadableUrl(a.href))) {
           results.push({
@@ -278,6 +323,7 @@ export default defineContentScript({
       'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
       'bin', 'torrent',
       'm3u8', 'mpd',
+      'vtt', 'srt', 'ass', 'ssa', 'sub', 'idx', 'sup', 'lrc',
     ]);
 
     /** 常见下载路径关键词（无扩展名的下载链接识别） */
@@ -362,9 +408,24 @@ export default defineContentScript({
       return classifyByExtension(`https://x/f.${ext}`);
     }
 
-    function mapFetchEventType(type: string): ResourceType {
+    function mapFetchEventType(type: string, contentType?: string): ResourceType {
       if (type === 'hls-manifest' || type === 'dash-manifest') return 'stream';
-      return 'other'; // Background 会根据 MIME 重新分类
+      // Also classify by contentType for fetch-detected events that carry stream info
+      if (contentType === 'hls-manifest' || contentType === 'dash-manifest') return 'stream';
+      // MSE detection is a page-level signal, not a downloadable resource — skip it
+      if (type === 'mse-detected') return 'other';
+      return 'other';
+    }
+
+    function parseMagnetDisplayName(magnetUri: string): string | undefined {
+      try {
+        const params = new URLSearchParams(magnetUri.split('?')[1] || '');
+        const dn = params.get('dn');
+        // URLSearchParams.get() already percent-decodes; no double decode needed
+        return dn || undefined;
+      } catch {
+        return undefined;
+      }
     }
   },
 });

@@ -84,6 +84,10 @@ pub struct DownloadParams {
     /// Proxy configuration — used by FTP downloader for SOCKS/HTTP CONNECT tunneling.
     /// HTTP downloads use the proxy via the `client` field (already configured).
     pub proxy_config: crate::proxy_config::ProxyConfig,
+    /// HLS quality selection: when set, the HLS downloader sends quality
+    /// options to Dart via signal and awaits the chosen variant index on this
+    /// channel.  `None` for non-HLS downloads (HTTP/FTP/BT).
+    pub hls_quality_rx: Option<tokio::sync::oneshot::Receiver<i32>>,
 }
 
 // ---------------------------------------------------------------------------

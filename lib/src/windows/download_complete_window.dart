@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:io';
 
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -28,7 +27,6 @@ class DownloadCompleteWindow extends StatefulWidget {
 
 class _DownloadCompleteWindowState extends State<DownloadCompleteWindow>
     with SingleTickerProviderStateMixin {
-  Timer? _autoCloseTimer;
   bool _isHovered = false;
   late final AnimationController _progressController;
 
@@ -49,14 +47,13 @@ class _DownloadCompleteWindowState extends State<DownloadCompleteWindow>
     _progressController = AnimationController(
       vsync: this,
       duration: _autoCloseDuration,
-    )..forward();
+    )..addStatusListener(_onAnimationStatus);
+    _progressController.forward();
     WidgetsBinding.instance.addPostFrameCallback((_) => _initWindow());
-    _startAutoClose();
   }
 
   @override
   void dispose() {
-    _autoCloseTimer?.cancel();
     _progressController.dispose();
     super.dispose();
   }
@@ -78,10 +75,10 @@ class _DownloadCompleteWindowState extends State<DownloadCompleteWindow>
     SubWindowUtils.focus();
   }
 
-  void _startAutoClose() {
-    _autoCloseTimer = Timer(_autoCloseDuration, () {
-      if (!_isHovered) _close();
-    });
+  void _onAnimationStatus(AnimationStatus status) {
+    if (status == AnimationStatus.completed && !_isHovered) {
+      _close();
+    }
   }
 
   Future<void> _close() async {
@@ -134,13 +131,15 @@ class _DownloadCompleteWindowState extends State<DownloadCompleteWindow>
       body: MouseRegion(
         onEnter: (_) {
           _isHovered = true;
-          _autoCloseTimer?.cancel();
           _progressController.stop();
         },
         onExit: (_) {
           _isHovered = false;
-          _progressController.forward();
-          _startAutoClose();
+          if (_progressController.isCompleted) {
+            _close();
+          } else {
+            _progressController.forward();
+          }
         },
         // 使用 Column（默认 mainAxisSize: max）填满窗口，
         // 中间区域用 Expanded 吸收多余空间，彻底杜绝溢出。

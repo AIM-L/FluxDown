@@ -5,7 +5,7 @@ use std::sync::Arc;
 use futures_util::FutureExt;
 use reqwest::Client;
 use rinf::RustSignal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -13,7 +13,9 @@ use uuid::Uuid;
 use crate::bt_downloader::{self, BtConfig, BtDownloadParams, SharedBtSession, TorrentSource};
 use crate::db::Db;
 use crate::downloader::{self, DownloadParams, ProgressUpdate, SegmentProgressInfo};
+use crate::dash_downloader;
 use crate::ftp_downloader;
+use crate::hls_downloader;
 use crate::proxy_config::ProxyConfig;
 use crate::signals::{AllTasks, SegmentDetail, SegmentProgress, TaskProgress};
 use crate::speed_limiter::SpeedLimiter;
@@ -162,6 +164,10 @@ pub struct DownloadManager {
     app_data_dir: String,
     /// User-configurable BT settings (DHT, UPnP, ports, custom trackers).
     bt_config: BtConfig,
+    /// Pending HLS quality selections: task_id → oneshot sender.
+    /// Populated when an HLS download starts; consumed when Dart sends
+    /// `SelectHlsQuality`.
+    hls_quality_senders: HashMap<String, oneshot::Sender<i32>>,
 }
 
 impl DownloadManager {
@@ -195,7 +201,9 @@ impl DownloadManager {
             bt_task_ids: HashSet::new(),
             speed_limiter: limiter,
             bt_session: None,
+            hls_quality_senders: HashMap::new(),
             default_save_dir,
+
             app_data_dir,
             bt_config,
         })
@@ -370,6 +378,7 @@ impl DownloadManager {
                 self.active_tokens.remove(task_id);
                 self.active_handles.remove(task_id);
                 self.bt_task_ids.remove(task_id);
+                self.hls_quality_senders.remove(task_id);
             }
         // A slot freed up — try to start queued tasks.
         self.drain_queue().await;
@@ -385,6 +394,18 @@ impl DownloadManager {
             && let Err(e) = self.db.wal_checkpoint().await
         {
             rinf::debug_print!("[manager] wal_checkpoint error: {e}");
+        }
+    }
+
+    /// Forward a quality selection from Dart to the waiting HLS download task.
+    pub fn send_hls_quality_selection(&mut self, task_id: &str, selected_index: i32) {
+        if let Some(tx) = self.hls_quality_senders.remove(task_id) {
+            let _ = tx.send(selected_index);
+        } else {
+            rinf::debug_print!(
+                "[manager] no pending HLS quality selection for task {}",
+                task_id
+            );
         }
     }
 
@@ -547,6 +568,8 @@ impl DownloadManager {
             .insert(task_id.clone(), (cancel_token.clone(), spawn_gen));
 
         let use_ftp = is_ftp_url(&url);
+        let use_hls = hls_downloader::is_hls_url(&url);
+        let use_dash = dash_downloader::is_dash_url(&url);
         let use_bt = is_magnet(&url) || !torrent_file_bytes.is_empty() || is_torrent_file_url(&url);
 
         if use_bt {
@@ -639,6 +662,14 @@ impl DownloadManager {
                 }
             };
 
+            let hls_quality_rx = if use_hls || use_dash {
+                let (tx, rx) = oneshot::channel();
+                self.hls_quality_senders.insert(task_id.clone(), tx);
+                Some(rx)
+            } else {
+                None
+            };
+
             let params = DownloadParams {
                 task_id: task_id.clone(),
                 url,
@@ -653,11 +684,20 @@ impl DownloadManager {
                 speed_limiter: self.speed_limiter.clone(),
                 cookies,
                 proxy_config: task_proxy,
+                hls_quality_rx,
             };
 
             tokio::spawn(async move {
                 let result = if use_ftp {
                     std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
+                        .catch_unwind()
+                        .await
+                } else if use_hls {
+                    std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
+                        .catch_unwind()
+                        .await
+                } else if use_dash {
+                    std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
                         .catch_unwind()
                         .await
                 } else {
@@ -702,6 +742,7 @@ impl DownloadManager {
         if let Some((token, _gen)) = self.active_tokens.remove(task_id) {
             token.cancel();
             self.bt_task_ids.remove(task_id);
+            self.hls_quality_senders.remove(task_id);
 
             // For BT tasks, explicitly pause the torrent in the session so
             // that the handle stays cached for fast resume.  This is a
@@ -802,6 +843,8 @@ impl DownloadManager {
             .insert(task_id.to_string(), (cancel_token.clone(), spawn_gen));
 
         let use_ftp = is_ftp_url(&task.url);
+        let use_hls = hls_downloader::is_hls_url(&task.url);
+        let use_dash = dash_downloader::is_dash_url(&task.url);
         let use_bt = is_bt_url(&task.url);
 
         if use_bt {
@@ -940,6 +983,14 @@ impl DownloadManager {
                 }
             };
 
+            let hls_quality_rx = if use_hls || use_dash {
+                let (tx, rx) = oneshot::channel();
+                self.hls_quality_senders.insert(tid.clone(), tx);
+                Some(rx)
+            } else {
+                None
+            };
+
             let params = DownloadParams {
                 task_id: tid.clone(),
                 url: task.url,
@@ -954,11 +1005,20 @@ impl DownloadManager {
                 speed_limiter: self.speed_limiter.clone(),
                 cookies: String::new(),
                 proxy_config: task_proxy,
+                hls_quality_rx,
             };
 
             tokio::spawn(async move {
                 let result = if use_ftp {
                     std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
+                        .catch_unwind()
+                        .await
+                } else if use_hls {
+                    std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
+                        .catch_unwind()
+                        .await
+                } else if use_dash {
+                    std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
                         .catch_unwind()
                         .await
                 } else {
@@ -987,6 +1047,7 @@ impl DownloadManager {
         if let Some((token, _gen)) = self.active_tokens.remove(task_id) {
             token.cancel();
             self.bt_task_ids.remove(task_id);
+            self.hls_quality_senders.remove(task_id);
 
             // For BT tasks, explicitly pause the torrent in the session so
             // that fast-resume data is preserved and the user can resume later.
@@ -1040,6 +1101,7 @@ impl DownloadManager {
         if let Some((token, _gen)) = self.active_tokens.remove(task_id) {
             token.cancel();
             self.bt_task_ids.remove(task_id);
+            self.hls_quality_senders.remove(task_id);
         }
         if let Some(handle) = self.active_handles.remove(task_id) {
             // Timeout guard: don't block forever if the task misbehaves.
@@ -1070,10 +1132,24 @@ impl DownloadManager {
                     }
                 }
             } else {
-                // HTTP / FTP: always clean up the in-progress temp file
+                // HTTP / FTP / HLS / DASH: always clean up the in-progress temp file
                 let temp_path =
                     PathBuf::from(format!("{}{}", path.display(), downloader::TEMP_EXT));
                 let _ = tokio::fs::remove_file(&temp_path).await;
+
+                // DASH audio sidecar: clean up .audio.m4a and its .part temp
+                if dash_downloader::is_dash_url(&t.url) {
+                    let audio_path = dash_downloader::build_audio_path(&path);
+                    let audio_temp = PathBuf::from(format!(
+                        "{}{}",
+                        audio_path.display(),
+                        downloader::TEMP_EXT
+                    ));
+                    let _ = tokio::fs::remove_file(&audio_temp).await;
+                    if delete_files {
+                        let _ = tokio::fs::remove_file(&audio_path).await;
+                    }
+                }
 
                 if delete_files {
                     let _ = tokio::fs::remove_file(&path).await;

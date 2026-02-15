@@ -15,6 +15,7 @@ import 'src/models/download_controller.dart';
 import 'src/models/settings_provider.dart';
 import 'src/pages/home_page.dart';
 import 'src/services/external_download_service.dart';
+import 'src/services/hls_quality_service.dart';
 import 'src/services/analytics_service.dart';
 import 'src/services/log_service.dart';
 import 'src/services/notification_service.dart';
@@ -223,6 +224,9 @@ class _FluxDownAppState extends State<FluxDownApp> with WindowListener {
       settingsProvider: _settingsForExternal,
       navigatorKey: _navigatorKey,
     );
+
+    // 初始化 HLS 画质选择服务 — 监听 Rust 端的画质选项信号
+    HlsQualityService.init(navigatorKey: _navigatorKey);
     // 请求加载配置，确保 settingsProvider 有默认保存目录等数据
     _settingsForExternal.requestConfig();
 
@@ -265,6 +269,7 @@ class _FluxDownAppState extends State<FluxDownApp> with WindowListener {
     logInfo('FluxDownApp', 'dispose called');
     _singleInstanceChannel.setMethodCallHandler(null);
     TrayService.instance.onExitApp = null;
+    HlsQualityService.shutdown();
     ExternalDownloadService.shutdown();
     _settingsForExternal.dispose();
     windowManager.removeListener(this);

@@ -25,6 +25,8 @@ const TABS: TabDef[] = [
   { key: 'document', i18nKey: 'panel.tabDocs' },
   { key: 'archive', i18nKey: 'panel.tabArchive' },
   { key: 'stream', i18nKey: 'panel.tabStream' },
+  { key: 'subtitle', i18nKey: 'panel.tabSubtitle' },
+  { key: 'magnet', i18nKey: 'panel.tabMagnet' },
   { key: 'other', i18nKey: 'panel.tabOther' },
 ];
 

@@ -13,8 +13,8 @@ use crate::signals::{
     BatchCreateTask, CheckFileAssociation, CheckForUpdate, ConfigEntry, ConfigLoaded,
     ConfirmExternalDownload, ControlTask, CreateTask, DetectSystemProxy, DownloadUpdate,
     ExternalDownloadRequest, FileAssociationStatus, InstallUpdate, ProxyTestResult,
-    RequestAllTasks, RequestConfig, SaveConfig, SetFileAssociation, SystemProxyInfo,
-    TestProxyConnection, UpdateCheckResult,
+    RequestAllTasks, RequestConfig, SaveConfig, SelectHlsQuality, SetFileAssociation,
+    SystemProxyInfo, TestProxyConnection, UpdateCheckResult,
 };
 use crate::updater;
 
@@ -159,6 +159,7 @@ pub async fn run(db_dir: PathBuf) {
     let check_file_assoc_recv = CheckFileAssociation::get_dart_signal_receiver();
     let test_proxy_recv = TestProxyConnection::get_dart_signal_receiver();
     let detect_sys_proxy_recv = DetectSystemProxy::get_dart_signal_receiver();
+    let select_hls_quality_recv = SelectHlsQuality::get_dart_signal_receiver();
 
     // Spawn the Native Messaging listener (reads from stdin in a blocking thread).
     // When the browser extension sends a download request, it arrives on this channel.
@@ -415,6 +416,16 @@ pub async fn run(db_dir: PathBuf) {
                         }
                     }
                 });
+            }
+            // --- HLS quality selection ---
+            Some(signal) = select_hls_quality_recv.recv() => {
+                let msg = signal.message;
+                rinf::debug_print!(
+                    "[actor] HLS quality selected: task={}, index={}",
+                    msg.task_id,
+                    msg.selected_index,
+                );
+                manager.send_hls_quality_selection(&msg.task_id, msg.selected_index);
             }
             // --- Proxy connectivity test ---
             Some(signal) = test_proxy_recv.recv() => {
