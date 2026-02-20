@@ -1,10 +1,12 @@
 #include "flutter_window.h"
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "flutter/generated_plugin_registrant.h"
+#include "utils.h"
 
 // Must match kCopyDataId in main.cpp.
 static const ULONG_PTR kCopyDataId = 0x464C5558; // "FLUX"
@@ -40,9 +42,20 @@ bool FlutterWindow::OnCreate() {
 
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
-  flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
-  });
+  // Check --silentStart before the callback to avoid capturing by reference.
+  const std::vector<std::string> cmd_args = GetCommandLineArguments();
+  const bool is_silent_start =
+      std::find(cmd_args.begin(), cmd_args.end(), "--silentStart") !=
+      cmd_args.end();
+
+  flutter_controller_->engine()->SetNextFrameCallback(
+      [this, is_silent_start]() {
+        // Skip showing the window on first frame if launched with --silentStart
+        // (boot autostart silent mode).
+        if (!is_silent_start) {
+          this->Show();
+        }
+      });
 
   // Flutter can complete the first frame before the "show window" callback is
   // registered. The following call ensures a frame is pending to ensure the

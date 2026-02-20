@@ -114,6 +114,16 @@ Future<void> main(List<String> args) async {
     appPath: Platform.resolvedExecutable,
     args: ['--silentStart'],
   );
+  // 若已启用开机启动，重新写入注册表确保 --silentStart 参数始终最新。
+  // 处理旧版本注册表条目缺少该参数的迁移场景。
+  try {
+    if (await launchAtStartup.isEnabled()) {
+      await launchAtStartup.enable();
+      logInfo('main', 'launchAtStartup re-enabled to refresh --silentStart arg');
+    }
+  } catch (e) {
+    logInfo('main', 'launchAtStartup refresh skipped: $e');
+  }
   logInfo('main', 'launchAtStartup setup done');
 
   // 初始化系统托盘
