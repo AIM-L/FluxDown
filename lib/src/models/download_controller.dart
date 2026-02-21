@@ -257,17 +257,21 @@ class DownloadController extends ChangeNotifier {
     };
   }
 
-  /// 各文件类型分类的任务数量（用于侧边栏显示计数）
+  /// 各文件类型分类的任务数量（用于侧边栏显示计数）。
+  /// 若当前有队列筛选，仅统计该队列内的任务。
   int countForCategory(FileCategory category) {
-    if (category == FileCategory.all) return _tasks.length;
-    return _tasks.where((t) => t.fileCategory == category).length;
+    final base = _queueFiltered;
+    if (category == FileCategory.all) return base.length;
+    return base.where((t) => t.fileCategory == category).length;
   }
 
-  /// 各状态的任务数量（不受文件类型过滤影响，用于侧边栏全局计数）
+  /// 各状态的任务数量（用于侧边栏状态区块计数）。
+  /// 若当前有队列筛选，仅统计该队列内的任务，使计数与点击后的实际结果一致。
   int countForStatus(StatusTab tab) {
+    final base = _queueFiltered;
     return switch (tab) {
-      StatusTab.all => _tasks.length,
-      StatusTab.downloading => _tasks
+      StatusTab.all => base.length,
+      StatusTab.downloading => base
           .where(
             (t) =>
                 t.status == TaskStatus.downloading ||
@@ -277,11 +281,11 @@ class DownloadController extends ChangeNotifier {
           )
           .length,
       StatusTab.completed =>
-        _tasks.where((t) => t.status == TaskStatus.completed).length,
+        base.where((t) => t.status == TaskStatus.completed).length,
       StatusTab.paused =>
-        _tasks.where((t) => t.status == TaskStatus.paused).length,
+        base.where((t) => t.status == TaskStatus.paused).length,
       StatusTab.error =>
-        _tasks.where((t) => t.status == TaskStatus.error).length,
+        base.where((t) => t.status == TaskStatus.error).length,
     };
   }
 

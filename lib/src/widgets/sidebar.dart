@@ -232,7 +232,7 @@ class _SidebarState extends State<Sidebar> {
           );
         },
       ),
-    );
+    ).then((_) => nameCtrl.dispose());
   }
 
   // 编辑队列对话框
@@ -261,7 +261,7 @@ class _SidebarState extends State<Sidebar> {
           );
         },
       ),
-    );
+    ).then((_) => nameCtrl.dispose());
   }
 
   // 删除队列确认对话框
@@ -791,8 +791,11 @@ class _QueueDialogState extends State<_QueueDialog> {
   void _confirm() {
     final name = widget.nameCtrl.text.trim();
     if (name.isEmpty) return;
-    final speedLimit = int.tryParse(_speedCtrl.text.trim()) ?? 0;
-    final maxConcurrent = int.tryParse(_concurrentCtrl.text.trim()) ?? 0;
+    // 钳制到合法范围：速度 0-1073741824 KB/s，并发 0-100（0 = 使用全局设置）
+    final speedLimit =
+        (int.tryParse(_speedCtrl.text.trim()) ?? 0).clamp(0, 1 << 30);
+    final maxConcurrent =
+        (int.tryParse(_concurrentCtrl.text.trim()) ?? 0).clamp(0, 100);
     final saveDir = _saveDirCtrl.text.trim();
     Navigator.of(context).pop();
     widget.onConfirm(name, speedLimit, maxConcurrent, saveDir);
