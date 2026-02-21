@@ -50,12 +50,13 @@ def get_previous_tag() -> str | None:
 
 
 def get_commits(from_tag: str | None, to_ref: str = "HEAD") -> str:
-    """获取两个 ref 之间的 commit log"""
+    """获取两个 ref 之间的 commit log，含变更文件列表（用于模块归属判断）"""
     if from_tag:
         range_spec = f"{from_tag}..{to_ref}"
     else:
         range_spec = to_ref
-    return run(["git", "log", range_spec, "--pretty=format:%h %s"])
+    # --name-only 列出每个 commit 修改的文件，供 AI 按路径判断所属模块
+    return run(["git", "log", range_spec, "--pretty=format:COMMIT %h %s", "--name-only"])
 
 
 def generate_release_notes(version: str, commits: str, prev_tag: str | None) -> str:
@@ -65,11 +66,36 @@ def generate_release_notes(version: str, commits: str, prev_tag: str | None) -> 
     prompt = textwrap.dedent(f"""\
         你是 FluxDown 项目的发布助手。FluxDown 是一个多协议下载工具，项目包含三个模块：
 
-        1. **FluxDown 客户端** — 桌面下载应用（Flutter + Rust），支持 HTTP/FTP/BT 多协议下载
-        2. **浏览器扩展** — Chrome/Firefox 扩展（fluxDown/ 目录），用于拦截浏览器下载并发送到客户端
-        3. **官网** — FluxDown 官方网站（website/ 目录），产品展示与下载页
+        1. **客户端** — 桌面下载应用（Flutter + Rust），支持 HTTP/FTP/BT 多协议下载
+        2. **浏览器扩展** — Chrome/Firefox 扩展，用于拦截浏览器下载并发送到客户端
+        3. **官网** — FluxDown 官方网站，产品展示与下载页
 
-        请根据以下 Git commit 记录，生成一份面向用户的中文 Release Notes。
+        ## 文件路径 → 模块归属规则（严格按此判断，优先级高于 commit 消息措辞）
+
+        | 文件路径前缀 | 所属模块 |
+        |-------------|---------|
+        | `lib/` | 客户端 |
+        | `native/` | 客户端 |
+        | `windows/` / `android/` / `ios/` / `macos/` / `linux/` | 客户端 |
+        | `assets/` | 客户端 |
+        | `fluxDown/` | 浏览器扩展 |
+        | `website/` | 官网 |
+        | `.github/workflows/` | 忽略（CI 内部，用户不感知） |
+        | `scripts/` / 根目录配置文件 | 忽略（开发工具，用户不感知） |
+
+        跨模块 commit（同时修改了多个模块的文件）需拆分到各自模块下分别描述。
+
+        ## 任务
+
+        请根据以下 Git commit 记录生成一份面向用户的中文 Release Notes。
+
+        每条 commit 记录格式为：
+        ```
+        COMMIT <hash> <subject>
+        <修改的文件1>
+        <修改的文件2>
+        ...
+        ```
 
         版本: {version}
         变更范围: {range_desc}
@@ -77,21 +103,21 @@ def generate_release_notes(version: str, commits: str, prev_tag: str | None) -> 
         Commit 记录:
         {commits}
 
-        要求:
+        ## 输出要求
+
         1. 用 Markdown 格式输出
         2. 开头用一两句话总结本次版本的核心亮点
-        3. 按**模块**分组，使用以下三级标题（仅在该模块有实际变更时才列出）:
-           - `### 客户端` — 桌面应用相关（下载引擎、UI、设置、性能等）
-           - `### 浏览器扩展` — 扩展相关（拦截、通信、兼容性等）
-           - `### 官网` — 网站相关（页面、内容、部署等）
-        4. 每个模块内按类型（新功能/改进/修复）用列表列出要点，语言简洁
-        5. 一条 commit 可能涉及多个模块，需要拆分到各自模块下
-        6. 忽略纯 CI/chore 类 commit，除非对用户体验有直接影响
-        7. 只输出 Release Notes 正文，不要加多余解释
-        8. 严禁在开头加版本号标题（如 "## v0.0.4 Release Notes"），直接从总结句开始
-        9. 不要使用水平分隔线（---）
-        10. 不要总结匿名信息收集方面的内容
-        11. 不要携带任何代码内容，只总结功能
+        3. 按模块分组，使用以下三级标题（**仅在该模块确实有文件变更时才列出**）：
+           - `### 客户端`
+           - `### 浏览器扩展`
+           - `### 官网`
+        4. 每个模块内按类型（新功能 / 改进 / 修复）用列表列出要点，语言简洁
+        5. 忽略纯 CI/chore/scripts commit，除非对用户体验有直接影响
+        6. 只输出 Release Notes 正文，不要加多余解释
+        7. 严禁在开头加版本号标题（如 "## v0.0.4 Release Notes"），直接从总结句开始
+        8. 不要使用水平分隔线（---）
+        9. 不要总结匿名信息收集方面的内容
+        10. 不要携带任何代码内容，只总结功能
     """)
 
     print("正在调用 Claude CLI 生成 Release Notes...")
@@ -226,9 +252,10 @@ def main() -> None:
         print("没有找到新的 commit", file=sys.stderr)
         sys.exit(1)
 
+    commit_count = sum(1 for line in commits.splitlines() if line.startswith("COMMIT "))
     print(f"版本: {version}")
     print(f"前一个 tag: {prev_tag or '(无)'}")
-    print(f"共 {len(commits.splitlines())} 个 commit")
+    print(f"共 {commit_count} 个 commit")
     print("-" * 40)
 
     # 生成 Release Notes
