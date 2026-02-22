@@ -62,7 +62,7 @@ const zhCN: Messages = {
   "hero.title1": "下载，",
   "hero.title2": "全面加速。",
   "hero.subtitle":
-    "Rust 驱动的多协议下载管理器，支持 HTTP/FTP/BitTorrent 磁力链接，智能多线程加速与浏览器无缝集成。精美界面，极致性能，永久免费，零广告。",
+    "Rust 驱动的多协议下载管理器，支持 HTTP/FTP/BitTorrent 磁力链接及 HLS/DASH 流媒体，智能多线程加速与浏览器无缝集成。精美界面，极致性能，永久免费，零广告。",
   "hero.cta": "下载 Windows 版",
   "hero.stat1.value": "10x",
   "hero.stat1.label": "极速下载",
@@ -104,7 +104,7 @@ const zhCN: Messages = {
   "mockup.labelPath": "路径",
   "mockup.labelUrl": "地址",
   "mockup.labelError": "错误",
-  "mockup.threadsValue": "{n} 线程",
+  "mockup.threadsValue": "{n} 线程（动态）",
   "mockup.btnPause": "暂停",
   "mockup.btnResume": "继续",
   "mockup.btnDelete": "删除",
@@ -131,7 +131,7 @@ const zhCN: Messages = {
     "IDM 风格的智能分段与运行时动态拆分。空闲线程自动接管慢速分段，连接复用避免重建开销，榨取每一份带宽。",
   "features.protoTitle": "多协议支持",
   "features.protoDesc":
-    "全面支持 HTTP、HTTPS、FTP 和 BitTorrent 磁力链接。每种协议都有专属优化引擎——从 HTTP Range 请求到 DHT 节点发现，开箱即用。",
+    "全面支持 HTTP、HTTPS、FTP、BitTorrent 磁力链接及 HLS/DASH 流媒体。每种协议都有专属优化引擎——从 HTTP Range 请求到 DHT 节点发现，开箱即用。",
   "features.speedTitle": "速度控制",
   "features.speedDesc":
     "基于令牌桶算法的全局限速器。设置带宽限制，让下载在后台运行的同时保持流畅的浏览体验。",
@@ -140,10 +140,10 @@ const zhCN: Messages = {
     "完整的断点续传支持。所有下载状态持久化到 SQLite — 安全关闭和重启，不丢失任何一个字节。",
   "features.browserTitle": "浏览器集成",
   "features.browserDesc":
-    "Chrome/Firefox 扩展三层拦截引擎，自动识别流媒体资源（HLS/DASH）。智能文件类型过滤、域名规则，一键加速。",
+    "Chrome/Firefox 扩展三层拦截引擎，自动识别流媒体资源（HLS/DASH）。页面资源嗅探、智能文件类型过滤、域名规则，一键加速。",
   "features.uiTitle": "精美界面",
   "features.uiDesc":
-    "精心打磨的视觉体验——深色与浅色主题、12 套配色方案、可调节面板的响应式布局。一款真正赏心悦目的下载工具。",
+    "精心打磨的视觉体验——深色与浅色主题、13 套配色方案、可调节面板的响应式布局。一款真正赏心悦目的下载工具。",
   "features.cleanTitle": "纯净安心",
   "features.cleanDesc":
     "零广告、零追踪、无需注册账号。所有数据留在本地——基于 SQLite 的本地优先架构。你的下载，只属于你。",
@@ -153,7 +153,7 @@ const zhCN: Messages = {
   "ext.title": "无缝接管",
   "ext.titleHighlight": "下载任务",
   "ext.subtitle":
-    "安装 Chrome 扩展，自动拦截浏览器下载并发送到 FluxDown。支持任意网站，可按需配置。",
+    "安装 Chrome 或 Firefox 扩展，自动拦截浏览器下载并发送到 FluxDown。支持任意网站，可按需配置。",
   "ext.feat1.title": "一键拦截",
   "ext.feat1.desc": "自动捕获下载请求，或通过右键菜单手动发送，完全掌控",
   "ext.feat2.title": "本地通信",
@@ -312,7 +312,7 @@ const zhCN: Messages = {
     "浏览器扩展支持 Chrome、Edge 及其他基于 Chromium 的浏览器，同时也支持 Firefox。扩展会自动拦截下载并发送到 FluxDown 进行加速下载。",
   "faq.items.4.q": "FluxDown 和 IDM 有什么区别？",
   "faq.items.4.a":
-    "FluxDown 提供类似的多线程下载加速功能，但完全免费，且使用现代技术（Rust + Flutter）构建。支持 HTTP、HTTPS 和 FTP 协议，具备基于系统配置的智能分段功能，提供原生桌面体验。",
+    "FluxDown 提供类似的多线程下载加速功能，但完全免费，且使用现代技术（Rust + Flutter）构建。支持 HTTP、HTTPS、FTP、BitTorrent 及 HLS/DASH 流媒体协议，具备基于系统配置的智能分段功能，提供原生桌面体验。",
   "faq.items.5.q": "FluxDown 支持断点续传吗？",
   "faq.items.5.a":
     "支持。FluxDown 具备完整的断点续传功能。所有下载进度都持久化到本地 SQLite 数据库中。你可以安全地关闭应用或重启电脑，不会丢失任何进度。",

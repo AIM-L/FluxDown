@@ -1,8 +1,19 @@
 # FluxDown — 项目知识库
 
-**应用名称**: FluxDown（类迅雷多协议下载工具）
+**应用名称**: FluxDown（多协议下载管理器，IDM 免费替代品）
+**官网**: https://fluxdown.app
 **技术栈**: Flutter (GUI) + Rust (下载引擎) + WXT 浏览器扩展
 **FFI 框架**: [Rinf 8.9](https://rinf.cunarist.org)（Dart↔Rust 信号通信，bincode 序列化）
+
+## 产品定位（来自官网）
+
+> **"Downloads, Supercharged."**（下载，全面加速。）
+
+- **核心价值主张**: Rust 驱动，10x 下载速度，永久免费，零广告，零追踪，无需账号
+- **目标用户**: 需要高速下载的用户、IDM 付费用户替代、关注隐私的用户、多协议需求专业用户
+- **与 IDM 对比优势**: 完全免费、现代技术栈（Rust + Flutter）、开源透明、本地优先架构
+- **平台支持**: Windows（已发布）；macOS/Linux/Web/移动端（规划中）
+- **SEO 描述**: "A blazing fast, multi-protocol download manager with browser extension. Powered by Rust engine with HTTP/HTTPS/FTP support, intelligent segmentation, and speed optimization."
 
 ## 命令速查
 
@@ -33,6 +44,16 @@ npm run dev                          # 开发模式（Chrome）
 npm run dev:firefox                  # 开发模式（Firefox）
 npm run build                        # 构建生产版
 npm run zip                          # 打包上架
+
+# 官网（website/ 目录下，Astro + React）
+npm run dev                          # 本地开发服务器 localhost:4321
+npm run build                        # 构建生产版到 dist/
+npm run preview                      # 预览构建结果
+
+# 发布版本
+python scripts/release_tag.py v0.x.x --push --github-release --update-changelog
+python scripts/release_tag.py v0.x.x --model opus --lang both --push --github-release  # 高质量双语
+python scripts/release_tag.py v0.x.x --dry-run  # 仅预览
 ```
 
 ## 项目结构
@@ -43,11 +64,28 @@ x_down/
 │   ├── main.dart                      # 应用入口（多窗口分发、初始化流程）
 │   └── src/
 │       ├── models/                    # 数据模型与状态管理
-│       ├── pages/                     # 页面（home_page, settings_page）
-│       ├── services/                  # 服务层（external_download, tray）
-│       ├── theme/                     # 主题（app_theme, app_colors, theme_provider）
-│       ├── widgets/                   # UI 组件
-│       ├── windows/                   # 子窗口（quick_download_window）
+│       │   ├── download_task.dart     # 任务模型（状态枚举/文件类型/分段数据）
+│       │   ├── download_controller.dart  # 核心控制器（桥接 Rust 信号和 Flutter UI）
+│       │   ├── download_queue.dart    # 命名队列模型
+│       │   └── settings_provider.dart # 全局设置（30+ 配置项）
+│       ├── pages/                     # 页面
+│       │   ├── home_page.dart         # 主页面（三栏布局：侧边栏+列表+详情）
+│       │   └── settings_page.dart     # 设置页面（6个分类：通用/外观/下载/BT/代理/关于）
+│       ├── services/                  # 服务层
+│       │   ├── external_download_service.dart  # 监听浏览器扩展请求 (HTTP :19527)
+│       │   ├── hls_quality_service.dart        # HLS 画质选择服务
+│       │   ├── tray_service.dart               # 系统托盘
+│       │   ├── notification_service.dart       # 下载完成通知（2s 聚合）
+│       │   ├── update_service.dart             # 自动更新（GitHub Releases）
+│       │   ├── analytics_service.dart          # 匿名数据分析（GA4）
+│       │   ├── feedback_service.dart           # 反馈提交（GitHub Issues）
+│       │   └── log_service.dart                # 日志管理（10MB 轮转，保留3个）
+│       ├── theme/                     # 主题
+│       │   ├── app_theme.dart         # 浅色/深色主题构建
+│       │   ├── app_colors.dart        # 主题感知色板（AppColors.of(context)）
+│       │   └── theme_provider.dart    # 主题切换+持久化（SharedPreferences）
+│       ├── widgets/                   # UI 组件（见下方详细清单）
+│       ├── windows/                   # 子窗口
 │       └── bindings/                  # ⚠️ 自动生成 — 勿手动编辑
 ├── native/hub/                        # Rust 下载引擎 crate（edition 2024）
 │   └── src/
@@ -58,10 +96,29 @@ x_down/
 │       ├── downloader.rs              # HTTP/HTTPS 下载引擎（分片/断点续传）
 │       ├── ftp_downloader.rs          # FTP 下载引擎（suppaftp 同步 API）
 │       ├── bt_downloader.rs           # BitTorrent 引擎（librqbit）
-│       ├── db.rs                      # SQLite 数据层（tasks/task_segments/config）
+│       ├── hls_downloader.rs          # HLS 下载引擎（M3U8/多码率/AES解密）
+│       ├── dash_downloader.rs         # DASH 下载引擎（MPD，基础支持）
+│       ├── segment_coordinator.rs     # 动态分段协调（主动拆分/抢救慢速分段）
+│       ├── meta_prober.rs             # 文件元数据探测（HEAD/Range:0-0）
+│       ├── proxy_config.rs            # 代理配置（无/系统/手动，读 Windows 注册表）
+│       ├── protocol_registry.rs       # fluxdown:// 自定义协议注册（Windows）
+│       ├── file_association.rs        # .torrent 文件关联注册（Windows）
+│       ├── native_messaging.rs        # HTTP Server :19527（浏览器扩展通信）
+│       ├── updater.rs                 # 自动更新器（GitHub Releases API）
+│       ├── db.rs                      # SQLite 数据层（tasks/task_segments/config/queues）
 │       ├── speed_limiter.rs           # Token bucket 全局速度限制器
 │       └── segment_advisor.rs         # 动态分段计算（文件大小+CPU+带宽）
 ├── fluxDown/                          # WXT 浏览器扩展（Chrome MV3, TypeScript）
+├── website/                           # 官网（Astro + React，部署到 Vercel）
+│   └── src/
+│       ├── pages/index.astro          # 主页（Hero/Features/Extension/Download 区块）
+│       ├── pages/faq.astro            # FAQ 页面（8个常见问题，中英双语）
+│       ├── pages/changelog.astro      # 更新日志（GitHub Releases 自动加载）
+│       ├── pages/feedback.astro       # 反馈页面
+│       ├── pages/vote.astro           # 社区投票页面
+│       ├── pages/qq-group.astro       # QQ 群页面（群号：832143651）
+│       └── pages/api/                 # API 路由（feedback/issues/release/vote/subscribe）
+├── scripts/release_tag.py             # 自动发布脚本（Claude CLI 生成 Release Notes）
 ├── Cargo.toml                         # Rust workspace（resolver = "3"）
 └── pubspec.yaml                       # Flutter 依赖
 ```
@@ -73,16 +130,265 @@ x_down/
                                           │
                           ┌───────────────┼──────────────────┐
                     [DownloadManager]    [Db]          [native_messaging]
-                     │      │    │    (SQLite)       (HTTP :19527)
-              [downloader] [ftp] [bt]                      ↑
-              (HTTP/HTTPS) (FTP) (BT)             [WXT 浏览器扩展]
-                     │
-            [SpeedLimiter] + [segment_advisor]
+                     │    │    │    │  (SQLite)       (HTTP :19527)
+              [HTTP] [FTP] [BT] [HLS]                      ↑
+                     │                             [WXT 浏览器扩展]
+            [SpeedLimiter] + [segment_advisor] + [segment_coordinator]
 ```
 
 **状态管理**: ChangeNotifier + ListenableBuilder（无 Provider/Riverpod/Bloc）
 **并发模型**: 每个下载 spawn 独立 tokio task，CancellationToken 控制生命周期
 **状态码**: 0=pending, 1=downloading, 2=paused, 3=completed, 4=error, 5=preparing
+
+## UI 组件完整清单
+
+### 页面
+
+| 文件 | 功能描述 |
+|------|---------|
+| `pages/home_page.dart` | 主页面。三栏布局（侧边栏 180-320px / 任务列表 / 详情面板 240-420px），全局快捷键（Ctrl+F/A/Esc/Del），Boost 优先下载 Banner，下载完成 2s 聚合通知 |
+| `pages/settings_page.dart` | 设置页面。侧边栏导航 6 个分类：通用（开机启动/关闭到托盘/torrent关联/匿名分析）、外观（语言/主题/颜色）、下载（目录/线程/并发/速度/UA/队列）、BT（自定义 Tracker）、代理（无/系统/手动 + 代理测试）、关于（版本更新） |
+
+### 核心布局组件
+
+| 文件 | 功能描述 |
+|------|---------|
+| `widgets/sidebar.dart` | 侧边栏。Logo、文件类型筛选器（视频/音频/文档/图片/压缩包/其他）、状态筛选器、命名队列列表（增删改查）、反馈按钮 |
+| `widgets/header_bar.dart` | 顶部栏。搜索框（Ctrl+F）、批量操作（管理模式/全选/暂停/删除）、全局暂停/恢复、新建下载、设置、窗口控制 |
+| `widgets/task_tab_bar.dart` | 任务状态 Tab（全部/下载中/已完成/已暂停/错误），显示各状态计数 |
+| `widgets/task_list.dart` | 任务列表。虚拟化滚动，时间分组（今天/昨天/本周/本月/更早），分组折叠/展开，右键菜单 |
+| `widgets/task_list_item.dart` | 任务列表项。文件图标、文件名/大小/速度/进度、协议标识（HTTP/FTP/BT）、进度条、多选复选框、操作按钮、Boost 标识 |
+| `widgets/detail_panel.dart` | 详情面板。5个Tab：常规（文件信息/URL/路径/进度/速度/ETA）、分段（IDM风格可视化+动态拆分动画）、队列（移动任务）、日志、高级（Checksum/代理） |
+| `widgets/status_bar.dart` | 底部状态栏。全局下载速度、活跃任务数/总任务数、速度限制显示 |
+| `widgets/title_drag_area.dart` | 自定义标题栏拖拽区域 |
+
+### 对话框组件
+
+| 文件 | 功能描述 |
+|------|---------|
+| `widgets/new_download_dialog.dart` | 新建下载。URL（多行批量）、文件名、保存目录、线程数、队列、Cookies、代理、UA、Checksum |
+| `widgets/quick_download_dialog.dart` | 快速下载对话框（浏览器扩展调起用） |
+| `widgets/hls_quality_dialog.dart` | HLS 画质选择。M3U8 多码率选择，显示带宽/分辨率 |
+| `widgets/update_changelog_dialog.dart` | 版本更新对话框。Markdown 渲染更新日志，立即更新/稍后提醒 |
+| `widgets/feedback_dialog.dart` | 反馈对话框。提交到 GitHub Issues |
+| `widgets/context_menu.dart` | 右键菜单。暂停/恢复/取消/删除/删除+文件、打开文件/文件夹、复制URL、Boost优先 |
+| `widgets/dir_picker_field.dart` | 文件夹选择器（系统文件对话框） |
+
+## 数据模型
+
+### 任务状态枚举（8种）
+`pending`(0) / `downloading`(1) / `paused`(2) / `completed`(3) / `error`(4) / `resuming` / `preparing`(5)
+
+### 文件类型分类（7种）
+`all` / `video`(15种扩展名) / `audio`(10种) / `document`(14种) / `image`(13种) / `archive`(13种) / `other`
+
+### 时间分组（5种）
+`today` / `yesterday` / `thisWeek` / `thisMonth` / `older`
+
+### SQLite 数据库（db.rs）
+
+```sql
+-- 任务表
+CREATE TABLE tasks (
+    id TEXT PRIMARY KEY,              -- UUID
+    url TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    save_dir TEXT NOT NULL,
+    status INTEGER NOT NULL DEFAULT 0,  -- 0-5 状态码
+    total_bytes INTEGER NOT NULL DEFAULT 0,
+    downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+    segments INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,           -- Unix 时间戳（秒）
+    error_message TEXT NOT NULL DEFAULT '',
+    proxy_url TEXT NOT NULL DEFAULT '',
+    queue_id TEXT NOT NULL DEFAULT '',
+    checksum TEXT NOT NULL DEFAULT ''   -- 格式：algo=hexhash
+);
+
+-- 分段表
+CREATE TABLE task_segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    segment_index INTEGER NOT NULL,
+    start_byte INTEGER NOT NULL,
+    end_byte INTEGER NOT NULL,
+    downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+-- 配置表（30+ 配置项）
+CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- BT 文件表
+CREATE TABLE torrent_files (
+    task_id TEXT PRIMARY KEY,
+    file_bytes BLOB NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+-- 队列表
+CREATE TABLE queues (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    speed_limit_kbps INTEGER NOT NULL DEFAULT 0,
+    max_concurrent INTEGER NOT NULL DEFAULT 0,
+    default_save_dir TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL DEFAULT 0,
+    default_segments INTEGER NOT NULL DEFAULT 0,
+    default_user_agent TEXT NOT NULL DEFAULT ''
+);
+```
+
+**数据库特性**: WAL 模式、外键约束、Schema 迁移（ALTER TABLE ADD COLUMN）、5s 批量持久化
+
+## 下载协议支持
+
+| 协议 | 实现文件 | 特性 |
+|------|---------|------|
+| HTTP/HTTPS | `downloader.rs` | 多线程、断点续传、Cookie、代理、Checksum、Accept-Encoding:identity |
+| FTP | `ftp_downloader.rs` | 多线程（独立连接）、REST断点续传、代理（SOCKS4/5/HTTP）、用户名密码 |
+| BitTorrent | `bt_downloader.rs` | Magnet链接、.torrent文件、DHT、UPnP、自定义Tracker（25个，亚洲优先）、断点续传 |
+| HLS | `hls_downloader.rs` | M3U8解析、多码率选择、AES-128-CBC解密、分段下载合并、重试3次 |
+| DASH | `dash_downloader.rs` | MPD格式，基础支持 |
+
+## Rust 核心模块详解
+
+### segment_advisor.rs — 动态分段计算
+- 文件 < 1MB → 1线程；1-10MB → 4；10-100MB → 8；100MB-1GB → 16；> 1GB → 32
+- CPU 核心数上限：`num_cpus::get() * 2`
+
+### segment_coordinator.rs — 动态分段协调
+- **主动拆分（Proactive）**: 检测慢速分段 → 拆分为两段加速
+- **抢救拆分（Reactive）**: 分段卡住 → 拆分并行
+- 拆分原子性：子分段插入 + 父分段缩小，单事务提交
+- 通过 `SegmentSplitEvent` 信号触发 Dart 端拆分动画
+
+### speed_limiter.rs — Token Bucket 限速
+- 参数：`rate`（字节/秒）、`burst`（=rate，突发缓冲）
+- API：`consume(bytes)` 异步等待令牌
+
+### download_manager.rs — 任务生命周期
+- 并发控制（`maxConcurrentTasks`）
+- 协议分发（HTTP/FTP/BT/HLS/DASH）
+- 速度平滑（EMA，α=0.3）
+- WAL Checkpoint（所有任务空闲时执行）
+- 队列管理（全局默认队列 + 命名队列独立配置）
+
+### proxy_config.rs — 代理配置
+- 模式：`None` / `System`（Windows 注册表）/ `Manual`
+- 类型：HTTP / HTTPS / SOCKS4 / SOCKS5
+- 读取注册表路径：`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+
+### meta_prober.rs — 元数据探测
+- HEAD 请求 → GET Range:0-0 降级 → 文件名解析（URL / Content-Disposition）
+- 检测 Accept-Ranges 支持
+
+## 浏览器扩展（fluxDown/）
+
+### 通信架构
+- 扩展 → FluxDown: HTTP POST `localhost:19527/download`（JSON）
+- 路由：`/download`（单个）、`/batch-download`（批量）、`/ping`（健康检查）
+
+### 下载拦截三层防线
+1. **第一层** `webRequest.onHeadersReceived`: 缓存响应元数据，检测 Content-Disposition/Content-Type
+2. **第二层** `downloads.onDeterminingFilename`: 主拦截（Chrome MV3 专属），`suggest({cancel:true})` 干净取消
+3. **第三层** `downloads.onCreated + onChanged`: 兜底拦截，Firefox 唯一路径（300ms 等待元数据填充）
+
+### 资源嗅探
+- 检测：视频/音频、HLS（application/vnd.apple.mpegurl）、大文件（>1MB）、下载附件
+- 存储：按 tabId 分组，浮动面板展示
+- Badge：图标右上角数字显示资源数量
+
+### 其他特性
+- **Alt+Click 绕过**: 写入 bypassTokens（15秒有效），放行浏览器直接下载
+- **右键菜单**: "Send to FluxDown"
+- **统计**: 每日 sent/failed 计数，跨天自动重置
+- **存储**: chrome.storage.sync（设置）+ chrome.storage.local（统计/主题）
+
+## 设置项完整列表（settings_provider.dart）
+
+| 分类 | 配置项 | 说明 |
+|------|-------|------|
+| 下载 | `defaultSaveDir` | 默认保存目录 |
+| 下载 | `defaultSegments` | 默认线程数 |
+| 下载 | `maxConcurrentTasks` | 最大并发数 |
+| 下载 | `speedLimitBytes` | 全局速度限制（字节/秒） |
+| 下载 | `globalUserAgent` | 全局 User-Agent（预设：Chrome/Firefox/Edge/Safari/百度网盘） |
+| 下载 | `defaultQueueId` | 默认队列 |
+| 行为 | `autoResumeOnStart` | 启动时自动恢复 |
+| 行为 | `closeToTray` | 关闭到系统托盘 |
+| 行为 | `autoStartup` | 开机启动 |
+| 行为 | `autoCheckUpdate` | 自动检查更新 |
+| 行为 | `analyticsEnabled` | 匿名数据分析（GA4） |
+| BT | `btEnableDht` | 启用 DHT |
+| BT | `btEnableUpnp` | 启用 UPnP |
+| BT | `btPortStart/End` | 端口范围 |
+| BT | `btCustomTrackers` | 自定义 Tracker 列表 |
+| 代理 | `proxyMode` | 代理模式（None/System/Manual） |
+| 代理 | `proxyType` | 代理类型（HTTP/HTTPS/SOCKS4/SOCKS5） |
+| 代理 | `proxyHost/Port` | 代理地址 |
+| 代理 | `proxyUsername/Password` | 代理认证 |
+| 代理 | `proxyNoList` | 排除列表 |
+| 文件关联 | `torrentAssocPrompted` | 是否已提示过 torrent 关联 |
+| 文件关联 | `torrentAssociated` | 是否已关联 .torrent 文件 |
+
+## 主题系统
+
+- **主题模式**: 亮色 / 深色 / 跟随系统
+- **预设色彩方案（13套）**: Zinc（默认）/ Slate / Stone / Gray / Neutral / Red / Rose / Orange / Green / Blue / Yellow / Violet / Custom
+- **字体**: MiSans 自定义字体族
+- **色板层级**:
+  - 背景: `bg` / `surface1` / `surface2`
+  - 文字: `textPrimary` / `textSecondary` / `textMuted`
+  - 交互: `border` / `hoverBg` / `accentBg`
+  - 语义: `accent` / `destructive` / `warning` / `success`
+
+## 服务层说明
+
+| 服务 | 职责 |
+|------|------|
+| `external_download_service.dart` | HTTP Server :19527，接收浏览器扩展的下载请求 |
+| `hls_quality_service.dart` | 监听 HLS 画质信号，弹窗让用户选择码率 |
+| `tray_service.dart` | 系统托盘图标+菜单（多语言），菜单项：显示窗口/新建下载/暂停恢复/退出 |
+| `notification_service.dart` | Windows Toast 通知，2s 内多个完成合并为摘要通知 |
+| `update_service.dart` | GitHub Releases 检查，启动后 5s 静默检查，弹窗展示 changelog |
+| `analytics_service.dart` | GA4 匿名埋点：启动/退出/创建/完成/失败/视图切换 |
+| `feedback_service.dart` | POST GitHub Issues API 提交反馈（含 OS/版本/语言系统信息） |
+| `log_service.dart` | 日志写入 `logs/flux_down.log`，10MB 轮转，保留最近 3 个文件 |
+
+## 官网（website/）
+
+**技术栈**: Astro + React + TypeScript，部署到 Vercel
+**多语言**: 中英双语（i18n 支持）
+
+### 页面结构
+- `/` — 主页（Hero / Features / Extension / Download / Announcements）
+- `/faq` — 8个常见问题（中英双语）
+- `/changelog` — 更新日志（GitHub Releases 自动加载，支持复制 Markdown/纯文本）
+- `/feedback` — 反馈页面
+- `/vote` — 社区投票（选择社区平台：微信群/QQ群/公众号）
+- `/qq-group` — QQ 群（群号：832143651）
+- `/privacy` — 隐私政策
+- `/terms` — 服务条款
+
+### API 路由（/api/）
+- `POST /api/feedback` — 提交反馈
+- `GET /api/release` — 获取最新 GitHub Release
+- `GET/POST /api/vote` — 社区投票
+- `POST /api/subscribe` — 订阅平台上线通知
+- `GET /api/issues/[number]` — 获取 GitHub Issue
+- `GET /api/issues/[number]/comments` — 获取 Issue 评论
+- `POST /api/webhooks/github` — GitHub Webhook
+
+### 官网 8 大功能特性文案（供 AI 代码生成参考产品语言）
+1. Rust-Powered Engine — 基于 Rust 和 Tokio，零开销抽象，内存安全，最大吞吐量
+2. Smart Segmentation — IDM 风格智能分段，运行时动态拆分，空闲线程接管慢速分段
+3. Multi-Protocol — HTTP/HTTPS/FTP/BitTorrent，每种协议专属优化引擎
+4. Speed Control — Token bucket 全局限速，后台下载不影响浏览
+5. Resume Anywhere — SQLite 全量断点续传，安全关机不丢进度
+6. Browser Integration — Chrome/Firefox 三层拦截引擎，自动检测 HLS/DASH 流媒体
+7. Beautiful Interface — 深浅主题 + 12套配色 + 可调节面板响应式布局
+8. Clean & Private — 零广告/零追踪/无账号，本地优先架构，数据完全本地
 
 ## 代码风格与规范
 
@@ -155,3 +461,8 @@ x_down/
 - 参考 `downloader.rs`（HTTP）和 `ftp_downloader.rs`（FTP）的对称设计模式
 - 新模块在 `lib.rs` 中声明 `mod xxx;`
 - DB 操作统一通过 `db.rs` 的 `Db` 结构体，所有 rusqlite 调用在 `spawn_blocking` 中
+
+### 发布新版本
+1. 运行 `python scripts/release_tag.py v0.x.x --push --github-release --update-changelog`
+2. 脚本自动提取 commit 记录 → Claude CLI 生成中文 Release Notes → 创建 annotated tag → 推送触发 CI
+3. 高质量双语发布加 `--model opus --lang both`

@@ -306,6 +306,12 @@ export default defineContentScript({
         return true;
       });
 
+      // R7-1 修复：SPA 长时间运行时 reportedUrls 可能无限增长，整体清空防内存泄漏。
+      // 下游 resource-store 仍有基于归一化 URL 的去重兜底，清空不会导致功能问题。
+      if (reportedUrls.size > 500) {
+        reportedUrls.clear();
+      }
+
       if (fresh.length === 0) return;
 
       // 补充 pageUrl

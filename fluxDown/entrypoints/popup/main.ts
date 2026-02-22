@@ -349,8 +349,13 @@ dotVisibleToggle.addEventListener('change', async () => {
 
 // 启用/禁用开关
 enableToggle.addEventListener('change', async () => {
-  const res = await chrome.runtime.sendMessage({ action: 'toggleEnabled' });
-  updateEnableHint(res.enabled);
+  // R8-1 修复：sendMessage 可能因 background 未响应而返回 undefined，加守卫防止 TypeError
+  try {
+    const res = await chrome.runtime.sendMessage({ action: 'toggleEnabled' });
+    if (res?.enabled !== undefined) updateEnableHint(res.enabled);
+  } catch {
+    // background 未响应时不改变 hint 显示
+  }
 });
 
 // 拦截模式
@@ -451,4 +456,7 @@ resetStatsBtn.addEventListener('click', async () => {
 });
 
 // ===== 启动 =====
-init();
+// R8-3 修复：init 是顶层 async 调用，加 .catch 防止意外异常成为未捕获 rejection
+init().catch((e) => {
+  console.error('[FluxDown Popup] Init failed:', e);
+});

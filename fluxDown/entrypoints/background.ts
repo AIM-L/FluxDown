@@ -52,33 +52,91 @@ interface DailyStats {
   date: string;
 }
 
-async function getTodayStats(): Promise<DailyStats> {
-  const today = new Date().toDateString();
-  const result = await chrome.storage.local.get('stats') ?? {};
-  const stats: DailyStats = result.stats || { sent: 0, failed: 0, date: '' };
+// Bug 4 修复：用序列化 Promise 链防止 incrementStat 并发读写竞态
+// chrome.storage 不提供事务，多个并发 get→modify→set 会导致写入丢失
+let _statChain: Promise<void> = Promise.resolve();
 
-  // 跨天自动重置
-  if (stats.date !== today) {
-    const resetStats: DailyStats = { sent: 0, failed: 0, date: today };
-    await chrome.storage.local.set({ stats: resetStats });
-    return resetStats;
-  }
-
-  return stats;
-}
-
-async function incrementStat(field: 'sent' | 'failed') {
-  const stats = await getTodayStats();
-  stats[field]++;
-  await chrome.storage.local.set({ stats });
+function incrementStat(field: 'sent' | 'failed'): Promise<void> {
+  _statChain = _statChain.then(async () => {
+    try {
+      const today = new Date().toDateString();
+      const result = await chrome.storage.local.get('stats');
+      let stats: DailyStats = result.stats || { sent: 0, failed: 0, date: '' };
+      if (stats.date !== today) {
+        stats = { sent: 0, failed: 0, date: today };
+      }
+      stats[field]++;
+      await chrome.storage.local.set({ stats });
+    } catch { /* storage 失败不影响主流程 */ }
+  });
+  return _statChain;
 }
 
 export default defineBackground(() => {
   console.log('[FluxDown] Background service worker started');
 
+  // ===== P3: settings 内存缓存 =====
+  // 避免每次拦截都 await chrome.storage.sync.get（热路径去异步化）
+  // storage.onChanged 保证跨标签页/窗口的实时同步
+  let _settingsCache: import('@/utils/settings').FluxDownSettings | null = null;
+  let _settingsCacheTs = 0;
+  const SETTINGS_CACHE_TTL = 2000; // 2 秒，足够应对快速连续下载
+  // Bug 8 修复：用 inflight Promise 防止并发调用时发起多次 loadSettings
+  let _settingsInflight: Promise<import('@/utils/settings').FluxDownSettings> | null = null;
+  // Bug R3-1/R3-9 修复：用版本序号防止 inflight 竞态
+  // storage.onChanged 可能在 inflight 期间触发，导致旧值写回覆盖新设置。
+  // 每次 storage 变化时递增版本号，inflight 完成时检查版本是否已变，已变则丢弃。
+  let _settingsVersion = 0;
+
+  async function getCachedSettings() {
+    const now = Date.now();
+    if (_settingsCache && now - _settingsCacheTs < SETTINGS_CACHE_TTL) {
+      return _settingsCache;
+    }
+    // 已有 inflight 请求则复用，避免并发发起多次 storage.sync.get
+    if (_settingsInflight) return _settingsInflight;
+    const versionAtStart = _settingsVersion;
+    _settingsInflight = loadSettings().then((s) => {
+      // 版本已变说明 storage.onChanged 在 loadSettings() 期间触发，
+      // 当前结果是旧版本的设置，丢弃缓存写入并强制下次重新加载
+      if (_settingsVersion === versionAtStart) {
+        _settingsCache = s;
+        _settingsCacheTs = Date.now();
+      }
+      _settingsInflight = null;
+      return s;
+    }).catch((e) => {
+      _settingsInflight = null;
+      throw e;
+    });
+    return _settingsInflight;
+  }
+
+  // 监听 storage 变化，立即失效缓存
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'sync' && changes.settings) {
+      _settingsCache = null;
+      _settingsCacheTs = 0;
+      _settingsInflight = null;
+      _settingsVersion++; // 使任何进行中的 inflight 结果失效
+    }
+  });
+
+  // 启动时预热缓存
+  // R5-8 修复：加 .catch 防止 loadSettings 失败产生未捕获 rejection 警告
+  getCachedSettings().then((s) => {
+    updateIcon(s.enabled);
+    console.log('[FluxDown] Settings cache warmed up');
+  }).catch((e) => {
+    console.warn('[FluxDown] Settings cache warmup failed (non-fatal):', e);
+  });
+
   // 初始化 i18n
+  // R7-2 修复：加 .catch() 防止意外异常成为未捕获 rejection 噪音
   initI18n().then(() => {
     console.log('[FluxDown] i18n initialized');
+  }).catch((e) => {
+    console.warn('[FluxDown] i18n init failed (non-fatal):', e);
   });
 
   // 初始化 tab 生命周期监听器（自动清理关闭/导航的 tab 资源）
@@ -125,6 +183,27 @@ export default defineBackground(() => {
     }
   }
 
+  // Bug R2-8 修复：将 requestHeaderCache 清理从"每次请求时全量遍历"改为周期性清理。
+  // 高流量页面（如视频网站）每秒可能触发数百次 onSendHeaders，之前每次都 O(n) 遍历会造成性能问题。
+  setInterval(() => {
+    const now = Date.now();
+    for (const [cachedUrl, entry] of requestHeaderCache) {
+      if (now - entry.ts > 60_000) {
+        requestHeaderCache.delete(cachedUrl);
+      }
+    }
+    // 强制大小上限（防止突发积累过多条目）
+    if (requestHeaderCache.size > 1000) {
+      const excess = requestHeaderCache.size - 800;
+      let deleted = 0;
+      for (const key of requestHeaderCache.keys()) {
+        if (deleted >= excess) break;
+        requestHeaderCache.delete(key);
+        deleted++;
+      }
+    }
+  }, 30_000); // 每 30 秒清理一次，远低于 60 秒有效期
+
   function onSendHeadersHandler(details: chrome.webRequest.WebRequestHeadersDetails) {
     if (!details.requestHeaders) return;
     const headers: Record<string, string> = {};
@@ -138,23 +217,6 @@ export default defineBackground(() => {
       }
     }
     requestHeaderCache.set(details.url, { cookies, headers, ts: Date.now() });
-
-    // 清理 60 秒前的缓存条目 + 强制大小上限（防止高流量页面短时间内积累过多条目）
-    const now = Date.now();
-    for (const [cachedUrl, entry] of requestHeaderCache) {
-      if (now - entry.ts > 60_000) {
-        requestHeaderCache.delete(cachedUrl);
-      }
-    }
-    if (requestHeaderCache.size > 1000) {
-      const excess = requestHeaderCache.size - 800;
-      let deleted = 0;
-      for (const key of requestHeaderCache.keys()) {
-        if (deleted >= excess) break;
-        requestHeaderCache.delete(key);
-        deleted++;
-      }
-    }
   }
 
   // === 响应头监听：检测"导航转下载"场景 ===
@@ -325,9 +387,88 @@ export default defineBackground(() => {
   // Alt+Click 绕过令牌：URL → 过期时间戳，15 秒内有效
   const bypassTokens = new Map<string, number>();
 
+  // Bug R3-2 修复：周期性清理 bypassTokens 中的过期条目，防止长期积累内存泄漏
+  setInterval(() => {
+    const now = Date.now();
+    for (const [tokenUrl, expiry] of bypassTokens) {
+      if (expiry <= now) bypassTokens.delete(tokenUrl);
+    }
+  }, 60_000); // 每 60 秒清理一次
+
   // Firefox 不支持 onDeterminingFilename，兜底层是唯一拦截路径，
   // 需要更长等待让浏览器填充 downloadItem 元数据
   const hasDeterminingFilename = !!chrome.downloads.onDeterminingFilename;
+
+  // ──────────────────────────────────────────────────────────────
+  // 弱网可靠性：统一等待元数据就绪
+  // ──────────────────────────────────────────────────────────────
+  // 设计原则：
+  //   - 路径A（main_frame 导航下载）：等待 responseDownloadCache 填充
+  //   - 路径B（XHR / JS 触发下载）：等待 downloadItem.mime/filename 填充
+  //   - 两条路径共享同一个 deadline，总等待上限为 META_MAX_WAIT（5s）
+  //   - 两路并发轮询：responseCache 先到就走路径A，否则走路径B
+  //
+  // Bug 1 修复：之前路径A的 waitForResponseCache 耗尽 5s 后，路径B才开始
+  //             等待，导致总等待 10s，且路径B内不再检查缓存（死路）。
+  // Bug 6 修复：现在两路并发，5s 是总上限，不是每路各 5s。
+  const POLL_INTERVAL = 60;       // 统一轮询间隔 ms
+  const META_MAX_WAIT = 5000;     // 总等待上限（弱网场景覆盖范围）
+
+  /**
+   * 并发等待两种元数据来源，哪个先到用哪个，共享 deadline。
+   * 返回：
+   *   { source: 'responseCache', data: ResponseDownloadInfo } — main_frame 导航下载
+   *   { source: 'downloadMeta', data: DownloadItem }          — XHR/JS 触发下载
+   *   null — deadline 到达或下载已被其他层处理
+   */
+  type MetaResult =
+    | { source: 'responseCache'; data: ResponseDownloadInfo }
+    | { source: 'downloadMeta'; data: chrome.downloads.DownloadItem };
+
+  async function waitForMeta(
+    url: string,
+    downloadId: number,
+    originalItem: chrome.downloads.DownloadItem,
+    deadlineMs: number,
+  ): Promise<MetaResult | null> {
+    let bestItem = originalItem;
+    while (Date.now() < deadlineMs) {
+      if (handledDownloads.has(downloadId)) return null;
+
+      // 路径A：responseDownloadCache 到达
+      const rc = responseDownloadCache.get(url);
+      if (rc) return { source: 'responseCache', data: rc };
+
+      // 路径B：downloadItem 元数据就绪
+      try {
+        const results = await chrome.downloads.search({ id: downloadId });
+        if (results && results.length > 0) {
+          const item = results[0];
+          if (item.state === 'complete' || (item as any).state === 'interrupted') {
+            // 下载已结束（可能极快完成），用最新状态返回
+            return { source: 'downloadMeta', data: item };
+          }
+          if (item.mime || item.filename) {
+            return { source: 'downloadMeta', data: item };
+          }
+          bestItem = item;
+        } else if (results && results.length === 0) {
+          // Bug R4-4 修复：search 返回空数组说明该下载项已不存在（被第二层 erase，或已被删除）。
+          // 视为已被其他路径处理，退出，避免误用过期的 originalItem 重复发送。
+          return null;
+        }
+      } catch {
+        // search 失败（Firefox 偶发），继续等待
+      }
+
+      await sleep(POLL_INTERVAL);
+    }
+    // deadline 到达，用 bestItem 兜底（宁可用不完整数据判断也不放弃拦截）
+    // 再最后检查一次缓存
+    const rc = responseDownloadCache.get(url);
+    if (rc) return { source: 'responseCache', data: rc };
+    return { source: 'downloadMeta', data: bestItem };
+  }
 
   // === 第三层：onCreated 兜底 + onChanged 元数据补全 ===
   chrome.downloads.onCreated.addListener((downloadItem) => {
@@ -351,7 +492,11 @@ export default defineBackground(() => {
     //
     // 注意：我们注册一个 onChanged 监听器，一旦 downloadItem 的 filename 或 mime
     // 字段被填充（说明浏览器已解析完响应头），就可以做出更准确的判断。
-    startFallbackInterception(downloadId, downloadItem);
+    //
+    // R6-8 修复：加 .catch() 防止内部未捕获异常成为 unhandled rejection 噪音
+    startFallbackInterception(downloadId, downloadItem).catch((e) => {
+      console.error('[FluxDown] Unexpected error in startFallbackInterception:', e);
+    });
 
     // 30 秒后全面清理
     setTimeout(() => {
@@ -361,149 +506,111 @@ export default defineBackground(() => {
   });
 
   /**
-   * 兜底拦截入口。策略：
+   * 兜底拦截入口。
    *
-   * 1. 立即检查 responseDownloadCache（第一层的 HTTP 响应缓存），
-   *    如果命中说明这是已确认的"导航转下载"，可以直接拦截，不必等待。
-   *
-   * 2. 如果缓存未命中，等待 150ms（给 onDeterminingFilename 机会先处理），
-   *    然后用 chrome.downloads.search() 查询最新的 downloadItem 元数据，
-   *    获取浏览器已解析的 filename / mime / fileSize，再做判断。
+   * 策略：
+   * 1. 给第二层（onDeterminingFilename）一个短窗口优先处理（Chrome）。
+   * 2. 并发等待两种元数据来源（responseDownloadCache / downloadItem），
+   *    共享 META_MAX_WAIT(5s) 总上限，哪个先到走哪条路径。
+   * 3. 拿到元数据后做 shouldIntercept 判断，命中则 cancel+erase+发送。
    */
   async function startFallbackInterception(downloadId: number, originalItem: chrome.downloads.DownloadItem) {
     const url = originalItem.url;
 
-    console.log('[FluxDown] startFallbackInterception:', { id: downloadId, url, cacheHit: responseDownloadCache.has(url), cacheKeys: [...responseDownloadCache.keys()] });
+    console.log('[FluxDown] startFallbackInterception:', {
+      id: downloadId, url,
+      cacheHit: responseDownloadCache.has(url),
+    });
 
-    // === 路径 A：检查 HTTP 响应缓存（即时判断，不等待） ===
-    const responseCached = responseDownloadCache.get(url);
-    if (responseCached) {
-      // 有 onDeterminingFilename 时给它一个短窗口先处理（suggest cancel 更干净），
-      // 没有时（Firefox）直接拦截，减少用户看到浏览器下载 UI 闪烁的概率
-      await sleep(hasDeterminingFilename ? 50 : 10);
-      if (handledDownloads.has(downloadId)) return;
+    // 给第二层一个处理窗口（Chrome 有 onDeterminingFilename，suggest cancel 更干净）
+    // Firefox 无此 API，10ms 仅用于让事件循环稳定
+    await sleep(hasDeterminingFilename ? 150 : 10);
+    if (handledDownloads.has(downloadId)) return;
 
-      console.log('[FluxDown] Fallback (path A - response cache hit):', {
-        id: downloadId,
-        url,
-        contentType: responseCached.contentType,
-        contentLength: responseCached.contentLength,
-        dispositionFilename: responseCached.dispositionFilename,
-      });
-
-      const settings = await loadSettings();
-      if (!settings.enabled) return;
-
-      // 用响应头缓存的信息构造 DownloadItemInfo
-      const itemInfo: DownloadItemInfo = {
-        url,
-        fileSize: responseCached.contentLength > 0 ? responseCached.contentLength : undefined,
-        mime: responseCached.contentType || undefined,
-        filename: responseCached.dispositionFilename || originalItem.filename || undefined,
-      };
-
-      // 检查 Alt+Click 绕过令牌（路径 A）
-      const bypassA = bypassTokens.get(url);
-      if (bypassA && bypassA > Date.now()) {
-        bypassTokens.delete(url);
-        return;
-      }
-
-      const interceptA = shouldIntercept(itemInfo, settings);
-      console.log('[FluxDown] Path A shouldIntercept:', interceptA, itemInfo);
-      if (!interceptA) return;
-
-      await executeFallbackIntercept(downloadId, url, originalItem.referrer, itemInfo);
-      responseDownloadCache.delete(url);
+    // 快速路径：缓存已就绪，直接处理，不进入轮询
+    const immediateCached = responseDownloadCache.get(url);
+    if (immediateCached) {
+      await handleResponseCacheHit(downloadId, url, originalItem, immediateCached);
       return;
     }
 
-    // === 路径 B：响应缓存未命中 — 等待后查询最新元数据 ===
-    // 有 onDeterminingFilename 时等 150ms 让它优先处理；
-    // Firefox 无此 API，兜底是唯一路径，等 300ms 让浏览器充分填充元数据。
-    // 注意：Firefox 中 onCreated 先于 onHeadersReceived 触发，等待后需再次检查缓存。
-    await sleep(hasDeterminingFilename ? 150 : 300);
-    if (handledDownloads.has(downloadId)) {
-      console.log('[FluxDown] Path B: already handled after sleep, skip');
-      return;
+    // 慢速路径：两路并发轮询，共享 deadline（Bug 1+6 修复）
+    const deadline = Date.now() + META_MAX_WAIT;
+    const metaResult = await waitForMeta(url, downloadId, originalItem, deadline);
+    if (!metaResult) return; // 被其他层处理或 deadline 到达且结果为 null
+
+    if (handledDownloads.has(downloadId)) return;
+
+    if (metaResult.source === 'responseCache') {
+      await handleResponseCacheHit(downloadId, url, originalItem, metaResult.data);
+    } else {
+      await handleDownloadMetaHit(downloadId, url, originalItem, metaResult.data);
     }
+  }
 
-    // Firefox 时序补偿：onCreated 先于 onHeadersReceived 触发，sleep 期间缓存可能已被填充
-    const responseCachedLate = responseDownloadCache.get(url);
-    if (responseCachedLate) {
-      console.log('[FluxDown] Path B: late cache hit for', url);
-      const settings = await loadSettings();
-      if (!settings.enabled) return;
+  /** 路径A：基于 responseDownloadCache 的响应头数据做拦截判断 */
+  async function handleResponseCacheHit(
+    downloadId: number,
+    url: string,
+    originalItem: chrome.downloads.DownloadItem,
+    rc: ResponseDownloadInfo,
+  ) {
+    if (handledDownloads.has(downloadId)) return;
+    console.log('[FluxDown] Fallback path A (response cache):', {
+      id: downloadId, url, contentType: rc.contentType,
+      contentLength: rc.contentLength, dispositionFilename: rc.dispositionFilename,
+    });
 
-      const itemInfo: DownloadItemInfo = {
-        url,
-        fileSize: responseCachedLate.contentLength > 0 ? responseCachedLate.contentLength : undefined,
-        mime: responseCachedLate.contentType || undefined,
-        filename: responseCachedLate.dispositionFilename || originalItem.filename || undefined,
-      };
+    const settings = await getCachedSettings();
+    if (!settings.enabled) return;
+    if (handledDownloads.has(downloadId)) return;
 
-      const bypassLate = bypassTokens.get(url);
-      if (bypassLate && bypassLate > Date.now()) {
-        bypassTokens.delete(url);
-        return;
-      }
+    const bypass = bypassTokens.get(url);
+    if (bypass && bypass > Date.now()) { bypassTokens.delete(url); return; }
 
-      const interceptLate = shouldIntercept(itemInfo, settings);
-      console.log('[FluxDown] Path B late shouldIntercept:', interceptLate, itemInfo);
-      if (!interceptLate) return;
-      if (handledDownloads.has(downloadId)) return;
+    const itemInfo: DownloadItemInfo = {
+      url,
+      fileSize: rc.contentLength > 0 ? rc.contentLength : undefined,
+      mime: rc.contentType || undefined,
+      filename: rc.dispositionFilename || originalItem.filename || undefined,
+    };
 
-      await executeFallbackIntercept(downloadId, url, originalItem.referrer, itemInfo);
-      responseDownloadCache.delete(url);
-      return;
-    }
+    const intercept = shouldIntercept(itemInfo, settings);
+    console.log('[FluxDown] Path A shouldIntercept:', intercept, itemInfo);
+    if (!intercept) return;
+    if (handledDownloads.has(downloadId)) return;
 
-    // 用 chrome.downloads.search 查询最新状态（此时浏览器可能已解析了响应头）
-    let freshItems: chrome.downloads.DownloadItem[];
+    // Bug R2-5 修复：用 try/finally 确保无论 executeFallbackIntercept 是否抛出，
+    // responseDownloadCache 中对应 URL 的条目都会被清理，防止再次下载同 URL 命中旧缓存
     try {
-      freshItems = (await chrome.downloads.search({ id: downloadId })) ?? [];
-    } catch (e) {
-      console.warn('[FluxDown] Path B: downloads.search threw:', e);
-      return;
+      await executeFallbackIntercept(downloadId, url, originalItem.referrer, itemInfo);
+    } finally {
+      responseDownloadCache.delete(url);
     }
+  }
 
-    if (freshItems.length === 0) {
-      console.warn('[FluxDown] Path B: freshItems empty for id:', downloadId, '(download erased or search failed)');
-      // 兜底：使用 originalItem 数据直接判断（Firefox search 可能返回空）
-      const settingsFallback = await loadSettings();
-      if (!settingsFallback.enabled) return;
-      const itemInfoFallback: DownloadItemInfo = {
-        url,
-        fileSize: originalItem.fileSize > 0 ? originalItem.fileSize : undefined,
-        mime: originalItem.mime || undefined,
-        filename: originalItem.filename || undefined,
-      };
-      const bypassFallback = bypassTokens.get(url);
-      if (bypassFallback && bypassFallback > Date.now()) { bypassTokens.delete(url); return; }
-      const interceptFallback = shouldIntercept(itemInfoFallback, settingsFallback);
-      console.log('[FluxDown] Path B fallback shouldIntercept:', interceptFallback, itemInfoFallback);
-      if (!interceptFallback) return;
-      if (handledDownloads.has(downloadId)) return;
-      await executeFallbackIntercept(downloadId, url, originalItem.referrer, itemInfoFallback);
-      return;
-    }
+  /** 路径B：基于 downloadItem 元数据做拦截判断 */
+  async function handleDownloadMetaHit(
+    downloadId: number,
+    url: string,
+    originalItem: chrome.downloads.DownloadItem,
+    freshItem: chrome.downloads.DownloadItem,
+  ) {
+    if (handledDownloads.has(downloadId)) return;
+    console.log('[FluxDown] Fallback path B (download meta):', {
+      id: downloadId, state: freshItem.state,
+      mime: freshItem.mime, filename: freshItem.filename, fileSize: freshItem.fileSize,
+    });
 
-    if (handledDownloads.has(downloadId)) {
-      console.log('[FluxDown] Path B: already handled after search, skip');
-      return;
-    }
-
-    const freshItem = freshItems[0];
-    console.log('[FluxDown] Path B freshItem:', { state: freshItem.state, mime: freshItem.mime, filename: freshItem.filename, fileSize: freshItem.fileSize });
-
-    // 如果下载已经完成或被取消了，不处理
+    // 下载已完成或被中断，无需处理
     if (freshItem.state === 'complete' || (freshItem as any).state === 'interrupted') {
       console.log('[FluxDown] Path B: download already complete/interrupted, skip');
       return;
     }
 
-    const settings = await loadSettings();
+    const settings = await getCachedSettings();
     if (!settings.enabled) return;
+    if (handledDownloads.has(downloadId)) return;
 
     const mime = freshItem.mime || originalItem.mime || undefined;
     const fileSize = (freshItem.fileSize > 0 ? freshItem.fileSize : undefined)
@@ -517,27 +624,13 @@ export default defineBackground(() => {
       filename,
     };
 
-    // 检查 Alt+Click 绕过令牌（路径 B）
-    const bypassB = bypassTokens.get(url);
-    if (bypassB && bypassB > Date.now()) {
-      bypassTokens.delete(url);
-      return;
-    }
+    const bypass = bypassTokens.get(url);
+    if (bypass && bypass > Date.now()) { bypassTokens.delete(url); return; }
 
-    const interceptB = shouldIntercept(itemInfo, settings);
-    console.log('[FluxDown] Path B shouldIntercept:', interceptB, itemInfo);
-    if (!interceptB) return;
-
-    // 最后一次检查——避免和 onDeterminingFilename 竞态
+    const intercept = shouldIntercept(itemInfo, settings);
+    console.log('[FluxDown] Path B shouldIntercept:', intercept, itemInfo);
+    if (!intercept) return;
     if (handledDownloads.has(downloadId)) return;
-
-    console.log('[FluxDown] Fallback (path B - search query):', {
-      id: downloadId,
-      url: itemInfo.url,
-      mime,
-      filename,
-      fileSize,
-    });
 
     await executeFallbackIntercept(downloadId, itemInfo.url, freshItem.referrer || originalItem.referrer, itemInfo);
   }
@@ -554,21 +647,31 @@ export default defineBackground(() => {
     // 标记为 fallback 已处理
     handledDownloads.set(downloadId, 'fallback');
 
-    // cancel + erase（替代 suggest({ cancel: true })）
-    try {
-      await chrome.downloads.cancel(downloadId);
-    } catch (e) {
-      console.warn('[FluxDown] Fallback: failed to cancel download:', e);
-    }
-    try {
-      chrome.downloads.erase({ id: downloadId });
-    } catch (e) {
-      console.warn('[FluxDown] Fallback: failed to erase download:', e);
-    }
+    // cancel + erase 并发执行（替代 suggest({ cancel: true })）
+    // 必须 await erase，否则下载项残留浏览器下载列表，可能引发二次触发
+    //
+    // Firefox MV2 兼容性修复：chrome.downloads.cancel() 在 Firefox 中可能返回
+    // undefined（旧式 callback API 兼容层），直接 .catch() 会抛出 TypeError。
+    // 用 Promise.resolve() 包裹确保始终得到一个真正的 Promise。
+    await Promise.allSettled([
+      Promise.resolve(chrome.downloads.cancel(downloadId)).catch((e) => {
+        console.warn('[FluxDown] Fallback: failed to cancel download:', e);
+      }),
+      Promise.resolve(chrome.downloads.erase({ id: downloadId })).catch((e) => {
+        console.warn('[FluxDown] Fallback: failed to erase download:', e);
+      }),
+    ]);
 
     // 发送到 FluxDown
+    // R6-7 修复：sendToFluxDown 抛出时需捕获，否则 startFallbackInterception 成为
+    // unhandled rejection（onCreated 以 fire-and-forget 方式调用，无外层 catch）。
+    // handledDownloads 已标记为 'fallback'，即使发送失败也不会重复拦截。
     const cleanFilename = extractCleanFilename(itemInfo.filename, url);
-    await sendToFluxDown(url, referrer, cleanFilename, itemInfo.fileSize, itemInfo.mime);
+    try {
+      await sendToFluxDown(url, referrer, cleanFilename, itemInfo.fileSize, itemInfo.mime);
+    } catch (e) {
+      console.error('[FluxDown] executeFallbackIntercept: sendToFluxDown failed:', e);
+    }
   }
 
   // === 第二层：onDeterminingFilename（主拦截） ===
@@ -579,9 +682,9 @@ export default defineBackground(() => {
     (downloadItem, suggest) => {
       const url = downloadItem.url;
 
-      // 跳过 blob 和 data URL
+      // 跳过 blob 和 data URL（Bug R4-8: filename 不传空字符串）
       if (url.startsWith('blob:') || url.startsWith('data:')) {
-        suggest({ filename: downloadItem.filename });
+        suggest(downloadItem.filename ? { filename: downloadItem.filename } : ({} as any));
         return;
       }
 
@@ -592,18 +695,39 @@ export default defineBackground(() => {
         return;
       }
 
+      // P0 关键修复：立即预标记为 'primary-pending'，
+      // 阻止第三层（onCreated 兜底计时器）在我们异步处理期间竞态抢先执行。
+      // 若最终判断不需拦截，在放行时删除此标记。
+      handledDownloads.set(downloadItem.id, 'primary');
+
       // 异步判断
       (async () => {
+        // Bug 2+5 修复：用 suggestCalled 保证 suggest 全局只调用一次。
+        // catch 块 + 正常路径都可能调用 suggest，两次调用会导致浏览器行为异常。
+        let suggestCalled = false;
+        // Bug R4-2 修复：追踪下载是否已被取消（suggest cancel 已调用），
+        // 防止 sendToFluxDown 失败时 catch 块误删 handledDownloads 标记导致重复发送。
+        let downloadCancelled = false;
+        const callSuggest = (arg: chrome.downloads.DownloadFilenameSuggestion | { cancel: true }) => {
+          if (suggestCalled) return;
+          suggestCalled = true;
+          if ('cancel' in arg && arg.cancel) downloadCancelled = true;
+          suggest(arg as any);
+        };
+
         try {
-          // 再次检查兜底状态（await 期间可能被兜底层抢先处理了）
+          // 再次检查兜底状态（极少数情况：兜底层在预标记之前已完成）
           if (handledDownloads.get(downloadItem.id) === 'fallback') {
-            suggest({ cancel: true });
+            callSuggest({ cancel: true });
             return;
           }
 
-          const settings = await loadSettings();
+          // P3：使用内存缓存，避免每次拦截都 await storage.sync.get
+          const settings = await getCachedSettings();
           if (!settings.enabled) {
-            suggest({ filename: downloadItem.filename });
+            // 不拦截，删除预标记，放行
+            handledDownloads.delete(downloadItem.id);
+            callSuggest({ filename: downloadItem.filename || undefined } as any);
             return;
           }
 
@@ -611,9 +735,9 @@ export default defineBackground(() => {
           const bypass = bypassTokens.get(url);
           if (bypass && bypass > Date.now()) {
             bypassTokens.delete(url);
-            // 必须标记为已处理，否则兜底层（onCreated）会在令牌消费后再次拦截，导致双重下载
-            handledDownloads.set(downloadItem.id, 'primary');
-            suggest({ filename: downloadItem.filename });
+            // Bug R2-1 修复：删除预标记，让浏览器正常下载
+            handledDownloads.delete(downloadItem.id);
+            callSuggest({ filename: downloadItem.filename || undefined } as any);
             return;
           }
 
@@ -632,35 +756,25 @@ export default defineBackground(() => {
           };
 
           if (!shouldIntercept(itemInfo, settings)) {
-            suggest({ filename: downloadItem.filename });
-            return;
-          }
-
-          // 最后一次竞态检查
-          if (handledDownloads.has(downloadItem.id)) {
-            suggest({ cancel: true });
+            // 不拦截，删除预标记，放行
+            handledDownloads.delete(downloadItem.id);
+            callSuggest({ filename: downloadItem.filename || undefined } as any);
             return;
           }
 
           console.log('[FluxDown] Intercepting download (onDeterminingFilename):', {
-            url,
-            mime,
-            filename: downloadItem.filename,
-            fileSize,
-            mode: settings.interceptMode,
+            url, mime, filename: downloadItem.filename, fileSize, mode: settings.interceptMode,
           });
 
-          // 标记为主拦截已处理
-          handledDownloads.set(downloadItem.id, 'primary');
+          // 取消浏览器下载（最干净的方式，在"另存为"弹出前生效）
+          callSuggest({ cancel: true });
 
-          // 取消浏览器下载
-          suggest({ cancel: true });
-
-          // 清理下载记录
+          // R5-3 修复：suggest({ cancel: true }) 后下载 ID 通常已消失，
+          // erase 失败是预期行为（非错误），降级为 debug 日志避免日志噪音。
           try {
-            chrome.downloads.erase({ id: downloadItem.id });
-          } catch (e) {
-            console.warn('[FluxDown] Failed to erase download:', e);
+            await chrome.downloads.erase({ id: downloadItem.id });
+          } catch {
+            console.debug('[FluxDown] erase after cancel: download item already gone (expected)');
           }
 
           // 发送到 FluxDown
@@ -668,8 +782,12 @@ export default defineBackground(() => {
           await sendToFluxDown(url, referrer, cleanFilename, fileSize, mime);
         } catch (e) {
           console.error('[FluxDown] Error in onDeterminingFilename handler:', e);
-          // 出错时放行下载，不阻塞用户
-          suggest({ filename: downloadItem.filename });
+          // Bug R4-2 修复：只有在下载尚未被取消（判断阶段出错）时，才清除预标记让兜底层接管。
+          // 若下载已被 suggest(cancel) 取消，保留 'primary' 标记，阻止兜底层重复拦截并重复发送。
+          if (!downloadCancelled) {
+            handledDownloads.delete(downloadItem.id);
+            callSuggest({ filename: downloadItem.filename || undefined } as any);
+          }
         } finally {
           downloadItemCache.delete(downloadItem.id);
         }
@@ -688,12 +806,121 @@ export default defineBackground(() => {
   // sendResponse 被调用后响应值经常被丢弃，popup 收到 undefined。
   // 返回 Promise 是 Firefox 原生支持的正确方式，Chrome 99+（含 MV3）同样支持。
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
     return handleMessage(message, sender).catch((_err) => ({ error: String(_err) })) as any;
   });
 
-  // ===== 下载此页面所有链接 =====
+  // ──────────────────────────────────────────────────────────────
+  // 弱网可靠性：发送失败重队列
+  // ──────────────────────────────────────────────────────────────
+  // 当 App 未运行或网络瞬断导致发送失败时，将请求入队。
+  // Service Worker 保活期间持续重试；下次 background 激活时也会恢复。
+  // 队列持久化到 chrome.storage.local，防止 SW 被回收时数据丢失。
+  interface PendingRequest {
+    request: DownloadRequest;
+    failedAt: number;
+    retries: number;
+  }
+
+  const PENDING_QUEUE_KEY = 'pendingDownloadQueue';
+  const MAX_PENDING_RETRIES = 5;
+  // 指数退避：2^retry * 1000ms，上限 30s
+  function retryDelay(retries: number): number {
+    return Math.min(Math.pow(2, retries) * 1000, 30_000);
+  }
+
+  // Bug 3 修复：用串行 Promise 链保证 enqueuePending / flushPendingQueue
+  // 的 read-modify-write 是原子的，杜绝并发竞态导致队列数据丢失
+  let _queueChain: Promise<void> = Promise.resolve();
+
+  function enqueuePending(request: DownloadRequest): Promise<void> {
+    _queueChain = _queueChain.then(async () => {
+      try {
+        const stored = await chrome.storage.local.get(PENDING_QUEUE_KEY);
+        const queue: PendingRequest[] = stored[PENDING_QUEUE_KEY] ?? [];
+        // Bug 7 修复：去重以 url+filename 联合键，允许同 URL 不同文件名重试
+        // 避免用户两次手动发送同一 URL 但第二次被错误去重
+        const key = `${request.url}|${request.filename ?? ''}`;
+        const isDup = queue.some(
+          (p) => `${p.request.url}|${p.request.filename ?? ''}` === key,
+        );
+        if (!isDup) {
+          queue.push({ request, failedAt: Date.now(), retries: 0 });
+          await chrome.storage.local.set({ [PENDING_QUEUE_KEY]: queue });
+          console.log('[FluxDown] Enqueued pending request:', request.url);
+        }
+      } catch (e) {
+        console.warn('[FluxDown] Failed to enqueue pending request:', e);
+      }
+    });
+    return _queueChain;
+  }
+
+  function flushPendingQueue(): Promise<void> {
+    _queueChain = _queueChain.then(async () => {
+      let stored: Record<string, any>;
+      try {
+        stored = await chrome.storage.local.get(PENDING_QUEUE_KEY);
+      } catch {
+        return;
+      }
+      const queue: PendingRequest[] = stored[PENDING_QUEUE_KEY] ?? [];
+      if (queue.length === 0) return;
+
+      // Bug R2-4 修复：将队列分成"本次需重试"和"暂不需要重试"两组，
+      // 对"本次需重试"的条目并发执行（避免串行等待 5 轮 x 10s 的超时），
+      // 完成后合并结果，一次写回 storage。
+      const now = Date.now();
+      const toRetry: PendingRequest[] = [];
+      const notYet: PendingRequest[] = [];
+
+      for (const item of queue) {
+        if (item.retries >= MAX_PENDING_RETRIES) {
+          console.warn('[FluxDown] Pending request exceeded max retries, dropping:', item.request.url);
+          continue; // 丢弃
+        }
+        if (now - item.failedAt < retryDelay(item.retries)) {
+          notYet.push(item); // 还没到重试时间
+          continue;
+        }
+        toRetry.push(item);
+      }
+
+      if (toRetry.length === 0) {
+        // 无需写回（队列内容未变）
+        return;
+      }
+
+      // 并发重试所有到期条目
+      const retryResults = await Promise.allSettled(
+        toRetry.map((item) => sendDownloadRequest(item.request)),
+      );
+
+      const remaining: PendingRequest[] = [...notYet];
+      for (let i = 0; i < toRetry.length; i++) {
+        const result = retryResults[i];
+        const item = toRetry[i];
+        if (result.status === 'fulfilled' && result.value.success) {
+          console.log('[FluxDown] Pending request flushed:', item.request.url);
+          incrementStat('sent').catch(() => {});
+          // 成功则不再放回 remaining
+        } else {
+          remaining.push({ ...item, retries: item.retries + 1, failedAt: Date.now() });
+        }
+      }
+
+      try {
+        await chrome.storage.local.set({ [PENDING_QUEUE_KEY]: remaining });
+      } catch { /* ignore */ }
+    });
+    return _queueChain;
+  }
+
+  // 启动时尝试刷新上次未发送的队列
+  flushPendingQueue().catch(() => {});
+  // 每 30 秒轮询一次
+  setInterval(() => { flushPendingQueue().catch(() => {}); }, 30_000);
+
   // ===== 核心：发送下载请求到 FluxDown App =====
   async function sendToFluxDown(
     url: string,
@@ -713,18 +940,20 @@ export default defineBackground(() => {
     }
 
     // 策略 2：通过 chrome.cookies API 提取（兜底）
+    // 加超时保护：弱网下 cookies API 偶发阻塞，500ms 内未返回则跳过
     if (!cookieString) {
       try {
-        const cookies = await chrome.cookies.getAll({ url });
-        cookieString = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
-        console.log('[FluxDown] Cookies from cookies API:', cookies.length, 'cookies,', cookieString.length, 'chars');
+        const cookiesResult = await Promise.race([
+          chrome.cookies.getAll({ url }),
+          new Promise<chrome.cookies.Cookie[]>((_, reject) =>
+            setTimeout(() => reject(new Error('cookies timeout')), 500),
+          ),
+        ]);
+        cookieString = cookiesResult.map((c) => `${c.name}=${c.value}`).join('; ');
+        console.log('[FluxDown] Cookies from cookies API:', cookiesResult.length, 'cookies');
       } catch (e) {
-        console.warn('[FluxDown] Failed to extract cookies via API:', e);
+        console.warn('[FluxDown] Failed/timeout to extract cookies via API:', e);
       }
-    }
-
-    if (!cookieString) {
-      console.log('[FluxDown] No cookies available for URL:', url);
     }
 
     const request: DownloadRequest = {
@@ -741,12 +970,11 @@ export default defineBackground(() => {
     const response = await sendDownloadRequest(request);
 
     if (response.success) {
-      // 统计：接管成功
       await incrementStat('sent');
     } else {
-      // 统计：接管失败
       await incrementStat('failed');
-
+      // 发送失败入队，等待 App 启动后重试（弱网 / App 未运行场景）
+      await enqueuePending(request);
       notify(
         t('notify.sendFailed'),
         t('notify.connectionFailed', { message: response.message }),
@@ -851,29 +1079,37 @@ export default defineBackground(() => {
         }
 
         // 为每个 URL 提取 cookies，构建 BatchDownloadItem 列表
-        const batchItems: BatchDownloadItem[] = [];
-        for (const item of items) {
-          let cookieString = '';
-          const cached = requestHeaderCache.get(item.url);
-          if (cached) {
-            cookieString = cached.cookies;
-            requestHeaderCache.delete(item.url);
-          }
-          if (!cookieString) {
-            try {
-              const cookies = await chrome.cookies.getAll({ url: item.url });
-              cookieString = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
-            } catch { /* ignore */ }
-          }
-          batchItems.push({
-            url: item.url,
-            referrer: item.referrer || '',
-            filename: item.filename,
-            cookies: cookieString,
-            fileSize: item.fileSize,
-            mimeType: item.mimeType,
-          });
-        }
+        // Bug 9 修复：cookies API 加 500ms 超时，与 sendToFluxDown 保持一致
+        // Bug R4-6 修复：并发提取所有 URL 的 cookies，避免串行 N×500ms 超时
+        const batchItems: BatchDownloadItem[] = await Promise.all(
+          items.map(async (item) => {
+            let cookieString = '';
+            const cached = requestHeaderCache.get(item.url);
+            if (cached) {
+              cookieString = cached.cookies;
+              requestHeaderCache.delete(item.url);
+            }
+            if (!cookieString) {
+              try {
+                const cookiesResult = await Promise.race([
+                  chrome.cookies.getAll({ url: item.url }),
+                  new Promise<chrome.cookies.Cookie[]>((_, reject) =>
+                    setTimeout(() => reject(new Error('cookies timeout')), 500),
+                  ),
+                ]);
+                cookieString = cookiesResult.map((c) => `${c.name}=${c.value}`).join('; ');
+              } catch { /* timeout 或权限不足，跳过 */ }
+            }
+            return {
+              url: item.url,
+              referrer: item.referrer || '',
+              filename: item.filename,
+              cookies: cookieString,
+              fileSize: item.fileSize,
+              mimeType: item.mimeType,
+            };
+          }),
+        );
 
         // 单次 HTTP POST 发送所有 URL（用换行符连接）
         const response = await sendBatchDownloadRequest(batchItems);
@@ -1035,12 +1271,19 @@ export default defineBackground(() => {
   }
 
   function notify(title: string, message: string) {
-    chrome.notifications.create({
-      type: 'basic',
-      iconUrl: '/icon/128.png',
-      title: `FluxDown - ${title}`,
-      message,
-    });
+    // R5-7 修复：Firefox 下 chrome.notifications 可能不存在或受权限限制，
+    // fire-and-forget 的未捕获 rejection 会产生控制台错误噪音。
+    if (!chrome.notifications?.create) return;
+    try {
+      chrome.notifications.create({
+        type: 'basic',
+        iconUrl: '/icon/128.png',
+        title: `FluxDown - ${title}`,
+        message,
+      });
+    } catch (e) {
+      console.warn('[FluxDown] notify: failed to create notification:', e);
+    }
   }
 
   function updateIcon(enabled: boolean) {
@@ -1056,6 +1299,6 @@ export default defineBackground(() => {
     if (api) api.setIcon({ path: iconPath });
   }
 
-  // 启动时检查连接状态
-  loadSettings().then((s) => updateIcon(s.enabled));
+  // 启动时更新图标（settings 已在上方 getCachedSettings 预热，此处复用缓存）
+  // 注意：updateIcon 已在 getCachedSettings 预热回调中调用，此行保留为显式确保
 });
