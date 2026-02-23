@@ -11,7 +11,8 @@
  *   assets: {
  *     setup: { name, size, download_url },
  *     portable: { name, size, download_url },
- *     extension: { name, size, download_url },
+ *     extension: { name, size, download_url },        // Chrome zip
+ *     firefox_extension: { name, size, download_url }, // Firefox XPI
  *   }
  * }
  */
@@ -117,7 +118,10 @@ export const GET: APIRoute = async () => {
     // ARM64 资产（仅新版 Release 包含）
     const setupArm64Asset = latest.assets.find((a) => a.name.endsWith("-windows-arm64-setup.exe"));
     const portableArm64Asset = latest.assets.find((a) => a.name.endsWith("-windows-arm64-portable.zip"));
-    const extensionAsset = latest.assets.find((a) => a.name.endsWith("-extension.zip"));
+    const extensionAsset = latest.assets.find((a) =>
+      a.name.endsWith("-chrome.zip") || a.name.endsWith("-extension.zip"),
+    );
+    const firefoxExtensionAsset = latest.assets.find((a) => a.name.endsWith("-firefox.xpi"));
 
     const formatAsset = (asset: GitHubAsset | undefined) => {
       if (!asset) return null;
@@ -148,6 +152,7 @@ export const GET: APIRoute = async () => {
         setup_arm64: formatAsset(setupArm64Asset),
         portable_arm64: formatAsset(portableArm64Asset),
         extension: formatAsset(extensionAsset),
+        firefox_extension: formatAsset(firefoxExtensionAsset),
       },
     };
 

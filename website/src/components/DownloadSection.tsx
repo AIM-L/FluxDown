@@ -38,6 +38,7 @@ interface ReleaseInfo {
     setup_arm64: ReleaseAsset | null;
     portable_arm64: ReleaseAsset | null;
     extension: ReleaseAsset | null;
+    firefox_extension: ReleaseAsset | null;
   };
 }
 
@@ -334,11 +335,9 @@ export default function DownloadSection() {
                 <div className="min-w-0">
                   <h3 className="text-sm font-semibold text-dark-text">{t("dl.extensionTitle")}</h3>
                   <p className="text-xs text-dark-text-muted mt-0.5">{t("dl.extensionDesc")}</p>
-                  {release?.assets.extension && (
+                  {(release?.assets.extension || release?.assets.firefox_extension) && (
                     <p className="text-[10px] text-dark-text-muted mt-1">
                       {t("dl.version", { version: release.version })}
-                      <span className="ml-1.5">({formatSize(release.assets.extension.size)})</span>
-                      <span className="ml-1.5">· Chrome + Firefox</span>
                     </p>
                   )}
                   <p className="text-[10px] text-dark-text-muted/70 mt-1">{t("dl.extensionOtherNote")}</p>
@@ -357,7 +356,17 @@ export default function DownloadSection() {
                   </svg>
                   {t("dl.extensionFirefox")}
                 </a>
-                {/* 离线包按钮（其他浏览器） */}
+                {/* Firefox 离线 XPI */}
+                {!loading && release?.assets.firefox_extension && (
+                  <a
+                    href={release.assets.firefox_extension.download_url}
+                    className="inline-flex items-center justify-center gap-2 rounded-lg border border-[#ff7139]/30 bg-[#ff7139]/10 px-4 py-2.5 text-xs font-semibold text-[#ff7139] hover:bg-[#ff7139]/20 transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Firefox XPI ({formatSize(release.assets.firefox_extension.size)})
+                  </a>
+                )}
+                {/* Chrome 离线包按钮 */}
                 {loading ? (
                   <div className="inline-flex items-center justify-center gap-2 rounded-lg bg-brand-blue/50 px-4 py-2.5 text-xs font-semibold text-white/70 cursor-wait">
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -370,7 +379,7 @@ export default function DownloadSection() {
                     className="inline-flex items-center justify-center gap-2 rounded-lg border border-brand-blue/30 bg-brand-blue/10 px-4 py-2.5 text-xs font-semibold text-brand-blue hover:bg-brand-blue/20 transition-colors"
                   >
                     <Download className="w-3.5 h-3.5" />
-                    {t("dl.extensionOffline")}
+                    {t("dl.extensionOffline")} ({formatSize(release.assets.extension.size)})
                   </a>
                 ) : (
                   <div className="inline-flex items-center justify-center gap-2 rounded-lg border border-dark-border px-4 py-2.5 text-xs font-medium text-dark-text-muted">

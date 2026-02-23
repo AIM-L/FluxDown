@@ -194,8 +194,8 @@ const zhCN: Messages = {
   "dl.extensionDesc":
     "拦截浏览器下载并发送到 FluxDown，支持 Chrome 和 Firefox。Firefox 扩展已在官方商店上架。",
   "dl.extensionFirefox": "Firefox 官方商店",
-  "dl.extensionOffline": "离线安装包",
-  "dl.extensionOtherNote": "其他浏览器上架审核中，可先下载离线版使用",
+  "dl.extensionOffline": "Chrome 离线包",
+  "dl.extensionOtherNote": "适用于 Chrome、Edge、Brave 等 Chromium 内核浏览器",
   "dl.downloadExtension": "下载扩展",
   "dl.totalDownloads": "次下载",
   "dl.notifyMe": "上线通知",
