@@ -77,7 +77,3 @@ website/.vercel/
 # Memory debug output
 .mem_debug/
 /videos
-
-# Scripts - 敏感配置（含 SMTP 密码和收件人邮箱）
-scripts/notify_config.json
-scripts/send_notify.py
