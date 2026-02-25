@@ -400,6 +400,37 @@ impl SharedBtSession {
             Session::new_with_opts(save_dir.into(), opts).await
         }).map_err(|e| DownloadError::Other(format!("BT session init failed: {e}")))?;
 
+        // Startup cleanup: remove any finished torrents that were
+        // retained in persistence from a previous app session.
+        //
+        // Background: since the main fix (pause-on-complete) we no
+        // longer call session.delete() when a torrent finishes, so
+        // completed torrents stay in session.json across restarts.
+        // Without this cleanup they would accumulate indefinitely,
+        // slowing down startup and wasting memory.
+        //
+        // We only remove them from the librqbit session — the actual
+        // downloaded files are left untouched (delete_files=false).
+        // User-triggered "delete task + files" goes through the normal
+        // delete_task() path which uses delete_files=true.
+        {
+            let finished_ids: Vec<usize> = session.with_torrents(|iter| {
+                iter.filter_map(|(id, handle)| {
+                    if handle.stats().finished { Some(id) } else { None }
+                })
+                .collect()
+            });
+            if !finished_ids.is_empty() {
+                rinf::debug_print!(
+                    "[BT] startup cleanup: removing {} finished torrent(s) from persistence",
+                    finished_ids.len()
+                );
+                for id in finished_ids {
+                    let _ = rt.block_on(session.delete(id.into(), false));
+                }
+            }
+        }
+
         rinf::debug_print!(
             "[BT] shared session created (DHT={}, UPnP={}, ports={}-{}, {} trackers, speed_limit={} B/s, worker_threads={}, persistence=on)",
             enable_dht,
@@ -440,11 +471,6 @@ impl SharedBtSession {
     /// Store a torrent handle for a task so it can be paused/resumed later.
     pub async fn store_handle(&self, task_id: &str, handle: BtHandle) {
         self.handles.lock().await.insert(task_id.to_string(), handle);
-    }
-
-    /// Remove and return the cached handle for a task.
-    pub async fn take_handle(&self, task_id: &str) -> Option<BtHandle> {
-        self.handles.lock().await.remove(task_id)
     }
 
     /// Pause a BT torrent by task_id.  The handle stays cached so that
@@ -1185,12 +1211,17 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 })
                 .await;
 
-            // Download complete — remove from session to free resources.
-            // Keep files on disk (delete_files=false).  Also remove from
-            // the handle cache since we no longer need to pause/resume.
-            shared_bt.take_handle(&task_id).await;
-            let torrent_id = handle.id();
-            let _ = session.delete(torrent_id.into(), false).await;
+            // Download complete.  Retain the handle in the cache (do NOT
+            // call take_handle) and pause the torrent so it stops seeding.
+            //
+            // Keeping the handle alive means that a future
+            // delete_task(delete_files=true) call can reach
+            // session.delete(torrent_id, true), which properly removes the
+            // files via librqbit.  Previously we called take_handle +
+            // session.delete(false) here, which discarded the handle and
+            // removed the session entry; that left no clean path for file
+            // deletion — only an unreliable filesystem-path fallback.
+            let _ = shared_bt.pause_task(&task_id).await;
             return Ok(());
         }
 

@@ -1519,12 +1519,17 @@ impl DownloadManager {
                 if let Some(ref bt) = self.bt_session {
                     bt.delete_task(task_id, delete_files).await;
                 }
-                // Fallback: if librqbit didn't delete files (e.g. session
-                // wasn't initialised), clean up manually.
-                if delete_files && path.exists() {
+                // Fallback filesystem cleanup: covers the cross-session case
+                // where the app restarted after completion (handle not in
+                // SharedBtSession.handles) and session.delete could not be
+                // called above.  We skip the outer path.exists() guard and
+                // let each operation fail silently if the path is absent.
+                if delete_files {
                     if path.is_dir() {
                         let _ = tokio::fs::remove_dir_all(&path).await;
                     } else {
+                        // Attempt remove_file regardless of path.exists();
+                        // a NotFound error is silently ignored via `let _`.
                         let _ = tokio::fs::remove_file(&path).await;
                     }
                 }

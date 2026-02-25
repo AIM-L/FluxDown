@@ -11,15 +11,14 @@ export default defineConfig({
     // Stable key to pin extension ID across dev/prod environments (Chrome/Edge only).
     // Firefox pins its ID via browser_specific_settings.gecko.id instead.
     // Including 'key' in Firefox manifests triggers an "unexpected property" warning.
-    // Corresponding Chrome extension ID: cmkcgfjpfcjfadecjdecbdfncmligjde
+    // Corresponding Chrome extension ID: meleenglfggcmcajknpeeeiobnpfmahc
     ...(browser !== 'firefox' ? {
-      key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAthusdAyFznAD55LqD7BzOWG+xYhvE8oVLKaYvEN7mcM/EuPAAIezzPp8HysMgAafUMyOI7IEWRLq4M68CB7/vuh6IDRmO4KteKPegnzvbbn5v7S3Iwvjuhb/tupQt96sWIlIxz27wN+ANeMdZJD3Zf1tA+Zi2eTdBmymClz0xjk4WcJoiPAlwOeCnMR6F62wB0xULi4hBCXccVsvO/ctzA/dtUcvYVF8apJ0DPJfX783ddcP12EVUgSv47WE70rs1a3fAG5bXQFncIDoc2FrPN+t6zvVT87Zpmb+q51w5gGvsC4zeP8DgS6zDkn7VcC2w/nUY+R8olvEfumkZarP9QIDAQAB",
+      key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuf6dyYDofdb37oWv25Rks/FLPA03UonRHvfgCw0KVtMJFUKSTyYbHJ3KWx8j/j8CZBKsPG+U75KEEeV7DTgxb0OUQDY93RzqdcIZlaLQaOxoFgmLI4I0dwjY7pIZs2lxkibqxHOZFZMwH3IMfIp0+u6CmumUPAtd40KaK9oTt0yIruWX6JaoSHJeNAGJ2SAPUl9WSAvB/VuGyL2JDeoT1Li4EZsYlCeaf1d3DHCt3Ye10kKt8a7Pv9iSOkgJlKSDQ24qRcHnch5Xe1IZfJYtAaeH8jYq5HdARFUcYnPgJ9gJEWUglQ2ADXywGyQF9gkOcDKmQJFukjqVDsQGpHbZcwIDAQAB",
     } : {}),
     permissions: [
       "downloads",
       "cookies",
       "webRequest",
-      "declarativeNetRequest",
       "storage",
       "notifications",
       "activeTab",

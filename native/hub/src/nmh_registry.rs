@@ -32,7 +32,7 @@ mod inner {
     const MANIFEST_FILENAME_FIREFOX: &str = "com.fluxdown.nmh.firefox.json";
 
     /// Chrome extension ID — pinned via `key` in wxt.config.ts manifest.
-    const CHROME_EXTENSION_ID: &str = "chrome-extension://cmkcgfjpfcjfadecjdecbdfncmligjde/";
+    const CHROME_EXTENSION_ID: &str = "chrome-extension://meleenglfggcmcajknpeeeiobnpfmahc/";
 
     /// Firefox extension ID (matches `browser_specific_settings.gecko.id` in manifest).
     const FIREFOX_EXTENSION_ID: &str = "fluxdown@fluxdown.app";
@@ -367,7 +367,7 @@ mod inner {
     /// On Linux, Firefox looks for the manifest by file name (must equal the host name).
     /// Windows uses a registry path so can have a different filename; Linux cannot.
     const MANIFEST_FILENAME_FIREFOX: &str = "com.fluxdown.nmh.json";
-    const CHROME_EXTENSION_ID: &str = "chrome-extension://cmkcgfjpfcjfadecjdecbdfncmligjde/";
+    const CHROME_EXTENSION_ID: &str = "chrome-extension://meleenglfggcmcajknpeeeiobnpfmahc/";
     const FIREFOX_EXTENSION_ID: &str = "fluxdown@fluxdown.app";
 
     #[derive(Serialize)]
