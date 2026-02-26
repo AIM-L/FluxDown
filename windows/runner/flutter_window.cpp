@@ -77,6 +77,39 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  // Handle WM_SHOWWINDOW to ensure Flutter's rendering engine pauses when the
+  // window is hidden to the system tray and resumes when shown again.
+  //
+  // window_manager.hide() calls ShowWindow(SW_HIDE) which sends only
+  // WM_SHOWWINDOW(FALSE) — NOT WM_SIZE(SIZE_MINIMIZED).  Without
+  // SIZE_MINIMIZED, Flutter's compositor does not pause vsync and continues
+  // rendering at the monitor refresh rate (~60 fps), wasting 3-4 % CPU even
+  // when there is nothing to draw.
+  //
+  // We synthesize the missing WM_SIZE messages so the Flutter engine always
+  // receives the signal it needs to suspend/resume the rasterizer.
+  //
+  // Guard: lParam == 0 means the visibility change was triggered by a direct
+  // ShowWindow call (our case).  Non-zero lParam values indicate parent-window
+  // state changes (SW_PARENTCLOSING, SW_PARENTOPENING) — we skip those because
+  // a real WM_SIZE(SIZE_MINIMIZED) was already dispatched by the minimize path.
+  if (message == WM_SHOWWINDOW && lparam == 0 && flutter_controller_) {
+    if (wparam == FALSE) {
+      // Window is being hidden.  Tell Flutter to pause vsync.
+      window_hidden_ = true;
+      ::PostMessage(hwnd, WM_SIZE, SIZE_MINIMIZED, 0);
+    } else if (wparam == TRUE && window_hidden_) {
+      // Window is being shown after a SW_HIDE.  Tell Flutter to resume vsync
+      // at the actual client dimensions (unchanged since we never minimized).
+      window_hidden_ = false;
+      RECT rect = GetClientArea();
+      ::PostMessage(hwnd, WM_SIZE, SIZE_RESTORED,
+                    MAKELPARAM(rect.right - rect.left,
+                               rect.bottom - rect.top));
+    }
+    // Fall through — let the base handler propagate WM_SHOWWINDOW normally.
+  }
+
   // Handle WM_COPYDATA from a second instance before Flutter processes it.
   if (message == WM_COPYDATA) {
     auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lparam);

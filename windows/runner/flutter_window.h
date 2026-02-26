@@ -34,6 +34,10 @@ class FlutterWindow : public Win32Window {
   // Method channel for forwarding second-instance args to Dart.
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       single_instance_channel_;
+
+  // Tracks whether the window was hidden via ShowWindow(SW_HIDE) so that
+  // we can synthesize a SIZE_RESTORED event when it becomes visible again.
+  bool window_hidden_ = false;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_
