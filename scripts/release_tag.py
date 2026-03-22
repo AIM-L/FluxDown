@@ -74,10 +74,13 @@ def get_previous_tag() -> str | None:
 def get_commits(from_tag: str | None, to_ref: str = "HEAD") -> str:
     """获取两个 ref 之间的 commit log，含变更文件列表（用于模块归属判断）"""
     range_spec = f"{from_tag}..{to_ref}" if from_tag else to_ref
-    return run(["git", "log", range_spec, "--pretty=format:COMMIT %h %s", "--name-only"])
+    return run(
+        ["git", "log", range_spec, "--pretty=format:COMMIT %h %s", "--name-only"]
+    )
 
 
 # ─── Claude CLI 调用 ─────────────────────────────────────────────────────────
+
 
 def _call_claude_streaming(prompt: str, model: str = "sonnet") -> str:
     """
@@ -89,13 +92,22 @@ def _call_claude_streaming(prompt: str, model: str = "sonnet") -> str:
 
     process = subprocess.Popen(
         [
-            "claude", "-p", prompt,
-            "--output-format", "stream-json",
+            "claude",
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
             "--verbose",
             "--include-partial-messages",
-            "--model", model,
-            "--max-turns", "10",
-            "--allowedTools", "Bash", "Read", "Glob", "Grep",
+            "--model",
+            model,
+            "--max-turns",
+            "10",
+            "--allowedTools",
+            "Bash",
+            "Read",
+            "Glob",
+            "Grep",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -164,22 +176,49 @@ def _call_claude_streaming(prompt: str, model: str = "sonnet") -> str:
     return final_result or "".join(collected).strip()
 
 
-def _call_claude_simple(prompt: str, model: str = "haiku") -> str:
+def _call_claude_simple(prompt: str, model: str = "haiku", timeout: int = 120) -> str:
     """非流式调用 Claude CLI（用于快速分类等轻量任务）"""
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
-    result = subprocess.run(
-        ["claude", "-p", prompt, "--model", model, "--max-turns", "1"],
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        timeout=60,
-        cwd=str(PROJECT_DIR),
-    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--model", model, "--max-turns", "1"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=timeout,
+            cwd=str(PROJECT_DIR),
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"\n⚠ Claude CLI 超时（{timeout}s），将使用本地 fallback 逻辑",
+            file=sys.stderr,
+        )
+        return ""
     if result.returncode != 0:
         return ""
     return result.stdout.strip()
+
+
+def _fallback_release_type(commits: str) -> str:
+    """根据 commit message 前缀本地推断发布类型（AI 不可用时的 fallback）"""
+    has_breaking = False
+    has_feat = False
+    for line in commits.splitlines():
+        lower = line.strip().lower()
+        if "breaking" in lower or "!:" in lower:
+            has_breaking = True
+        if lower.startswith("commit ") or lower.startswith("co"):
+            # 跳过 COMMIT hash 行，看后面的描述
+            continue
+        if any(lower.startswith(p) for p in ("feat", "feat:", "feat(")):
+            has_feat = True
+    if has_breaking:
+        return "major"
+    if has_feat:
+        return "minor"
+    return "patch"
 
 
 def suggest_release_type(commits: str, prev_tag: str | None) -> str:
@@ -191,7 +230,7 @@ def suggest_release_type(commits: str, prev_tag: str | None) -> str:
         - **minor**：新增功能，向后兼容
         - **patch**：仅修复 bug 或微小改进，无新功能
 
-        上一个版本：{prev_tag or '(无)'}
+        上一个版本：{prev_tag or "(无)"}
         Commit 记录：
         {commits}
 
@@ -201,12 +240,18 @@ def suggest_release_type(commits: str, prev_tag: str | None) -> str:
     for word in ("major", "minor", "patch"):
         if word in output:
             return word
-    return "unknown"
+    # AI 无法返回有效结果时，使用本地 fallback
+    fallback = _fallback_release_type(commits)
+    print(f"  ℹ AI 未返回有效结果，本地推断为: {fallback}", file=sys.stderr)
+    return fallback
 
 
 # ─── Release Notes 生成 ──────────────────────────────────────────────────────
 
-def _build_notes_prompt(version: str, commits: str, prev_tag: str | None, lang: str) -> str:
+
+def _build_notes_prompt(
+    version: str, commits: str, prev_tag: str | None, lang: str
+) -> str:
     """构建生成 Release Notes 的完整 prompt"""
     range_desc = f"{prev_tag}..{version}" if prev_tag else f"初始版本到 {version}"
     range_spec = f"{prev_tag}..HEAD" if prev_tag else "HEAD"
@@ -310,7 +355,11 @@ def _build_notes_prompt(version: str, commits: str, prev_tag: str | None, lang: 
 
 
 def generate_release_notes(
-    version: str, commits: str, prev_tag: str | None, lang: str = "zh", model: str = "sonnet"
+    version: str,
+    commits: str,
+    prev_tag: str | None,
+    lang: str = "zh",
+    model: str = "sonnet",
 ) -> str:
     """调用 Claude CLI 流式生成 Release Notes"""
     prompt = _build_notes_prompt(version, commits, prev_tag, lang)
@@ -329,7 +378,9 @@ def generate_release_notes(
     return result
 
 
-def refine_release_notes(current_notes: str, user_request: str, model: str = "sonnet") -> str:
+def refine_release_notes(
+    current_notes: str, user_request: str, model: str = "sonnet"
+) -> str:
     """根据用户反馈调用 Claude CLI 修改 Release Notes"""
     prompt = textwrap.dedent(f"""\
         你是 FluxDown 项目的发布助手。以下是当前的 Release Notes 草稿：
@@ -358,6 +409,7 @@ def refine_release_notes(current_notes: str, user_request: str, model: str = "so
 
 
 # ─── 交互式审阅 ──────────────────────────────────────────────────────────────
+
 
 def interactive_review(release_notes: str, model: str = "sonnet") -> str | None:
     """
@@ -398,13 +450,16 @@ def interactive_review(release_notes: str, model: str = "sonnet") -> str | None:
             if not user_request:
                 print("未输入修改要求，请重试")
                 continue
-            current_notes = refine_release_notes(current_notes, user_request, model=model)
+            current_notes = refine_release_notes(
+                current_notes, user_request, model=model
+            )
             round_num += 1
         else:
             print("无效输入，请输入 y、m 或 n")
 
 
 # ─── Git / GitHub 操作 ───────────────────────────────────────────────────────
+
 
 def create_tag(version: str, message: str) -> None:
     """创建 annotated tag（使用 --cleanup=verbatim 保留 # 开头的 Markdown 标题）"""
@@ -433,7 +488,9 @@ def create_github_release(version: str, notes: str, prerelease: bool = False) ->
     )
     if result.returncode != 0:
         print(f"⚠ GitHub Release 创建失败:\n{result.stderr}", file=sys.stderr)
-        print(f"  请手动运行: gh release create {version} --notes '...'", file=sys.stderr)
+        print(
+            f"  请手动运行: gh release create {version} --notes '...'", file=sys.stderr
+        )
     else:
         url = result.stdout.strip()
         print(f"✓ 已创建 GitHub Release: {url}")
@@ -456,7 +513,9 @@ def update_changelog(version: str, notes: str) -> None:
             insert_at = 1
             while insert_at < len(lines) and not lines[insert_at].startswith("##"):
                 insert_at += 1
-        new_content = "".join(lines[:insert_at]) + "\n" + entry + "".join(lines[insert_at:])
+        new_content = (
+            "".join(lines[:insert_at]) + "\n" + entry + "".join(lines[insert_at:])
+        )
     else:
         new_content = f"# Changelog\n\n{entry}"
 
@@ -465,6 +524,7 @@ def update_changelog(version: str, notes: str) -> None:
 
 
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -545,12 +605,19 @@ def main() -> None:
     if not args.skip_suggest:
         print("正在分析发布类型（haiku）...", end=" ", flush=True)
         release_type = suggest_release_type(commits, prev_tag)
-        type_labels = {"major": "重大版本 ⚠", "minor": "功能版本", "patch": "修复版本", "unknown": "未知"}
+        type_labels = {
+            "major": "重大版本 ⚠",
+            "minor": "功能版本",
+            "patch": "修复版本",
+            "unknown": "未知",
+        }
         print(f"建议: {release_type} — {type_labels.get(release_type, '')}")
         print()
 
     # ── 生成 Release Notes（流式输出）──
-    release_notes = generate_release_notes(version, commits, prev_tag, lang=args.lang, model=args.model)
+    release_notes = generate_release_notes(
+        version, commits, prev_tag, lang=args.lang, model=args.model
+    )
 
     if args.dry_run:
         print("(dry-run 模式，未创建 tag)\n")
