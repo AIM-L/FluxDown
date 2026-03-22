@@ -174,11 +174,14 @@ pub async fn parse_m3u8(
     client: &Client,
     url: &str,
     cookies: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<M3u8Content, DownloadError> {
     let mut req = client.get(url);
     if !cookies.is_empty() {
         req = req.header("Cookie", cookies);
     }
+    // 应用浏览器扩展捕获的额外请求头
+    req = crate::downloader::apply_extra_headers(req, extra_headers);
 
     let resp = req.send().await?.error_for_status()?;
     let bytes = resp.bytes().await?;
@@ -300,6 +303,7 @@ async fn fetch_key(
     cookies: &str,
     playlist_url: &str,
     key_cache: &mut HashMap<String, Vec<u8>>,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<u8>, DownloadError> {
     if let Some(cached) = key_cache.get(key_uri) {
         return Ok(cached.clone());
@@ -310,6 +314,8 @@ async fn fetch_key(
     if !safe_cookies.is_empty() {
         req = req.header("Cookie", safe_cookies);
     }
+    // 应用浏览器扩展捕获的额外请求头
+    req = crate::downloader::apply_extra_headers(req, extra_headers);
 
     let resp = req.send().await?.error_for_status()?;
     let key_bytes = resp.bytes().await?.to_vec();
@@ -583,7 +589,7 @@ async fn run_hls_download_inner(
         .await;
 
     // Parse the M3U8 playlist
-    let content = parse_m3u8(&p.client, &p.url, &p.cookies).await?;
+    let content = parse_m3u8(&p.client, &p.url, &p.cookies, &p.extra_headers).await?;
 
     let (segments, media_sequence) = match content {
         M3u8Content::Master { variants } => {
@@ -594,7 +600,8 @@ async fn run_hls_download_inner(
                 return Err(DownloadError::Cancelled);
             }
 
-            let media_content = parse_m3u8(&p.client, &selected_uri, &p.cookies).await?;
+            let media_content =
+                parse_m3u8(&p.client, &selected_uri, &p.cookies, &p.extra_headers).await?;
             match media_content {
                 M3u8Content::Media {
                     segments,
@@ -705,6 +712,7 @@ async fn run_hls_download_inner(
             &p.cancel_token,
             &p.task_id,
             seg_idx,
+            &p.extra_headers,
         )
         .await?;
 
@@ -712,8 +720,15 @@ async fn run_hls_download_inner(
         let output_data = if let Some(ref key_info) = segment.key {
             if key_info.method == HlsKeyMethod::Aes128 && !key_info.uri.is_empty() {
                 // Fetch key (cached)
-                let key_bytes =
-                    fetch_key(&p.client, &key_info.uri, &p.cookies, &p.url, &mut key_cache).await?;
+                let key_bytes = fetch_key(
+                    &p.client,
+                    &key_info.uri,
+                    &p.cookies,
+                    &p.url,
+                    &mut key_cache,
+                    &p.extra_headers,
+                )
+                .await?;
 
                 // Determine IV
                 let iv = if let Some(ref iv_str) = key_info.iv {
@@ -947,11 +962,12 @@ async fn download_segment_with_retry(
     cancel_token: &tokio_util::sync::CancellationToken,
     task_id: &str,
     seg_idx: usize,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<u8>, DownloadError> {
     let mut attempts = 0u32;
 
     loop {
-        match download_segment_once(client, url, cookies, playlist_url).await {
+        match download_segment_once(client, url, cookies, playlist_url, extra_headers).await {
             Ok(data) => return Ok(data),
             Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
             Err(e) => {
@@ -985,12 +1001,15 @@ async fn download_segment_once(
     url: &str,
     cookies: &str,
     playlist_url: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<u8>, DownloadError> {
     let safe_cookies = cookies_for_url(playlist_url, url, cookies);
     let mut req = client.get(url);
     if !safe_cookies.is_empty() {
         req = req.header("Cookie", safe_cookies);
     }
+    // 应用浏览器扩展捕获的额外请求头
+    req = crate::downloader::apply_extra_headers(req, extra_headers);
 
     let resp = req.send().await?.error_for_status()?;
     let data = resp.bytes().await?.to_vec();

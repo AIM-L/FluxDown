@@ -157,6 +157,8 @@ struct QueuedTask {
     /// Checksum spec for post-download integrity verification.
     /// Format: "algo=hexhash". Empty = skip verification.
     checksum: String,
+    /// 浏览器扩展捕获的额外 HTTP 请求头（如 Authorization）。
+    extra_headers: std::collections::HashMap<String, String>,
 }
 
 pub struct DownloadManager {
@@ -745,6 +747,7 @@ impl DownloadManager {
         user_agent: String,
         queue_id: String,
         checksum: String,
+        extra_headers: std::collections::HashMap<String, String>,
     ) {
         let task_id = Uuid::new_v4().to_string();
         // When segments <= 0 ("auto"), store 0 in DB and let the downloader
@@ -812,6 +815,7 @@ impl DownloadManager {
             user_agent,
             queue_id,
             checksum,
+            extra_headers,
         };
         if is_bt || (self.has_capacity() && self.has_queue_capacity(&queued.queue_id)) {
             self.do_start_task(queued).await;
@@ -872,6 +876,7 @@ impl DownloadManager {
             user_agent,
             queue_id,
             checksum,
+            extra_headers,
         } = queued;
 
         // Four-tier segment count priority:
@@ -1059,6 +1064,7 @@ impl DownloadManager {
                 proxy_config: task_proxy,
                 hls_quality_rx,
                 checksum,
+                extra_headers,
             };
 
             tokio::spawn(async move {
@@ -1263,6 +1269,7 @@ impl DownloadManager {
                     user_agent: String::new(), // use global UA on resume
                     queue_id: t.queue_id,
                     checksum: t.checksum, // loaded from DB for integrity verification
+                    extra_headers: std::collections::HashMap::new(), // 恢复任务无额外请求头
                 });
             }
         }
@@ -1496,6 +1503,7 @@ impl DownloadManager {
                 proxy_config: task_proxy,
                 hls_quality_rx,
                 checksum: task.checksum,
+                extra_headers: std::collections::HashMap::new(), // 恢复任务无额外请求头
             };
 
             tokio::spawn(async move {
@@ -2082,6 +2090,7 @@ impl DownloadManager {
                 user_agent: String::new(),
                 queue_id: task_row.queue_id,
                 checksum: task_row.checksum,
+                extra_headers: std::collections::HashMap::new(), // 恢复任务无额外请求头
             });
         }
     }

@@ -33,8 +33,9 @@ pub struct DownloadRequest {
     pub referrer: String,
     #[serde(default)]
     pub cookies: String,
+    /// 浏览器请求中捕获的额外 HTTP 头（如 Authorization）。
+    /// 由 Rust 下载引擎在发起请求时附加到请求头中。
     #[serde(default)]
-    #[allow(dead_code)]
     pub headers: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "fileSize")]
     #[serde(default)]
@@ -73,7 +74,7 @@ mod server {
     use tokio::net::windows::named_pipe::ServerOptions;
     use tokio::sync::mpsc;
 
-    use super::{DownloadRequest, PipeMessage, PipeResponse, MAX_MESSAGE_SIZE, PIPE_NAME};
+    use super::{DownloadRequest, MAX_MESSAGE_SIZE, PIPE_NAME, PipeMessage, PipeResponse};
 
     /// Read a 4-byte LE length-prefixed message from the pipe.
     async fn read_framed_message(
@@ -146,35 +147,33 @@ mod server {
                         msg_id: msg.msg_id,
                     }
                 }
-                "download" => {
-                    match serde_json::from_value::<DownloadRequest>(msg.payload) {
-                        Ok(download_req) => {
-                            rinf::debug_print!(
-                                "[nmh-pipe] download request (msg_id={}): url={}",
-                                msg.msg_id,
-                                download_req.url
-                            );
-                            let _ = tx.send(download_req).await;
-                            PipeResponse {
-                                success: true,
-                                message: Some("download accepted".to_string()),
-                                msg_id: msg.msg_id,
-                            }
-                        }
-                        Err(e) => {
-                            rinf::debug_print!(
-                                "[nmh-pipe] download parse error (msg_id={}): {}",
-                                msg.msg_id,
-                                e
-                            );
-                            PipeResponse {
-                                success: false,
-                                message: Some(format!("invalid download payload: {}", e)),
-                                msg_id: msg.msg_id,
-                            }
+                "download" => match serde_json::from_value::<DownloadRequest>(msg.payload) {
+                    Ok(download_req) => {
+                        rinf::debug_print!(
+                            "[nmh-pipe] download request (msg_id={}): url={}",
+                            msg.msg_id,
+                            download_req.url
+                        );
+                        let _ = tx.send(download_req).await;
+                        PipeResponse {
+                            success: true,
+                            message: Some("download accepted".to_string()),
+                            msg_id: msg.msg_id,
                         }
                     }
-                }
+                    Err(e) => {
+                        rinf::debug_print!(
+                            "[nmh-pipe] download parse error (msg_id={}): {}",
+                            msg.msg_id,
+                            e
+                        );
+                        PipeResponse {
+                            success: false,
+                            message: Some(format!("invalid download payload: {}", e)),
+                            msg_id: msg.msg_id,
+                        }
+                    }
+                },
                 other => {
                     rinf::debug_print!(
                         "[nmh-pipe] unknown action '{}' (msg_id={})",
@@ -259,7 +258,7 @@ mod server {
     use tokio::net::UnixListener;
     use tokio::sync::mpsc;
 
-    use super::{DownloadRequest, PipeMessage, PipeResponse, MAX_MESSAGE_SIZE};
+    use super::{DownloadRequest, MAX_MESSAGE_SIZE, PipeMessage, PipeResponse};
 
     /// Returns the Unix socket path for the NMH relay to connect to.
     /// Prefer $XDG_RUNTIME_DIR (user-private, cleaned on logout) over /tmp.
@@ -433,4 +432,73 @@ mod server {
 /// Ping requests are handled internally (immediate pong response).
 pub fn spawn_native_messaging_listener() -> mpsc::Receiver<DownloadRequest> {
     server::spawn_listener()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DownloadRequest;
+
+    #[test]
+    fn deserialize_download_request_with_headers() {
+        let json = r#"{
+            "url": "https://example.com/file.zip",
+            "filename": "file.zip",
+            "referrer": "https://example.com/",
+            "cookies": "session=abc123",
+            "headers": {
+                "Authorization": "Bearer token123",
+                "X-Custom": "value"
+            },
+            "fileSize": 1024,
+            "mimeType": "application/zip"
+        }"#;
+        let req: DownloadRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.url, "https://example.com/file.zip");
+        assert_eq!(req.filename, "file.zip");
+        assert_eq!(req.referrer, "https://example.com/");
+        assert_eq!(req.cookies, "session=abc123");
+        let headers = req.headers.unwrap();
+        assert_eq!(headers.get("Authorization").unwrap(), "Bearer token123");
+        assert_eq!(headers.get("X-Custom").unwrap(), "value");
+        assert_eq!(req.file_size, Some(1024));
+        assert_eq!(req.mime_type.as_deref(), Some("application/zip"));
+    }
+
+    #[test]
+    fn deserialize_download_request_without_headers() {
+        let json = r#"{
+            "url": "https://example.com/file.zip"
+        }"#;
+        let req: DownloadRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.url, "https://example.com/file.zip");
+        assert!(req.headers.is_none());
+        assert_eq!(req.cookies, "");
+        assert_eq!(req.referrer, "");
+    }
+
+    #[test]
+    fn deserialize_download_request_empty_headers() {
+        let json = r#"{
+            "url": "https://example.com/file.zip",
+            "headers": {}
+        }"#;
+        let req: DownloadRequest = serde_json::from_str(json).unwrap();
+        let headers = req.headers.unwrap();
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn deserialize_batch_url_with_newlines() {
+        // 验证批量下载用换行符拼接的 URL 可以正确反序列化
+        let json = r#"{
+            "url": "https://a.com/1.zip\nhttps://b.com/2.zip",
+            "cookies": "session=abc",
+            "referrer": "https://example.com/"
+        }"#;
+        let req: DownloadRequest = serde_json::from_str(json).unwrap();
+        let urls: Vec<&str> = req.url.split('\n').collect();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "https://a.com/1.zip");
+        assert_eq!(urls[1], "https://b.com/2.zip");
+    }
 }

@@ -62,6 +62,14 @@ pub struct BatchCreateTask {
     /// Named queue ID to assign all tasks to. Empty = default queue.
     #[serde(default)]
     pub queue_id: String,
+    /// 浏览器 cookies，用于需要认证的批量下载。
+    /// 批次内所有任务共享。
+    #[serde(default)]
+    pub cookies: String,
+    /// HTTP Referer 请求头，来自浏览器扩展。
+    /// 批次内所有任务共享。
+    #[serde(default)]
+    pub referrer: String,
 }
 
 /// Control an existing task (pause/resume/cancel/delete)
@@ -397,8 +405,8 @@ pub struct UrlProtocolStatus {
 #[derive(Serialize, RustSignal)]
 pub struct TaskMetaProbed {
     pub task_id: String,
-    pub file_name: String,  // 空 = 无法探测
-    pub total_bytes: i64,   // 0 = 未知
+    pub file_name: String, // 空 = 无法探测
+    pub total_bytes: i64,  // 0 = 未知
 }
 
 /// 队列位置批量更新 (Rust → Dart) — 每次队列变化时广播

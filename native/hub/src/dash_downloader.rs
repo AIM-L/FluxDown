@@ -68,6 +68,8 @@ struct SegmentDownloadContext<'a> {
     reference_url: &'a str,
     cancel_token: &'a tokio_util::sync::CancellationToken,
     task_id: &'a str,
+    /// 浏览器扩展捕获的额外 HTTP 请求头
+    extra_headers: &'a std::collections::HashMap<String, String>,
 }
 
 pub async fn run_dash_download(mut params: DownloadParams) {
@@ -151,7 +153,7 @@ async fn run_dash_download_inner(
         })
         .await;
 
-    let mpd = fetch_and_parse_mpd(&p.client, &p.url, &p.cookies).await?;
+    let mpd = fetch_and_parse_mpd(&p.client, &p.url, &p.cookies, &p.extra_headers).await?;
     let period = mpd
         .periods
         .first()
@@ -308,11 +310,14 @@ async fn fetch_and_parse_mpd(
     client: &Client,
     url: &str,
     cookies: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<dash_mpd::MPD, DownloadError> {
     let mut req = client.get(url);
     if !cookies.is_empty() {
         req = req.header("Cookie", cookies);
     }
+    // 应用浏览器扩展捕获的额外请求头
+    req = crate::downloader::apply_extra_headers(req, extra_headers);
     let resp = req.send().await?.error_for_status()?;
     let bytes = resp.bytes().await?;
     let xml = String::from_utf8(bytes.to_vec())
@@ -1011,6 +1016,7 @@ async fn download_track(
         reference_url,
         cancel_token: &p.cancel_token,
         task_id: &p.task_id,
+        extra_headers: &p.extra_headers,
     };
 
     let segment_iter = init_seg.iter().chain(media_segs.iter());
@@ -1155,6 +1161,8 @@ async fn download_segment_streaming(
     if !safe_cookies.is_empty() {
         req = req.header("Cookie", safe_cookies);
     }
+    // 应用浏览器扩展捕获的额外请求头
+    req = crate::downloader::apply_extra_headers(req, ctx.extra_headers);
 
     let resp = tokio::select! {
         _ = ctx.cancel_token.cancelled() => return Err(DownloadError::Cancelled),

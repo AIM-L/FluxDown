@@ -582,10 +582,12 @@ class DownloadController extends ChangeNotifier {
     String proxyUrl = '',
     String userAgent = '',
     String queueId = '',
+    String cookies = '',
+    String referrer = '',
   }) {
     logInfo(
       _tag,
-      'batchCreateTask: ${entries.length} entries, dir=$saveDir, seg=$segments, queue=$queueId',
+      'batchCreateTask: ${entries.length} entries, dir=$saveDir, seg=$segments, queue=$queueId, cookies_len=${cookies.length}',
     );
     BatchCreateTask(
       entries: entries,
@@ -594,6 +596,8 @@ class DownloadController extends ChangeNotifier {
       proxyUrl: proxyUrl,
       userAgent: userAgent,
       queueId: queueId,
+      cookies: cookies,
+      referrer: referrer,
     ).sendSignalToRust();
     for (final entry in entries) {
       final protocol = entry.url.toLowerCase().startsWith('ftp')

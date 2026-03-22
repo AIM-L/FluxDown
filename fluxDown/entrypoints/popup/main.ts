@@ -31,6 +31,9 @@ const themeBtn = $<HTMLButtonElement>('#themeBtn');
 const langBtn = $<HTMLButtonElement>('#langBtn');
 const langLabel = langBtn.querySelector('.lang-label')!;
 
+// 版本号
+const versionLabel = $('#versionLabel')!;
+
 // 统计
 const statSent = $('#statSent')!;
 const statFailed = $('#statFailed')!;
@@ -262,6 +265,9 @@ async function init() {
   updateLangButton();
 
   await initTheme();
+
+  // 从 manifest 动态读取版本号（CI 构建时由 git tag 写入）
+  versionLabel.textContent = `v${browser.runtime.getManifest().version}`;
 
   // 直接查询连接状态和加载设置，不经过 background sendMessage。
   // 原因：Firefox MV2 中 WXT 框架会注册自己的 onMessage 监听器（用于 HMR），

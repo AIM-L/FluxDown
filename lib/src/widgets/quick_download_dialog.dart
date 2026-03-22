@@ -309,6 +309,8 @@ class _QuickDownloadDialogContentState
         proxyUrl: proxyUrl,
         userAgent: userAgent,
         queueId: _selectedQueueId,
+        cookies: widget.cookies,
+        referrer: widget.referrer,
       ).sendSignalToRust();
     }
 

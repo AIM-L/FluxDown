@@ -16,9 +16,9 @@
  *   - 超时 12s（预留 NMH 启动 App 的等待时间）
  */
 
-import { browser } from 'wxt/browser';
+import { browser } from "wxt/browser";
 
-const NMH_NAME = 'com.fluxdown.nmh';
+const NMH_NAME = "com.fluxdown.nmh";
 
 // 每请求超时时间（NMH 启动 App 最多需要 ~7.5s，预留充足余量）
 const REQUEST_TIMEOUT_MS = 12000;
@@ -48,6 +48,7 @@ export interface BatchDownloadItem {
   filename?: string;
   referrer?: string;
   cookies?: string;
+  headers?: Record<string, string>;
   fileSize?: number;
   mimeType?: string;
 }
@@ -77,7 +78,7 @@ function getPort(): chrome.runtime.Port | null {
     _port = browser.runtime.connectNative(NMH_NAME);
   } catch (e) {
     // connectNative() throws synchronously if the API is unavailable (e.g. permission denied).
-    console.error('[FluxDown NMH] connectNative() threw:', e);
+    console.error("[FluxDown NMH] connectNative() threw:", e);
     return null;
   }
 
@@ -107,15 +108,15 @@ function getPort(): chrome.runtime.Port | null {
     // native messaging host is forbidden" (extension ID mismatch).
     const err = (p as any).error ?? browser.runtime.lastError;
     if (err?.message) {
-      console.error('[FluxDown NMH] port disconnected, reason:', err.message);
+      console.error("[FluxDown NMH] port disconnected, reason:", err.message);
     } else {
-      console.warn('[FluxDown NMH] port disconnected (no error reason)');
+      console.warn("[FluxDown NMH] port disconnected (no error reason)");
     }
     _port = null;
     // Reject all pending requests
     for (const [id, pending] of _pendingRequests) {
       clearTimeout(pending.timer);
-      pending.resolve({ success: false, message: 'port disconnected' });
+      pending.resolve({ success: false, message: "port disconnected" });
       _pendingRequests.delete(id);
     }
   });
@@ -127,7 +128,9 @@ function disconnectPort() {
   if (_port) {
     try {
       _port.disconnect();
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
     _port = null;
   }
 }
@@ -136,18 +139,21 @@ function disconnectPort() {
 // 消息发送
 // ──────────────────────────────────────────────────────────────
 
-function sendMessage(action: string, payload: Record<string, any> = {}): Promise<ApiResponse> {
+function sendMessage(
+  action: string,
+  payload: Record<string, any> = {},
+): Promise<ApiResponse> {
   return new Promise<ApiResponse>((resolve) => {
     const port = getPort();
     if (!port) {
-      resolve({ success: false, message: 'native_messaging_unavailable' });
+      resolve({ success: false, message: "native_messaging_unavailable" });
       return;
     }
 
     const msgId = _nextMsgId++;
     const timer = setTimeout(() => {
       _pendingRequests.delete(msgId);
-      resolve({ success: false, message: 'timeout' });
+      resolve({ success: false, message: "timeout" });
     }, REQUEST_TIMEOUT_MS);
 
     _pendingRequests.set(msgId, { resolve, timer });
@@ -158,7 +164,7 @@ function sendMessage(action: string, payload: Record<string, any> = {}): Promise
       _pendingRequests.delete(msgId);
       clearTimeout(timer);
       disconnectPort();
-      resolve({ success: false, message: 'postMessage failed' });
+      resolve({ success: false, message: "postMessage failed" });
     }
   });
 }
@@ -169,15 +175,19 @@ function sendMessage(action: string, payload: Record<string, any> = {}): Promise
  * disconnects the old port and retries once — Chrome will spawn a fresh
  * NMH process which auto-launches the App.
  */
-async function sendWithRetry(action: string, payload: Record<string, any>): Promise<ApiResponse> {
+async function sendWithRetry(
+  action: string,
+  payload: Record<string, any>,
+): Promise<ApiResponse> {
   const result = await sendMessage(action, payload);
   if (result.success) return result;
 
   // Retry once on transient failures (gets a fresh NMH process that auto-launches App)
-  const retryable = result.message === 'port disconnected'
-    || result.message === 'postMessage failed'
-    || result.message === 'app_not_running'
-    || result.message === 'timeout';
+  const retryable =
+    result.message === "port disconnected" ||
+    result.message === "postMessage failed" ||
+    result.message === "app_not_running" ||
+    result.message === "timeout";
 
   if (retryable) {
     disconnectPort();
@@ -191,29 +201,35 @@ async function sendWithRetry(action: string, payload: Record<string, any>): Prom
 // 导出接口（与原 HTTP 版本完全兼容）
 // ──────────────────────────────────────────────────────────────
 
-export async function sendDownloadRequest(request: DownloadRequest): Promise<ApiResponse> {
-  return sendWithRetry('download', request as Record<string, any>);
+export async function sendDownloadRequest(
+  request: DownloadRequest,
+): Promise<ApiResponse> {
+  return sendWithRetry("download", request as Record<string, any>);
 }
 
-export async function sendBatchDownloadRequest(items: BatchDownloadItem[]): Promise<ApiResponse> {
+export async function sendBatchDownloadRequest(
+  items: BatchDownloadItem[],
+): Promise<ApiResponse> {
   if (items.length === 0) {
-    return { success: false, message: 'No items' };
+    return { success: false, message: "No items" };
   }
 
-  const joinedUrl = items.map((item) => item.url).join('\n');
-  const cookies = items[0]?.cookies || '';
+  const joinedUrl = items.map((item) => item.url).join("\n");
+  const cookies = items[0]?.cookies || "";
 
   const request: DownloadRequest = {
     url: joinedUrl,
-    filename: '',
-    referrer: items[0]?.referrer || '',
+    filename: "",
+    referrer: items[0]?.referrer || "",
     cookies,
+    // 传递第一条 item 的额外请求头（如 Authorization 等）
+    headers: items[0]?.headers,
   };
 
-  return sendWithRetry('download', request as Record<string, any>);
+  return sendWithRetry("download", request as Record<string, any>);
 }
 
 export async function checkFluxDownAvailable(): Promise<boolean> {
-  const result = await sendMessage('ping');
+  const result = await sendMessage("ping");
   return result.success === true;
 }

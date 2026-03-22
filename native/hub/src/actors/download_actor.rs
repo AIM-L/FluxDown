@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use rinf::{DartSignal, RustSignal};
@@ -6,18 +7,18 @@ use tokio::sync::mpsc;
 use crate::bt_downloader::{self, BtConfig};
 use crate::db::Db;
 use crate::download_manager::{self, DownloadManager, DownloadManagerConfig, TaskDone};
-use crate::native_messaging::{self};
 use crate::file_association;
+use crate::native_messaging::{self};
 use crate::protocol_registry;
 use crate::proxy_config::ProxyConfig;
 use crate::signals::{
     BatchControlTask, BatchCreateTask, CheckFileAssociation, CheckForUpdate, CheckUrlProtocol,
     ConfigEntry, ConfigLoaded, ConfirmExternalDownload, ControlTask, CreateQueue, CreateTask,
-    DeleteQueue, DetectSystemProxy, DownloadUpdate, ExternalDownloadRequest,
-    FileAssociationStatus, InstallUpdate, MoveTaskToQueue, ProxyTestResult, RequestAllQueues,
-    RequestAllTasks, RequestConfig, SaveConfig, SelectHlsQuality, SetFileAssociation,
-    SetPriorityTask, SetUrlProtocol, SystemProxyInfo, TestProxyConnection, UpdateCheckResult,
-    UpdateQueue, UrlProtocolStatus,
+    DeleteQueue, DetectSystemProxy, DownloadUpdate, ExternalDownloadRequest, FileAssociationStatus,
+    InstallUpdate, MoveTaskToQueue, ProxyTestResult, RequestAllQueues, RequestAllTasks,
+    RequestConfig, SaveConfig, SelectHlsQuality, SetFileAssociation, SetPriorityTask,
+    SetUrlProtocol, SystemProxyInfo, TestProxyConnection, UpdateCheckResult, UpdateQueue,
+    UrlProtocolStatus,
 };
 use crate::updater;
 
@@ -87,7 +88,15 @@ async fn load_initial_config(db: &Db) -> (usize, u64, String, BtConfig, ProxyCon
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(0);
 
-    (max_concurrent, speed_limit_bytes, save_dir, bt_config, proxy_config, user_agent, default_segments)
+    (
+        max_concurrent,
+        speed_limit_bytes,
+        save_dir,
+        bt_config,
+        proxy_config,
+        user_agent,
+        default_segments,
+    )
 }
 
 pub async fn run(db_dir: PathBuf) {
@@ -105,7 +114,15 @@ pub async fn run(db_dir: PathBuf) {
     }
 
     // Load persisted config to initialize the manager with correct limits.
-    let (max_concurrent, speed_limit_bps, save_dir, mut bt_config, proxy_config, user_agent, default_segments) = load_initial_config(&db).await;
+    let (
+        max_concurrent,
+        speed_limit_bps,
+        save_dir,
+        mut bt_config,
+        proxy_config,
+        user_agent,
+        default_segments,
+    ) = load_initial_config(&db).await;
     rinf::debug_print!(
         "[actor] proxy config: mode={}, type={}, host={}, port={}",
         proxy_config.mode.as_str(),
@@ -131,15 +148,18 @@ pub async fn run(db_dir: PathBuf) {
     );
 
     let app_data_dir = db_dir.to_string_lossy().into_owned();
-    let mut manager = match DownloadManager::new(db.clone(), DownloadManagerConfig {
-        max_concurrent,
-        speed_limit_bps,
-        default_save_dir: save_dir,
-        app_data_dir,
-        bt_config,
-        proxy_config,
-        user_agent,
-    }) {
+    let mut manager = match DownloadManager::new(
+        db.clone(),
+        DownloadManagerConfig {
+            max_concurrent,
+            speed_limit_bps,
+            default_save_dir: save_dir,
+            app_data_dir,
+            bt_config,
+            proxy_config,
+            user_agent,
+        },
+    ) {
         Ok(m) => m,
         Err(e) => {
             rinf::debug_print!("Failed to create download manager: {}", e);
@@ -219,12 +239,16 @@ pub async fn run(db_dir: PathBuf) {
         }
     });
 
+    // 缓存浏览器扩展传递的额外 HTTP 请求头（如 Authorization），
+    // 以 URL 为 key，在用户确认下载时取出传递给下载引擎。
+    let mut ext_headers_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
+
     loop {
         tokio::select! {
             Some(signal) = create_recv.recv() => {
                 let msg = signal.message;
                 manager
-                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, String::new(), 0, msg.torrent_file_bytes, msg.proxy_url, msg.user_agent, msg.queue_id, msg.checksum)
+                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, String::new(), 0, msg.torrent_file_bytes, msg.proxy_url, msg.user_agent, msg.queue_id, msg.checksum, HashMap::new())
                     .await;
                 // 立即推送 AllTasks，确保 Dart 端在收到 TaskProgress 之前
                 // 已通过 AllTasks 获得正确的 queue_id，防止新任务被错误归入默认队列。
@@ -238,7 +262,7 @@ pub async fn run(db_dir: PathBuf) {
                 );
                 for entry in msg.entries {
                     manager
-                        .create_task(entry.url, msg.save_dir.clone(), entry.file_name, msg.segments, String::new(), String::new(), 0, Vec::new(), msg.proxy_url.clone(), msg.user_agent.clone(), msg.queue_id.clone(), entry.checksum)
+                        .create_task(entry.url, msg.save_dir.clone(), entry.file_name, msg.segments, msg.cookies.clone(), msg.referrer.clone(), 0, Vec::new(), msg.proxy_url.clone(), msg.user_agent.clone(), msg.queue_id.clone(), entry.checksum, HashMap::new())
                         .await;
                 }
                 // 批量创建完成后统一推送一次 AllTasks，同步 queue_id 到 Dart。
@@ -375,10 +399,17 @@ pub async fn run(db_dir: PathBuf) {
             // --- Native Messaging: browser extension download requests ---
             Some(req) = native_msg_rx.recv() => {
                 rinf::debug_print!(
-                    "[actor] external download request from browser: url={}, cookies_len={}",
+                    "[actor] external download request from browser: url={}, cookies_len={}, headers={:?}",
                     req.url,
-                    req.cookies.len()
+                    req.cookies.len(),
+                    req.headers.as_ref().map(|h| h.keys().collect::<Vec<_>>()),
                 );
+                // 缓存额外请求头，供用户确认下载时使用
+                if let Some(ref headers) = req.headers {
+                    if !headers.is_empty() {
+                        ext_headers_cache.insert(req.url.clone(), headers.clone());
+                    }
+                }
                 // Forward to Dart UI so it can pop the quick-download dialog.
                 ExternalDownloadRequest {
                     url: req.url,
@@ -393,13 +424,16 @@ pub async fn run(db_dir: PathBuf) {
             // --- Dart confirmed an external download request ---
             Some(signal) = confirm_ext_recv.recv() => {
                 let msg = signal.message;
+                // 取出缓存的额外请求头
+                let extra_headers = ext_headers_cache.remove(&msg.url).unwrap_or_default();
                 rinf::debug_print!(
-                    "[actor] user confirmed external download: url={}, cookies_len={}",
+                    "[actor] user confirmed external download: url={}, cookies_len={}, extra_headers={}",
                     msg.url,
-                    msg.cookies.len()
+                    msg.cookies.len(),
+                    extra_headers.len(),
                 );
                 manager
-                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, msg.referrer, msg.hint_file_size, Vec::new(), msg.proxy_url, msg.user_agent, msg.queue_id, String::new())
+                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, msg.referrer, msg.hint_file_size, Vec::new(), msg.proxy_url, msg.user_agent, msg.queue_id, String::new(), extra_headers)
                     .await;
                 // 推送 AllTasks 确保 Dart 端获得正确 queue_id。
                 manager.load_and_send_all_tasks().await;

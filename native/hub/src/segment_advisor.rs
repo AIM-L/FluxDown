@@ -179,6 +179,8 @@ pub async fn probe_bandwidth(
     supports_range: bool,
     cancel_token: &CancellationToken,
     cookies: &str,
+    referrer: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Option<f64> {
     use futures_util::StreamExt;
 
@@ -191,6 +193,12 @@ pub async fn probe_bandwidth(
     if !cookies.is_empty() {
         req = req.header("Cookie", cookies);
     }
+    // 设置 Referer 头，部分 CDN/防盗链服务器需要此字段
+    if !referrer.is_empty() {
+        req = req.header(reqwest::header::REFERER, referrer);
+    }
+    // 应用用户自定义请求头
+    req = crate::downloader::apply_extra_headers(req, extra_headers);
 
     let start = std::time::Instant::now();
 
@@ -253,7 +261,7 @@ fn available_parallelism() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{advise_static, advise_with_bandwidth, AdvisorInput};
+    use super::{AdvisorInput, advise_static, advise_with_bandwidth, probe_bandwidth};
 
     #[test]
     fn small_file_gets_one_segment() {
@@ -301,5 +309,20 @@ mod tests {
             supports_range: true,
         });
         assert_eq!(advice.segments, 1);
+    }
+
+    #[tokio::test]
+    async fn probe_bandwidth_signature_accepts_referrer_and_extra_headers() {
+        // 编译时验证：probe_bandwidth 接受 referrer 和 extra_headers 参数。
+        // 使用一个不可达的调用点让编译器检查参数类型，无需真实 HTTP 服务器。
+        if false {
+            let client = reqwest::Client::new();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let headers = std::collections::HashMap::<String, String>::new();
+            let _ = probe_bandwidth(
+                &client, "http://x", true, &cancel, "cookie", "referer", &headers,
+            )
+            .await;
+        }
     }
 }

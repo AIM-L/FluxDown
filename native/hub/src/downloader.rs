@@ -105,6 +105,26 @@ pub struct DownloadParams {
     /// Format: "algo=hexhash", e.g. "sha-256=abc123..." or "md5=d41d8c...".
     /// Empty = skip verification.
     pub checksum: String,
+    /// 浏览器扩展捕获的额外 HTTP 请求头（如 Authorization）。
+    /// 在发起 HTTP 请求时附加到请求头中。
+    pub extra_headers: std::collections::HashMap<String, String>,
+}
+
+/// 将浏览器扩展捕获的额外 HTTP 头应用到请求构建器上。
+/// 无效的 header name 或 value 会被静默跳过。
+pub(crate) fn apply_extra_headers(
+    mut req: reqwest::RequestBuilder,
+    extra_headers: &std::collections::HashMap<String, String>,
+) -> reqwest::RequestBuilder {
+    for (name, value) in extra_headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            req = req.header(header_name, header_value);
+        }
+    }
+    req
 }
 
 // ---------------------------------------------------------------------------
@@ -280,10 +300,11 @@ pub async fn resolve_file_info(
     url: &str,
     cookies: &str,
     referrer: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<FileInfo, DownloadError> {
     let mut last_err = None;
     for attempt in 0..PROBE_MAX_RETRIES {
-        match resolve_file_info_once(client, url, cookies, referrer).await {
+        match resolve_file_info_once(client, url, cookies, referrer, extra_headers).await {
             Ok(info) => return Ok(info),
             Err(e) => {
                 rinf::debug_print!(
@@ -320,6 +341,7 @@ async fn resolve_file_info_once(
     url: &str,
     cookies: &str,
     referrer: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<FileInfo, DownloadError> {
     // --- Concurrent HEAD + GET probe ----------------------------------------
     // Fire both HEAD and GET Range:0-0 in parallel.  HEAD is faster when it
@@ -334,6 +356,7 @@ async fn resolve_file_info_once(
         if !referrer.is_empty() {
             req = req.header(reqwest::header::REFERER, referrer);
         }
+        req = apply_extra_headers(req, extra_headers);
         req.send()
     };
 
@@ -348,6 +371,7 @@ async fn resolve_file_info_once(
         if !referrer.is_empty() {
             req = req.header(reqwest::header::REFERER, referrer);
         }
+        req = apply_extra_headers(req, extra_headers);
         req.send()
     };
 
@@ -967,6 +991,8 @@ async fn compute_segments_with_advisor(p: &DownloadParams, info: &FileInfo) -> i
                 info.supports_range,
                 &p.cancel_token,
                 &p.cookies,
+                &p.referrer,
+                &p.extra_headers,
             )
             .await
             {
@@ -1058,7 +1084,8 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
         }
     } else {
         rinf::debug_print!("[download] task {} resolving file info...", p.task_id);
-        let info = resolve_file_info(client, &p.url, &p.cookies, &p.referrer).await?;
+        let info =
+            resolve_file_info(client, &p.url, &p.cookies, &p.referrer, &p.extra_headers).await?;
         rinf::debug_print!(
             "[download] task {} resolved: name={}, size={}, range={}",
             p.task_id,
@@ -1215,6 +1242,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
             &p.speed_limiter,
             &p.cookies,
             &p.referrer,
+            &p.extra_headers,
         )
         .await?;
     } else {
@@ -1231,6 +1259,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
             &p.speed_limiter,
             &p.cookies,
             &p.referrer,
+            &p.extra_headers,
         )
         .await?;
     }
@@ -1344,6 +1373,7 @@ async fn download_single(
     speed_limiter: &SpeedLimiter,
     cookies: &str,
     referrer: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<(), DownloadError> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -1370,6 +1400,7 @@ async fn download_single(
     if !referrer.is_empty() {
         req = req.header(reqwest::header::REFERER, referrer);
     }
+    req = apply_extra_headers(req, extra_headers);
     if resume {
         req = req.header("Range", format!("bytes={}-", existing_len));
         downloaded = existing_len;
@@ -1522,6 +1553,7 @@ async fn download_multi_segment(
     speed_limiter: &SpeedLimiter,
     cookies: &str,
     referrer: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<(), DownloadError> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -1560,6 +1592,7 @@ async fn download_multi_segment(
         speed_limiter,
         cookies,
         referrer,
+        extra_headers,
     )
     .await
 }
@@ -1999,5 +2032,65 @@ mod tests {
             Some("三体 (刘慈欣).epub"),
             "raw UTF-8 bytes in filename= must not prevent filename*= from being parsed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_extra_headers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_extra_headers_adds_authorization() {
+        use std::collections::HashMap;
+        let client = reqwest::Client::new();
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer token123".to_string());
+        let req = client.get("https://example.com/file.zip");
+        let req = super::apply_extra_headers(req, &headers);
+        // 构建请求并验证 header 已正确添加
+        let built = req.build().unwrap();
+        assert_eq!(
+            built
+                .headers()
+                .get("Authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer token123"
+        );
+    }
+
+    #[test]
+    fn apply_extra_headers_empty_map_is_noop() {
+        use std::collections::HashMap;
+        let client = reqwest::Client::new();
+        let headers = HashMap::new();
+        let req = client.get("https://example.com/file.zip");
+        let req = super::apply_extra_headers(req, &headers);
+        let built = req.build().unwrap();
+        assert!(built.headers().get("Authorization").is_none());
+    }
+
+    #[test]
+    fn apply_extra_headers_skips_invalid_header_name() {
+        use std::collections::HashMap;
+        let client = reqwest::Client::new();
+        let mut headers = HashMap::new();
+        // 无效的 header name（包含空格）应被跳过
+        headers.insert("Invalid Header".to_string(), "value".to_string());
+        headers.insert("Valid-Header".to_string(), "good".to_string());
+        let req = client.get("https://example.com/file.zip");
+        let req = super::apply_extra_headers(req, &headers);
+        let built = req.build().unwrap();
+        // 有效 header 正常添加
+        assert_eq!(
+            built
+                .headers()
+                .get("Valid-Header")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "good"
+        );
+        // 无效 header 被跳过（HeaderName::from_bytes 会拒绝含空格的名称）
     }
 }

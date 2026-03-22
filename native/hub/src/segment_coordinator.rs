@@ -184,6 +184,7 @@ pub async fn run_coordinated_download(
     speed_limiter: &SpeedLimiter,
     cookies: &str,
     referrer: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<(), DownloadError> {
     // ----- 0. Defensive checks ------------------------------------------------
     if total_bytes <= 0 {
@@ -358,6 +359,7 @@ pub async fn run_coordinated_download(
             speed_limiter.clone(),
             cookies.to_string(),
             referrer.to_string(),
+            extra_headers.clone(),
         );
 
         worker_assign_txs.push(Some(assign_tx));
@@ -1055,6 +1057,7 @@ fn spawn_worker(
     speed_limiter: SpeedLimiter,
     cookies: String,
     referrer: String,
+    extra_headers: std::collections::HashMap<String, String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Worker loop: keep accepting assignments until the channel closes.
@@ -1081,6 +1084,7 @@ fn spawn_worker(
                 &speed_limiter,
                 &cookies,
                 &referrer,
+                &extra_headers,
             )
             .await;
 
@@ -1138,6 +1142,7 @@ async fn do_segment_with_retry(
     speed_limiter: &SpeedLimiter,
     cookies: &str,
     referrer: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<i64, DownloadError> {
     let mut attempts = 0u32;
 
@@ -1160,6 +1165,7 @@ async fn do_segment_with_retry(
             speed_limiter,
             cookies,
             referrer,
+            extra_headers,
         )
         .await
         {
@@ -1216,6 +1222,7 @@ async fn do_segment(
     speed_limiter: &SpeedLimiter,
     cookies: &str,
     referrer: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
 ) -> Result<i64, DownloadError> {
     if actual_start > seg_end {
         // Already complete.
@@ -1230,6 +1237,7 @@ async fn do_segment(
     if !referrer.is_empty() {
         req = req.header(reqwest::header::REFERER, referrer);
     }
+    req = crate::downloader::apply_extra_headers(req, extra_headers);
     let resp = req.send().await?.error_for_status()?;
 
     // For segment 0, try extracting a better filename from the response.
