@@ -412,10 +412,12 @@ final _kSanitizeRules = <({RegExp pattern, String Function(Match m) replace})>[
 
   // 2. HTTP(S) URL 长 query string（>50 字符）→ ?[QUERY_REDACTED]
   //    覆盖：知网/百度网盘签名 URL、CDN 防盗链、私人 BT tracker passkey
+  //    使用非贪婪 + 向前看，不消耗 URL 后面的分隔符（逗号、括号等）
   (
     pattern: RegExp(
-      r'(https?://[^?\s]{3,})\?([^\s]{50,})',
+      r'(https?://[^?\s]{3,})\?([^\s]{50,}?)(?=[\s,)\]>]|$)',
       caseSensitive: false,
+      multiLine: true,
     ),
     replace: (m) => '${m[1]}?[QUERY_REDACTED]',
   ),
@@ -426,9 +428,14 @@ final _kSanitizeRules = <({RegExp pattern, String Function(Match m) replace})>[
     replace: (m) => '${m[1]}[REDACTED]',
   ),
 
-  // 4. Authorization 头值：Authorization: Bearer <token> → Authorization: Bearer [REDACTED]
+  // 4. Authorization 头值：Authorization: Bearer <token> → Authorization: [REDACTED]
+  //    覆盖：Bearer Token、Basic 认证、API Key 等两段式头值
+  //    (?:\S+\s+)? 可选匹配 scheme（如 "Bearer "），\S+ 匹配实际凭证
   (
-    pattern: RegExp(r'(authorization\b[^:]*:\s*)\S+', caseSensitive: false),
+    pattern: RegExp(
+      r'(authorization\b[^:]*:\s*)(?:\S+\s+)?\S+',
+      caseSensitive: false,
+    ),
     replace: (m) => '${m[1]}[REDACTED]',
   ),
 
@@ -437,7 +444,7 @@ final _kSanitizeRules = <({RegExp pattern, String Function(Match m) replace})>[
   //          actor 日志 `proxy config changed: proxy_password=xxx`
   (
     pattern: RegExp(
-      r'(proxy[_\s]?(?:password|username)\s*[=:]\s*)(\S+)',
+      r'(proxy[_\s]?(?:password|username)\s*[=:]\s*)\S+',
       caseSensitive: false,
     ),
     replace: (m) => '${m[1]}[REDACTED]',
