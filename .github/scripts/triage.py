@@ -9,7 +9,6 @@ import os
 import json
 import sys
 import urllib.request
-import urllib.error
 
 # ── Project 常量 ────────────────────────────────────────────────────────────
 PROJECT_ID = "PVT_kwHOCZ7LWM4BTV8N"
@@ -176,7 +175,7 @@ try:
         data=json.dumps(
             {
                 "model": "claude-haiku-4-5",
-                "max_tokens": 120,
+                "max_tokens": 200,
                 "messages": [{"role": "user", "content": prompt}],
             }
         ).encode(),
@@ -203,48 +202,57 @@ if result.get("priority") not in PRIORITY_IDS:
 if result.get("module") not in MODULE_IDS:
     result["module"] = "Flutter UI"
 
-# 防御：Claude 返回的 duplicate_of 必须在已知候选列表中
+# 防御：Claude 返回的 duplicate_of 必须是合法整数且在已知候选列表中
 dup_of_raw = result.get("duplicate_of")
-if dup_of_raw is not None and int(dup_of_raw) not in valid_numbers:
-    print("[warn] Claude returned unknown duplicate #" + str(dup_of_raw) + ", ignoring")
-    result["duplicate_of"] = None
+if dup_of_raw is not None:
+    try:
+        dup_of_int = int(dup_of_raw)
+        if dup_of_int not in valid_numbers:
+            print(
+                "[warn] Claude returned unknown duplicate #"
+                + str(dup_of_raw)
+                + ", ignoring"
+            )
+            result["duplicate_of"] = None
+        else:
+            result["duplicate_of"] = dup_of_int  # 统一为 int
+    except (ValueError, TypeError):
+        print(
+            "[warn] Claude returned non-integer duplicate_of: "
+            + repr(dup_of_raw)
+            + ", ignoring"
+        )
+        result["duplicate_of"] = None
 
 
 # ── 4a. 重复 issue 处理 ──────────────────────────────────────────────────────
-dup_of_raw = result.get("duplicate_of")
-if dup_of_raw is not None:
-    dup_num = int(dup_of_raw)
+dup_num = result.get("duplicate_of")  # 已经是 int 或 None
+if dup_num is not None:
     print("[triage] Duplicate of #" + str(dup_num))
+    issue_path = "/repos/" + repo + "/issues/" + str(issue_number)
 
-    # 加 duplicate 标签
-    gh_rest(
-        "POST",
-        "/repos/" + repo + "/issues/" + str(issue_number) + "/labels",
-        {"labels": ["duplicate"]},
-    )
+    try:
+        gh_rest("POST", issue_path + "/labels", {"labels": ["duplicate"]})
+    except Exception as e:
+        print("[warn] Failed to add duplicate label:", e)
 
-    # 自动评论
-    comment = (
-        "感谢您的反馈！\n\n"
-        "经自动检测，此问题与 #" + str(dup_num) + " 描述的内容高度相似，"
-        "已将本 issue 标记为重复并关闭。\n\n"
-        "请前往 #"
-        + str(dup_num)
-        + " 关注进展，也欢迎在原 issue 中补充更多细节 :pray:\n\n"
-        "> *此回复由自动分诊程序生成*"
-    )
-    gh_rest(
-        "POST",
-        "/repos/" + repo + "/issues/" + str(issue_number) + "/comments",
-        {"body": comment},
-    )
+    try:
+        comment = (
+            "感谢您的反馈！\n\n"
+            "经自动检测，此问题与 #" + str(dup_num) + " 描述的内容高度相似，"
+            "已将本 issue 标记为重复并关闭。\n\n"
+            "请前往 #" + str(dup_num) + " 关注进展，"
+            "也欢迎在原 issue 中补充更多细节 :pray:\n\n"
+            "> *此回复由自动分诊程序生成*"
+        )
+        gh_rest("POST", issue_path + "/comments", {"body": comment})
+    except Exception as e:
+        print("[warn] Failed to post duplicate comment:", e)
 
-    # 关闭 issue
-    gh_rest(
-        "PATCH",
-        "/repos/" + repo + "/issues/" + str(issue_number),
-        {"state": "closed", "state_reason": "not_planned"},
-    )
+    try:
+        gh_rest("PATCH", issue_path, {"state": "closed", "state_reason": "not_planned"})
+    except Exception as e:
+        print("[warn] Failed to close duplicate issue:", e)
 
     print("[triage] Done - marked duplicate of #" + str(dup_num))
     sys.exit(0)
