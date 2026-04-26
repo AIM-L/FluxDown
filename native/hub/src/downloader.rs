@@ -1705,7 +1705,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
         })
         .await;
 
-    let dest_path = save_dir.join(&actual_name);
+    let mut dest_path = save_dir.join(&actual_name);
     // Chrome-style: write to a temporary file during download, rename on success.
     let temp_path = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
 
@@ -1939,6 +1939,42 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
         }
     };
 
+    // If a better file name was discovered during download (e.g. the actual
+    // GET response carried a richer Content-Disposition than the initial probe
+    // hint), download_single / do_segment will have already written it to the
+    // DB via update_task_file_name.  Re-read it here and redirect dest_path so
+    // the final rename lands on the correct file name.
+    //
+    // Without this step the task's in-memory / Dart-side name (updated via
+    // ProgressUpdate) diverges from the on-disk file name, which stays at the
+    // original hint-based name forever.
+    {
+        let db_file_name =
+            p.db.load_task_by_id(&p.task_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.file_name)
+                .unwrap_or_default();
+
+        if !db_file_name.is_empty() && db_file_name != actual_name {
+            // Dedup in case the better name collides with an existing file that
+            // was created between probe and now.
+            let deduped = dedup_filename(&save_dir, &db_file_name).await;
+            if deduped != db_file_name {
+                // Dedup changed the name — keep DB and reality in sync.
+                let _ = p.db.update_task_file_name(&p.task_id, &deduped).await;
+            }
+            log_info!(
+                "[download] task {} better name applied: {} → {}",
+                p.task_id,
+                actual_name,
+                deduped
+            );
+            dest_path = save_dir.join(&deduped);
+        }
+    }
+
     // Checksum verification — runs after size integrity check, before rename.
     if !p.checksum.is_empty() {
         log_info!(
@@ -2108,6 +2144,9 @@ async fn download_single(
             "[download-single] got better name from response: {}",
             resp_name
         );
+        // Persist immediately so run_download_inner can redirect dest_path
+        // to this name before the final .fdownloading → real-name rename.
+        let _ = db.update_task_file_name(task_id, &resp_name).await;
         let _ = progress_tx
             .send(ProgressUpdate {
                 task_id: task_id.to_string(),

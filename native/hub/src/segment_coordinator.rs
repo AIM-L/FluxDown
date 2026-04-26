@@ -1932,6 +1932,9 @@ async fn do_segment(
                 resp_name,
                 cd
             );
+            // Persist immediately so run_download_inner can redirect dest_path
+            // to this name before the final .fdownloading → real-name rename.
+            let _ = db.update_task_file_name(task_id, &resp_name).await;
             let snapshot = seg_states.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let _ = progress_tx
                 .send(ProgressUpdate {
