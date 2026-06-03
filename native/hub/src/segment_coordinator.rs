@@ -501,18 +501,40 @@ pub async fn run_coordinated_download(
     }
 
     // Integrity check for resumed files: verify the file on disk is intact.
+    //
+    // 重要局限性（避免给维护者制造虚假安全感）：本检查只能基于**文件大小**判断，
+    // 而多段下载会在写入任何数据**之前**就把临时文件预分配到 effective_total_bytes
+    // （见下方第 2 步 fallocate/SetFileInformationByHandle）。因此正常续传时
+    // file_len 恒等于 effective_total_bytes，它**无法**反映“实际已写入内容量”，
+    // 也就**无法**检测以下内容空洞类损坏：
+    //   - 崩溃发生在 seek+write 与 update_segment_progress 之间（DB 记账领先磁盘）；
+    //   - 外部工具截断了内容但保留了 apparent size；
+    //   - 稀疏空洞被读为 0。
+    // 这类内容损坏只能由末尾的 seg_total 聚合检查（run_coordinated_download 第 8 步）
+    // 或可选的 checksum 兜底，size 检查对此形同虚设。
+    //
+    // 本检查能可靠捕获的，仅是**文件比上次预分配后更短**的情形：文件被外部删除
+    // （file_len==0）或被截断到 effective_total_bytes 以下。一旦续传时（db_downloaded>0）
+    // 文件存在，则上一会话必然已执行过预分配（预分配先于任何 worker 写入），
+    // 故 file_len 本应 >= effective_total_bytes；若更短即为外部损坏，重置是安全的，
+    // 且因合规续传文件恒 >= effective_total_bytes 而不会误伤。
     {
         let db_downloaded: i64 = segments.values().map(|s| s.downloaded_bytes).sum();
         let file_len = match tokio::fs::metadata(dest).await {
             Ok(m) => m.len() as i64,
             Err(_) => 0,
         };
-        if db_downloaded > 0 && (file_len == 0 || file_len < db_downloaded) {
+        // 与 effective_total_bytes 比较（而非更弱的 db_downloaded）：预分配后合规
+        // 续传文件长度恒 >= effective_total_bytes，低于即为外部截断/删除。
+        if db_downloaded > 0
+            && (file_len == 0 || file_len < db_downloaded || file_len < effective_total_bytes)
+        {
             log_info!(
-                "[coordinator] task {} file integrity mismatch: file_len={}, db_downloaded={}. Resetting.",
+                "[coordinator] task {} file integrity mismatch: file_len={}, db_downloaded={}, expected>={}. Resetting.",
                 task_id,
                 file_len,
-                db_downloaded
+                db_downloaded,
+                effective_total_bytes
             );
             for seg in segments.values_mut() {
                 seg.downloaded_bytes = 0;
@@ -1440,12 +1462,37 @@ fn build_seg_state_vec(segments: &BTreeMap<i32, LiveSegment>) -> Vec<SegmentProg
 }
 
 /// Overwrite the shared visualization state from the authoritative segment map.
+///
+/// `downloaded_bytes` is **exclusively owned by the worker** (see ownership
+/// contract on [`update_seg_state`]); the coordinator only owns `start_byte` /
+/// `end_byte` / `index`.  Naively replacing the whole vector from the
+/// coordinator's in-memory map would clobber `downloaded_bytes` with a value
+/// that may already be stale — between `sync_downloaded_from_shared` at the top
+/// of the Done handler and this call there is an `.await` (persist), during
+/// which other active workers keep advancing and writing larger
+/// `downloaded_bytes` into `seg_states`.  Writing the smaller stale value back
+/// would regress those segments' progress, briefly rewind the UI, and feed a
+/// stale split point into `try_split_largest`.
+///
+/// To honour the single-writer contract we preserve each *existing* segment's
+/// `downloaded_bytes` from the current shared state and only let
+/// newly-introduced segments (split children, absent from the snapshot) take
+/// their value from the map.
 fn rebuild_seg_states(
     segments: &BTreeMap<i32, LiveSegment>,
     seg_states: &Arc<StdMutex<Vec<SegmentProgressInfo>>>,
 ) {
-    let new_states = build_seg_state_vec(segments);
+    let mut new_states = build_seg_state_vec(segments);
     if let Ok(mut states) = seg_states.lock() {
+        // 快照现有各段 worker 维护的 downloaded_bytes（index → bytes）。
+        let existing: HashMap<i32, i64> =
+            states.iter().map(|s| (s.index, s.downloaded_bytes)).collect();
+        // 仅恢复快照中已存在的段；split 新生子段不在其中，保持来自 map 的值。
+        for s in &mut new_states {
+            if let Some(&dl) = existing.get(&s.index) {
+                s.downloaded_bytes = dl;
+            }
+        }
         *states = new_states;
     }
 }
@@ -1932,6 +1979,16 @@ async fn do_segment(
     // split that happened since our last chunk.
     let mut effective_end = seg_end;
 
+    // 标记我们是否真正抵达了段边界（写满了 [actual_start, effective_end]）。
+    // 只有在 `write_len == 0`（预算耗尽）或 `write_len < bytes.len()`（截断本块
+    // 命中边界）这两条 break 路径上才置为 true。若循环因 `None`（流被服务器
+    // 干净地提前关闭，常见于大文件尾部的 CDN 故障）退出而此标志仍为 false，
+    // 说明收到的字节少于请求的区间——必须返回 Err 触发 do_segment_with_retry
+    // 的指数退避重试，而非把截断段当作成功（否则会留下内容空洞，仅被末尾的
+    // 聚合检查 seg_total < effective_total_bytes 捕获，迫使整任务重启而非廉价
+    // 的单段重试）。
+    let mut boundary_reached = false;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -1975,6 +2032,7 @@ async fn do_segment(
 
                         if write_len == 0 {
                             // Reached the (possibly shrunk) boundary — stop.
+                            boundary_reached = true;
                             break;
                         }
 
@@ -2001,6 +2059,7 @@ async fn do_segment(
 
                         // If we truncated the chunk, we hit the boundary.
                         if write_len < bytes.len() {
+                            boundary_reached = true;
                             file.flush().await?;
                             let _ = db.update_segment_progress(
                                 task_id, seg_idx, seg_downloaded,
@@ -2052,6 +2111,39 @@ async fn do_segment(
     }
 
     file.flush().await?;
+
+    // --- Truncation / short-read detection ---------------------------------
+    // 若循环并非因抵达段边界而退出（boundary_reached == false），且未被取消，
+    // 则唯一的退出途径是 `None`（流被干净地提前关闭）。此时若仍未写满目标
+    // 区间，说明服务器在没有错误帧的情况下截断了响应体——这是大文件尾部
+    // 常见的 CDN 故障模式，会被 206 状态码与无错误的流结束所掩盖。
+    //
+    // 重新读取共享状态里可能已被 split 收窄的 end_byte：若 split 恰好把边界
+    // 收窄到我们停下的位置，本段实际已完成，不应误报截断。
+    if !boundary_reached && !cancel.is_cancelled() {
+        if let Ok(states) = seg_states.lock()
+            && let Some(s) = states.iter().find(|s| s.index == seg_idx)
+        {
+            effective_end = s.end_byte;
+        }
+        let next_pos = seg_start + seg_downloaded;
+        if next_pos <= effective_end {
+            // 已写到磁盘的部分进度已通过 update_seg_state / update_segment_progress
+            // 在循环内持久化（见 DB_SAVE_INTERVAL_SECS 分支）。这里仅补一次落库，
+            // 确保 do_segment_with_retry 以 seg_start + downloaded_bytes 续传本段，
+            // 而非从头重下，也不污染 total_downloaded 计数。
+            update_seg_state(seg_states, seg_idx, seg_downloaded);
+            let _ = db
+                .update_segment_progress(task_id, seg_idx, seg_downloaded)
+                .await;
+            return Err(DownloadError::Other(format!(
+                "segment {} truncated: received {} bytes, expected {} (server closed stream early)",
+                seg_idx,
+                next_pos - actual_start,
+                effective_end - actual_start + 1
+            )));
+        }
+    }
 
     // Linux: posix_fadvise(FADV_DONTNEED) 通知内核释放已完成段的页缓存，
     // 防止大文件下载过程中页缓存无限增长占满内存。
@@ -2118,12 +2210,13 @@ fn update_seg_state(
 mod tests {
     use super::{
         LiveSegment, MAX_SEGMENTS, MIN_SPLIT_BYTES, SegState, TAIL_MIN_SPLIT_BYTES, all_done,
-        dynamic_min_split_bytes, extract_host, find_next_pending_only, find_next_work,
-        is_single_conn_domain, record_single_conn_domain, single_conn_cache, try_proactive_split,
-        try_split_largest, validate_coverage,
+        build_seg_state_vec, dynamic_min_split_bytes, extract_host, find_next_pending_only,
+        find_next_work, is_single_conn_domain, rebuild_seg_states, record_single_conn_domain,
+        single_conn_cache, try_proactive_split, try_split_largest, validate_coverage,
     };
-    use crate::downloader::{DownloadError, is_server_rejection};
+    use crate::downloader::{DownloadError, SegmentProgressInfo, is_server_rejection};
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     fn make_seg(index: i32, start: i64, end: i64, downloaded: i64, state: SegState) -> LiveSegment {
         LiveSegment {
@@ -2133,6 +2226,83 @@ mod tests {
             downloaded_bytes: downloaded,
             state,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // rebuild_seg_states (F044: single-writer contract for downloaded_bytes)
+    // -----------------------------------------------------------------------
+
+    // rebuild_seg_states 必须保留 worker 在 seg_states 里维护的 downloaded_bytes，
+    // 而不是用 coordinator 内存映射里可能陈旧的值覆盖之。否则会回退活跃段进度、
+    // 让 UI 短暂倒退，并向 try_split_largest 喂入过期的 split point。
+    #[test]
+    fn rebuild_preserves_worker_downloaded_bytes() {
+        let mut segs = BTreeMap::new();
+        // coordinator 映射里的 downloaded_bytes 是陈旧的低值（100）。
+        segs.insert(0, make_seg(0, 0, 999, 100, SegState::Active));
+
+        // 共享状态里 worker 已推进到更高的值（700）。
+        let seg_states: Arc<StdMutex<Vec<SegmentProgressInfo>>> =
+            Arc::new(StdMutex::new(vec![SegmentProgressInfo {
+                index: 0,
+                start_byte: 0,
+                end_byte: 999,
+                downloaded_bytes: 700,
+            }]));
+
+        rebuild_seg_states(&segs, &seg_states);
+
+        let states = seg_states.lock().expect("lock not poisoned");
+        let s0 = states.iter().find(|s| s.index == 0).expect("seg 0 exists");
+        assert_eq!(
+            s0.downloaded_bytes, 700,
+            "rebuild 必须保留 worker 的较高进度，而非覆盖为 coordinator 的陈旧值"
+        );
+    }
+
+    // 新生 split 子段（不在旧 seg_states 快照里）应保留来自映射的 downloaded_bytes，
+    // 同时父段已存在的进度仍被保留。
+    #[test]
+    fn rebuild_keeps_new_split_child_and_preserves_parent() {
+        let mut segs = BTreeMap::new();
+        // 父段 0 被 split：end_byte 收窄到 499；映射里其 downloaded 为陈旧 100。
+        segs.insert(0, make_seg(0, 0, 499, 100, SegState::Active));
+        // split 出的新子段 1，downloaded_bytes 来自映射（0）。
+        segs.insert(1, make_seg(1, 500, 999, 0, SegState::Pending));
+
+        // 旧快照只有父段 0，且 worker 进度已到 300（高于映射）。
+        let seg_states: Arc<StdMutex<Vec<SegmentProgressInfo>>> =
+            Arc::new(StdMutex::new(vec![SegmentProgressInfo {
+                index: 0,
+                start_byte: 0,
+                end_byte: 999,
+                downloaded_bytes: 300,
+            }]));
+
+        rebuild_seg_states(&segs, &seg_states);
+
+        let states = seg_states.lock().expect("lock not poisoned");
+        let s0 = states.iter().find(|s| s.index == 0).expect("seg 0 exists");
+        let s1 = states.iter().find(|s| s.index == 1).expect("seg 1 exists");
+        // 父段保留 worker 进度（300），但 end_byte 取映射里收窄后的新值（499）。
+        assert_eq!(s0.downloaded_bytes, 300, "父段进度应被保留");
+        assert_eq!(s0.end_byte, 499, "父段 end_byte 应反映 split 收窄");
+        // 新子段不在旧快照里，downloaded_bytes 取映射值（0）。
+        assert_eq!(s1.downloaded_bytes, 0, "新 split 子段进度取映射值");
+        assert_eq!(s1.start_byte, 500);
+        assert_eq!(s1.end_byte, 999);
+    }
+
+    // build_seg_state_vec 自身仍按 map 原样构建（不涉及保留逻辑），作为基线对照。
+    #[test]
+    fn build_seg_state_vec_mirrors_map() {
+        let mut segs = BTreeMap::new();
+        segs.insert(0, make_seg(0, 0, 499, 250, SegState::Active));
+        segs.insert(1, make_seg(1, 500, 999, 0, SegState::Pending));
+        let v = build_seg_state_vec(&segs);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].downloaded_bytes, 250);
+        assert_eq!(v[1].downloaded_bytes, 0);
     }
 
     // -----------------------------------------------------------------------

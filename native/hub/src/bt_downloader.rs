@@ -106,22 +106,43 @@ impl TorrentSource {
 }
 
 /// Extract the `dn=` (display name) parameter from a magnet URI, if present.
+///
+/// The decoded value is sanitized via `crate::downloader::sanitize_filename`
+/// to strip path separators and other illegal characters (`/`, `\`, `:`, …),
+/// matching `meta_prober::extract_dn_from_magnet`.  Without this, an illegal
+/// `dn=` would flow into the DB display name and the metadata-failure fallback
+/// file name inconsistently with the queued-task path.  Returns `None` when the
+/// decoded value is empty (before sanitization), so callers fall back to a
+/// generated name instead of the literal `"download"` placeholder.
 fn magnet_display_name(url: &str) -> Option<String> {
     url.split('&')
         .find_map(|part| {
             let part = part.strip_prefix("magnet:?").unwrap_or(part);
             part.strip_prefix("dn=")
         })
-        .map(urlencoding_decode)
+        .and_then(|raw| {
+            let decoded = urlencoding_decode(raw);
+            if decoded.is_empty() {
+                None
+            } else {
+                Some(crate::downloader::sanitize_filename(&decoded))
+            }
+        })
 }
 
 /// Minimal percent-decoding for `dn=` values (UTF-8 safe).
 ///
-/// Collects percent-encoded bytes into a buffer and decodes them as UTF-8,
-/// correctly handling multi-byte characters (e.g. CJK, emoji).
+/// Collects **both** percent-encoded bytes (`%XX`) **and** literal bytes into a
+/// shared byte buffer, then decodes the buffer as UTF-8 (with GBK fallback).
+/// This correctly handles multi-byte characters (e.g. CJK, emoji) regardless of
+/// whether they arrive percent-encoded or as raw literal UTF-8 — many BT
+/// clients write the original UTF-8 directly into `dn=` (e.g. `dn=中文电影`).
+/// Decoding per-byte via `b as char` would treat each UTF-8 byte as a Latin-1
+/// code point and produce mojibake.
 ///
-/// Incomplete `%` sequences at the end of the input (e.g. `%`, `%A`) are
-/// treated as literal characters rather than silently padded with zeros.
+/// `+` decodes to a space (flushing the accumulated buffer first, since it is a
+/// genuine delimiter).  Incomplete or invalid `%` sequences are kept as literal
+/// bytes rather than silently padded with zeros.
 fn urlencoding_decode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut bytes_buf: Vec<u8> = Vec::new();
@@ -160,25 +181,33 @@ fn urlencoding_decode(input: &str) -> String {
                     bytes_buf.push(h << 4 | l);
                     i += 3;
                 } else {
-                    flush(&mut bytes_buf, &mut out);
-                    out.push('%');
+                    // Not a valid `%XX` escape — keep the `%` as a literal byte
+                    // (0x25, valid ASCII) in `bytes_buf` so it decodes together
+                    // with any surrounding literal multi-byte sequence.
+                    bytes_buf.push(b'%');
                     i += 1;
                 }
             }
             b'%' => {
-                // Incomplete `%` at end of string — emit as literal.
-                flush(&mut bytes_buf, &mut out);
-                out.push('%');
-                i += 1;
-                // Also emit any remaining characters after `%` literally.
+                // Incomplete `%` at end of string — treat the `%` and any
+                // trailing bytes as literal content.  We push them as raw
+                // bytes into `bytes_buf` (rather than `b as char`, which would
+                // mangle multi-byte UTF-8 by re-interpreting each byte as a
+                // Latin-1 code point) so the trailing sequence is decoded
+                // together with surrounding literal bytes by
+                // `decode_bytes_utf8_or_gbk`.  0x25 ('%') is valid ASCII and
+                // safely passes through UTF-8 decoding unchanged.
                 while i < len {
-                    out.push(bytes[i] as char);
+                    bytes_buf.push(bytes[i]);
                     i += 1;
                 }
             }
-            b => {
-                flush(&mut bytes_buf, &mut out);
-                out.push(b as char);
+            _ => {
+                // Literal byte — accumulate into `bytes_buf` so that literal
+                // multi-byte UTF-8 sequences (common in magnet `dn=` values,
+                // e.g. `dn=中文电影`) are decoded as a whole instead of
+                // per-byte via `b as char` (which produced mojibake).
+                bytes_buf.push(bytes[i]);
                 i += 1;
             }
         }
@@ -320,6 +349,20 @@ pub struct SharedBtSession {
     /// Maps librqbit torrent ID → our task_id.
     /// Used to detect when the same torrent is added by multiple tasks.
     torrent_ids: Mutex<HashMap<usize, String>>,
+    /// Serializes the completion-stage "dedup destination name + move from
+    /// staging" sequence across concurrent BT tasks.
+    ///
+    /// All BT downloads run on the shared multi-thread bt-runtime, so two
+    /// same-named torrents can finish and run `compute_completion_layout`
+    /// (which checks `save_dir/name` does not exist) and `move_path` (rename)
+    /// at the same instant.  Without serialization both pick the identical
+    /// deduped name and the second `std::fs::rename` silently overwrites the
+    /// first task's file (single file) or leaves a half-moved directory.
+    ///
+    /// Holding this lock across the brief dedup+move closes the TOCTOU window.
+    /// It is the BT analogue of the HTTP path's `reserved_temp_paths`.  The
+    /// lock is only contended in the rare simultaneous-completion case.
+    completion_move_lock: Mutex<()>,
 }
 
 impl SharedBtSession {
@@ -535,6 +578,7 @@ impl SharedBtSession {
             inflight_adds: AtomicUsize::new(0),
             file_selection_map: Mutex::new(HashMap::new()),
             torrent_ids: Mutex::new(HashMap::new()),
+            completion_move_lock: Mutex::new(()),
         })
     }
 
@@ -720,6 +764,16 @@ impl SharedBtSession {
         self.torrent_ids.lock().await.get(&torrent_id).cloned()
     }
 
+    /// Acquire the completion-move serialization lock.
+    ///
+    /// Callers hold the returned guard across the dedup-destination-name +
+    /// `move_path` sequence in the completion stage so that concurrent BT
+    /// task completions cannot race on the same `save_dir` destination name
+    /// (which would otherwise let one task's file silently overwrite another's).
+    pub async fn lock_completion_move(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.completion_move_lock.lock().await
+    }
+
     fn increment_inflight_add(&self) {
         self.inflight_adds.fetch_add(1, Ordering::Relaxed);
     }
@@ -880,30 +934,42 @@ pub async fn run_bt_download(params: BtDownloadParams) -> Result<(), DownloadErr
     // Clean up pre-created staging dir if it's empty or contains only
     // zero-byte files (librqbit may pre-allocate stubs before detecting
     // AlreadyManaged or before any real data is written).
+    //
+    // `run_bt_download` runs on the main `current_thread` runtime, so the
+    // synchronous `std::fs` scan (read_dir + metadata + remove_dir_all) must
+    // not run inline — on a large/slow staging dir it would block the event
+    // loop, stalling every other task's progress reporting and UI signalling.
+    // We move the blocking work into `spawn_blocking` and `.await` it.
     let cleanup_stage = || {
         let stage = bt_stage_dir(&save_dir_for_cleanup, &tid_for_cleanup);
-        if !stage.exists() {
-            return;
-        }
-        let has_real_data = std::fs::read_dir(&stage)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
+        let tid = tid_for_cleanup.clone();
+        async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                if !stage.exists() {
+                    return;
+                }
+                let has_real_data = std::fs::read_dir(&stage)
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
+                    })
+                    .unwrap_or(false);
+                if !has_real_data {
+                    log_info!(
+                        "[BT] task={} cleaning up empty staging dir after error/cancel",
+                        short_id(&tid)
+                    );
+                    let _ = std::fs::remove_dir_all(&stage);
+                }
             })
-            .unwrap_or(false);
-        if !has_real_data {
-            log_info!(
-                "[BT] task={} cleaning up empty staging dir after error/cancel",
-                short_id(&tid_for_cleanup)
-            );
-            let _ = std::fs::remove_dir_all(&stage);
+            .await;
         }
     };
 
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
-            cleanup_stage();
+            cleanup_stage().await;
             Err(e)
         }
         // JoinError has two causes:
@@ -913,7 +979,7 @@ pub async fn run_bt_download(params: BtDownloadParams) -> Result<(), DownloadErr
         //      In that case cancelled is already true, so treat it as Cancelled to
         //      prevent the task from being marked as failed/error in the DB.
         Err(join_err) => {
-            cleanup_stage();
+            cleanup_stage().await;
             if cancelled.load(Ordering::SeqCst) {
                 log_info!(
                     "[BT] task={} JoinError while cancelled (runtime shutdown during pause) — treating as Cancelled",
@@ -1133,6 +1199,7 @@ pub fn rescue_stranded_staging_files(
         );
 
         let mut first_moved_name: Option<String> = None;
+        let mut all_moves_ok = true;
         for entry in &entries {
             let child_name = entry.file_name();
             let child_name_str = child_name.to_string_lossy();
@@ -1152,6 +1219,7 @@ pub fn rescue_stranded_staging_files(
                     }
                 }
                 Err(e) => {
+                    all_moves_ok = false;
                     log_info!(
                         "[BT] rescue: task={} failed to move child '{}': {}",
                         &task_id[..task_id.len().min(8)],
@@ -1162,9 +1230,19 @@ pub fn rescue_stranded_staging_files(
             }
         }
 
-        // Remove staging dir regardless — any failed children are lost;
-        // the user can re-download if needed.
-        let _ = std::fs::remove_dir_all(&stage_dir);
+        // 仅当所有子项都成功迁出才删除 staging 目录；否则保留,避免把迁移
+        // 失败(权限/跨盘/瞬时 I/O)的文件随目录一并删掉造成数据丢失——与
+        // fast path 及 bt_download_inner 的完成路径行为对齐,留待下次启动重试。
+        if all_moves_ok {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+        } else {
+            log_info!(
+                "[BT] rescue: task={} some children failed to move; \
+                 keeping staging dir for recovery: {}",
+                &task_id[..task_id.len().min(8)],
+                stage_dir.display()
+            );
+        }
 
         if let Some(name) = first_moved_name {
             updates.push((task_id.to_string(), name));
@@ -1316,9 +1394,46 @@ fn compute_completion_layout(
         } else {
             basename.as_str()
         };
+        // First dedup against the on-disk contents of save_dir.
         let mut candidate = dedup_name_in_dir(save_dir, candidate_seed);
-        while taken.contains(&candidate) {
-            candidate = dedup_name_in_dir(save_dir, &format!("_{candidate}"));
+        // Then dedup against names already chosen in *this* batch.  Use a plain
+        // numeric counter on the seed's stem/ext (`stem (n).ext`) rather than
+        // prepending `_` to the whole candidate, which previously stacked
+        // underscores (`_file (1).ext`, `__file (1).ext`, …) and corrupted the
+        // base name.  This keeps the same `name (n).ext` style as
+        // `dedup_name_in_dir` itself.
+        if taken.contains(&candidate) {
+            let stem = Path::new(candidate_seed)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(candidate_seed);
+            let ext = Path::new(candidate_seed)
+                .extension()
+                .and_then(|s| s.to_str());
+            // 1..=9999 mirrors the bound in `dedup_name_in_dir`, preventing an
+            // unbounded loop in the pathological all-collisions case.
+            for n in 1..=9999u32 {
+                let numbered = match ext {
+                    Some(e) => format!("{} ({}).{}", stem, n, e),
+                    None => format!("{} ({})", stem, n),
+                };
+                // Reconcile against disk again so we never overwrite a real file.
+                let deduped = dedup_name_in_dir(save_dir, &numbered);
+                if !taken.contains(&deduped) {
+                    candidate = deduped;
+                    break;
+                }
+            }
+            // 极端兜底:9999 个编号变体都被占用(需约 1 万个同 basename 文件挤入同一
+            // 扁平目录)时,candidate 仍为已占用名,会导致 moves 出现重复目标 → 落盘时
+            // 静默覆盖丢数据。此处用 UUID 后缀保证唯一,杜绝覆盖。
+            if taken.contains(&candidate) {
+                let uniq = uuid::Uuid::new_v4();
+                candidate = match ext {
+                    Some(e) => format!("{} ({}).{}", stem, uniq, e),
+                    None => format!("{} ({})", stem, uniq),
+                };
+            }
         }
         taken.insert(candidate.clone());
         let src = stage_dir.join(rel);
@@ -1421,13 +1536,29 @@ fn build_multi_file_segments(
             continue;
         }
         let start = offset as i64;
+        // Partial-selection guard: with a subset `total_bytes` but the full
+        // torrent's `file_offsets`, an unselected file's `offset` can exceed
+        // `total_bytes`.  Such a file would yield `start > end` and a negative
+        // `downloaded_bytes`, producing an illegal SegmentProgressInfo for
+        // Dart.  Skip any file whose start lies beyond the (subset) total.
+        if start >= total_bytes {
+            continue;
+        }
         let end = (offset + file_len).saturating_sub(1) as i64;
         let end = end.min(total_bytes - 1);
+        // Defensive: `end < start` should be impossible after the guard above,
+        // but skip rather than emit a reversed range if it ever occurs.
+        if end < start {
+            continue;
+        }
+        let span = end - start + 1;
         segs.push(SegmentProgressInfo {
             index: i as i32,
             start_byte: start,
             end_byte: end,
-            downloaded_bytes: (dl_bytes as i64).min(end - start + 1),
+            // Clamp into `[0, span]` so a subset/total mismatch can never yield
+            // a negative downloaded count.
+            downloaded_bytes: (dl_bytes as i64).clamp(0, span),
         });
     }
     segs
@@ -1715,23 +1846,92 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             // Err(Cancelled)), apply the pending delete now that we have the
             // torrent ID.  This prevents orphaned files from magnets whose
             // DHT metadata resolved after the user deleted the task.
+            //
+            // TOCTOU note: `bt_download_inner`'s main loop stores the handle in
+            // `handles` only on the success path; on a cancel it returns early
+            // *before* `store_handle`.  Meanwhile `delete_task` (download_manager)
+            // removes-from-`handles` (a miss, since not yet stored) and then
+            // `register_pending_delete`.  If this detached task only checked
+            // `take_pending_delete` once and that check raced *ahead* of the
+            // `register_pending_delete`, the pending entry would never be
+            // consumed and the torrent would leak in the librqbit session.
+            //
+            // To close the window we register the handle here and re-check the
+            // pending-delete map afterwards (double-checked consumption):
+            //   1. take_pending_delete → if set, delete now (no need to store).
+            //   2. else store_handle, then take_pending_delete *again*; if a
+            //      delete arrived in between, delete now and drop the handle.
+            // Because `delete_task` writes the pending entry *after* its
+            // handles-miss, at least one of the two checks (or `delete_task`'s
+            // own handle lookup, once stored) always observes the delete.
             if let Ok(ref resp) = result {
-                let torrent_id = match resp {
-                    AddTorrentResponse::Added(id, _)
-                    | AddTorrentResponse::AlreadyManaged(id, _) => Some(*id),
-                    _ => None,
-                };
-                if let Some(id) = torrent_id
-                    && let Some(del_files) = shared_bt_for_add
-                        .take_pending_delete(&task_id_for_add)
-                        .await
-                {
-                    let _ = session_for_add.delete(id.into(), del_files).await;
-                    log_info!(
-                        "[BT] task={} pending delete applied after add_torrent (delete_files={})",
-                        short_id(&task_id_for_add),
-                        del_files
-                    );
+                match resp {
+                    AddTorrentResponse::Added(id, handle) => {
+                        let id = *id;
+                        let handle = handle.clone();
+                        if let Some(del_files) =
+                            shared_bt_for_add.take_pending_delete(&task_id_for_add).await
+                        {
+                            // Delete was requested before we got here.
+                            let _ = session_for_add.delete(id.into(), del_files).await;
+                            log_info!(
+                                "[BT] task={} pending delete applied after add_torrent (delete_files={})",
+                                short_id(&task_id_for_add),
+                                del_files
+                            );
+                        } else {
+                            // No delete yet — publish the handle so pause/resume/
+                            // delete can find it, then re-check for a delete that
+                            // may have raced in just after our first check.  We
+                            // also register the torrent_id so `delete_task` can
+                            // clean up the mapping.
+                            shared_bt_for_add.register_torrent_id(id, &task_id_for_add).await;
+                            shared_bt_for_add
+                                .store_handle(&task_id_for_add, handle)
+                                .await;
+                            if let Some(del_files) =
+                                shared_bt_for_add.take_pending_delete(&task_id_for_add).await
+                            {
+                                // A delete arrived between the two checks; consume
+                                // it and remove the handle we just stored
+                                // (delete_task also unregisters the torrent_id).
+                                let _ = shared_bt_for_add
+                                    .delete_task(&task_id_for_add, del_files)
+                                    .await;
+                                log_info!(
+                                    "[BT] task={} pending delete applied on re-check after store_handle (delete_files={})",
+                                    short_id(&task_id_for_add),
+                                    del_files
+                                );
+                            }
+                        }
+                    }
+                    AddTorrentResponse::AlreadyManaged(id, _handle) => {
+                        // The torrent is owned by another task.  We must NOT
+                        // store its handle under our task_id, nor unconditionally
+                        // delete it (that would clobber the real owner).  Only
+                        // consume a pending delete if this very task owns the
+                        // torrent_id mapping — otherwise leave it to the owner.
+                        if let Some(del_files) =
+                            shared_bt_for_add.take_pending_delete(&task_id_for_add).await
+                        {
+                            let owner = shared_bt_for_add.task_for_torrent(*id).await;
+                            if owner.as_deref() == Some(task_id_for_add.as_str()) {
+                                let _ = session_for_add.delete((*id).into(), del_files).await;
+                                log_info!(
+                                    "[BT] task={} pending delete applied (already-managed, owned by us, delete_files={})",
+                                    short_id(&task_id_for_add),
+                                    del_files
+                                );
+                            } else {
+                                log_info!(
+                                    "[BT] task={} pending delete skipped — torrent owned by another task",
+                                    short_id(&task_id_for_add)
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             result
@@ -2114,7 +2314,10 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
     let total_bytes = {
         let selected_total: i64 = handle
             .with_metadata(|meta| {
-                selected_indices
+                // 用 true_selection(从 DB 载入的真实选择)而非 selected_indices
+                // (Path R 同会话续传时被置为全量占位 0..file_count),否则部分选择
+                // 续传会把 total_bytes 误算成所有文件之和,导致进度百分比与 DB 元数据错误。
+                true_selection
                     .iter()
                     .filter_map(|&i| meta.file_infos.get(i as usize))
                     .map(|fi| fi.len as i64)
@@ -2298,6 +2501,13 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 // correct; just return resolved_name for the signal.
                 (resolved_name.clone(), true)
             } else {
+                // Serialize the dedup-name + move sequence against other BT
+                // task completions sharing this session's save_dir.  Without
+                // this, two same-named torrents finishing simultaneously would
+                // both dedup to the same name and the second rename would
+                // overwrite the first task's file (see F050).  The guard is
+                // held until the end of this block, covering the whole move loop.
+                let _move_guard = shared_bt.lock_completion_move().await;
                 let layout = compute_completion_layout(
                     &save_path,
                     &stage_dir,
@@ -2645,6 +2855,145 @@ pub fn probe_torrent_meta(probe_id: String, torrent_bytes: Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::compute_bt_display_progress;
+
+    // -------------------------------------------------------------------------
+    // urlencoding_decode — literal multi-byte UTF-8 must not be mangled (F052).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn urlencoding_decode_literal_utf8_not_mangled() {
+        // Raw (unencoded) UTF-8 in dn= is common; it must round-trip intact
+        // rather than being decoded per-byte as Latin-1.
+        assert_eq!(super::urlencoding_decode("中文电影"), "中文电影");
+    }
+
+    #[test]
+    fn urlencoding_decode_percent_encoded_utf8() {
+        // "中" = E4 B8 AD percent-encoded.
+        assert_eq!(super::urlencoding_decode("%E4%B8%AD"), "中");
+    }
+
+    #[test]
+    fn urlencoding_decode_mixed_literal_and_encoded() {
+        // Literal "中" followed by percent-encoded "文".
+        assert_eq!(super::urlencoding_decode("中%E6%96%87"), "中文");
+    }
+
+    #[test]
+    fn urlencoding_decode_plus_is_space() {
+        assert_eq!(super::urlencoding_decode("a+b"), "a b");
+    }
+
+    #[test]
+    fn urlencoding_decode_incomplete_percent_tail_keeps_literal() {
+        // A trailing incomplete `%` followed by literal multi-byte must not
+        // panic and must not mangle the literal sequence.
+        assert_eq!(super::urlencoding_decode("ab%中"), "ab%中");
+    }
+
+    #[test]
+    fn urlencoding_decode_invalid_hex_keeps_percent() {
+        // `%zz` is not a valid escape — `%` is preserved as a literal.
+        assert_eq!(super::urlencoding_decode("%zz"), "%zz");
+    }
+
+    // -------------------------------------------------------------------------
+    // magnet_display_name — decode + sanitize, None on empty (F049).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn magnet_display_name_sanitizes_illegal_chars() {
+        // `/` in the decoded dn must be sanitized to `_`, matching meta_prober.
+        let name = super::magnet_display_name("magnet:?xt=urn:btih:abc&dn=a%2Fb");
+        assert_eq!(name.as_deref(), Some("a_b"));
+    }
+
+    #[test]
+    fn magnet_display_name_literal_utf8() {
+        let name = super::magnet_display_name("magnet:?xt=urn:btih:abc&dn=中文电影");
+        assert_eq!(name.as_deref(), Some("中文电影"));
+    }
+
+    #[test]
+    fn magnet_display_name_none_when_no_dn() {
+        assert!(super::magnet_display_name("magnet:?xt=urn:btih:abc").is_none());
+    }
+
+    #[test]
+    fn magnet_display_name_none_when_dn_empty() {
+        // Empty dn value decodes to empty → None (caller falls back to a
+        // generated name rather than the "download" placeholder).
+        assert!(super::magnet_display_name("magnet:?xt=urn:btih:abc&dn=").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // build_multi_file_segments — subset total with full offsets (F055).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn multi_file_segments_skip_out_of_range_and_no_negative() {
+        // Subset selection: total_bytes covers only the first file (100), but
+        // file_offsets/file_progress carry the full torrent (3 files).  The
+        // second/third files start at offset >= total and must be skipped; no
+        // segment may carry a negative downloaded_bytes.
+        let total_bytes = 100i64;
+        let file_progress = [50u64, 0u64, 0u64];
+        // file 0: [0,100), file 1: [100,300), file 2: [300,400)
+        let file_offsets = [(0u64, 100u64), (100u64, 200u64), (300u64, 100u64)];
+        let segs = super::build_multi_file_segments(total_bytes, &file_progress, &file_offsets);
+        // Only the in-range file 0 survives.
+        assert_eq!(segs.len(), 1);
+        let s = &segs[0];
+        assert_eq!(s.start_byte, 0);
+        assert_eq!(s.end_byte, 99);
+        assert_eq!(s.downloaded_bytes, 50);
+        for s in &segs {
+            assert!(s.downloaded_bytes >= 0, "downloaded_bytes must be non-negative");
+            assert!(s.end_byte >= s.start_byte, "end must not precede start");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // compute_completion_layout — dedup must not stack underscores (F038).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn completion_layout_dedup_uses_numeric_suffix() {
+        use std::path::PathBuf;
+        // Two selected files with the same basename in different sub-dirs:
+        // their flat destinations collide and must be deduped as
+        // "file.txt" + "file (1).txt", not "_file.txt".
+        let tmp = std::env::temp_dir().join(format!(
+            "fluxdown_bt_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let stage = tmp.join(".stage");
+        let _ = std::fs::create_dir_all(&stage);
+
+        let selected = vec![
+            PathBuf::from("dirA/file.txt"),
+            PathBuf::from("dirB/file.txt"),
+        ];
+        let layout = super::compute_completion_layout(&tmp, &stage, &selected, false, "");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // Avoid `.unwrap()`/`.expect()` (denied by clippy) — match explicitly.
+        let moves = match layout {
+            Some((moves, _top)) => moves,
+            None => panic!("layout should be Some"),
+        };
+        assert_eq!(moves.len(), 2);
+        let dst0 = moves[0].1.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let dst1 = moves[1].1.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert_eq!(dst0, "file.txt");
+        assert_eq!(dst1, "file (1).txt");
+        // No underscore-prefixed name should ever be produced.
+        assert!(!dst1.starts_with('_'), "must not stack underscore prefixes");
+    }
 
     #[test]
     fn display_progress_does_not_reach_total_before_finished() {

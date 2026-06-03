@@ -99,16 +99,32 @@ pub fn parse_ftp_url(url: &str) -> Result<FtpUrl, DownloadError> {
     })
 }
 
+/// 将单个十六进制字符（ASCII）转换为 0..=15 的 nibble 值。
+///
+/// 仅接受 `0-9` / `a-f` / `A-F`；其它字节返回 `None`。按字节解析可避免对
+/// `&str` 做切片，从而消除 `%` 后紧跟多字节 UTF-8 字符时的 char-boundary panic。
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn url_decode(s: &str) -> String {
     let mut result = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // 命中 `%` 且后面还有两个字节时，按字节解析两位十六进制。
+        // 不再用 `&s[i+1..i+3]` 切片，避免切点落在多字节 UTF-8 字符内部时 panic。
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let Some(hi) = hex_nibble(bytes[i + 1])
+            && let Some(lo) = hex_nibble(bytes[i + 2])
         {
-            result.push(byte);
+            result.push((hi << 4) | lo);
             i += 3;
             continue;
         }
@@ -175,14 +191,25 @@ fn ftp_connect_sync_with_proxy(
         // Set passive_stream_builder so data connections also go through the proxy.
         // In passive mode, the FTP server tells us the data endpoint address.
         // We need to connect to that address through the proxy too.
+        //
+        // NAT 容忍：很多 NAT 后的 FTP 服务器在 PASV/EPSV 227 响应里报告的是
+        // 私网/不可路由 IP（如 192.168.x.x）。标准客户端的做法是忽略 PASV 报告
+        // 的 IP，复用控制连接的主机名，只采用 PASV 报告的端口。经代理隧道时若
+        // 直接连服务器自报的 IP，代理往往无法到达，导致数据连接失败。这里改为
+        // 复用控制主机 + PASV 端口，对齐标准 NAT 容忍行为。
         let proxy_clone = proxy.clone();
+        let control_host = ftp_url.host.clone();
         ftp = ftp.passive_stream_builder(move |data_addr: std::net::SocketAddr| {
-            let host = data_addr.ip().to_string();
             let port = data_addr.port();
-            proxy_config::proxy_connect_sync(&proxy_clone, &host, port, Duration::from_secs(30))
-                .map_err(|e| {
-                    suppaftp::FtpError::ConnectionError(std::io::Error::other(e.to_string()))
-                })
+            proxy_config::proxy_connect_sync(
+                &proxy_clone,
+                &control_host,
+                port,
+                Duration::from_secs(30),
+            )
+            .map_err(|e| {
+                suppaftp::FtpError::ConnectionError(std::io::Error::other(e.to_string()))
+            })
         });
 
         ftp
@@ -198,8 +225,14 @@ fn ftp_connect_sync_with_proxy(
                 .ok_or_else(|| DownloadError::Other("DNS returned no addresses".to_string()))
         })?;
 
-        FtpStream::connect_timeout(sock_addr, timeout)
-            .map_err(|e| DownloadError::Other(format!("FTP connect error: {}", e)))?
+        let mut ftp = FtpStream::connect_timeout(sock_addr, timeout)
+            .map_err(|e| DownloadError::Other(format!("FTP connect error: {}", e)))?;
+        // NAT 容忍：很多 NAT 后的 FTP 服务器在 PASV 227 响应里报告私网/不可路由
+        // IP（如 192.168.x.x）。开启该开关后 suppaftp 忽略 PASV 自报 IP，复用控制
+        // 连接的主机 + PASV 端口建立数据连接，对齐标准客户端行为（代理路径已在
+        // 上面的 passive_stream_builder 中做了等价处理；此处覆盖直连路径）。
+        ftp.set_passive_nat_workaround(true);
+        ftp
     };
 
     stream
@@ -398,6 +431,108 @@ pub async fn probe_ftp_bandwidth(
 
     cancel_watcher.abort();
     result
+}
+
+// ---------------------------------------------------------------------------
+// REST honouring verification (guards multi-segment correctness)
+// ---------------------------------------------------------------------------
+
+/// 多段下载前对服务器是否真正执行 REST 偏移做一次内容无关的探测。
+///
+/// 背景：HTTP 多段路径通过 `206 Partial Content` 显式校验 Range 是否被执行；
+/// FTP 没有等价机制——`ftp_do_segment` 先 `resume_transfer(actual_start)`（发
+/// REST）再 `retr_as_stream`，然后把从数据流读到的字节写到文件偏移
+/// `actual_start`。若服务器对 REST 返回 350 却仍从文件头开始发送数据（部分老旧
+/// /代理 FTP 服务器行为），每个段都会把“文件头部内容”写到各自的目标偏移，导致
+/// 最终文件字节数正确但内容整体错位的静默数据损坏。
+///
+/// 探测原理（无需任何文件内容知识）：REST 到 `total_bytes - 1`，RETR：
+/// - 合规服务器：该范围恰好 1 字节，读到 1 字节后即 EOF。
+/// - 忽略 REST 的服务器：从字节 0 开始发送整文件，会在 1 字节之后继续送达。
+///
+/// 因此只要读到的字节数 > 1，即可断定 REST 被忽略 → 返回 `Some(false)`，调用方
+/// 应降级为单流（单流起始全新下载不依赖 REST 写偏移）。读到 ≤1 字节即 EOF 视为
+/// REST 被执行，返回 `Some(true)`。
+///
+/// 为避免对合规服务器的误降级（rule: 不得误降级合规服务器多段下载），任何探测
+/// 过程中的网络/协议错误（连接失败、REST 返回非 350、RETR 失败、读超时等）一律
+/// 视为“不确定”，返回 `None`，调用方应信任 REST 并继续多段——错误更可能是瞬时
+/// 故障而非 REST 失效，不能据此剥夺合规服务器的多段能力。
+fn verify_ftp_rest_honoured_sync(
+    ftp_url: &FtpUrl,
+    proxy: Option<&ProxyConfig>,
+    total_bytes: i64,
+) -> Option<bool> {
+    // 仅对可定位、且至少 2 字节的文件有意义（多段门槛 >1MB，必然满足）。
+    if total_bytes < 2 {
+        return None;
+    }
+    let probe_offset = (total_bytes - 1) as usize;
+
+    let mut ftp = ftp_connect_sync_with_proxy(ftp_url, proxy).ok()?;
+
+    if ftp.resume_transfer(probe_offset).is_err() {
+        // 服务器对 REST 直接报错：不确定（可能是瞬时故障，也可能真的不支持 REST，
+        // 但此处不据此降级，交由实际下载阶段的重试/完整性核对兜底）。
+        let _ = ftp.quit();
+        return None;
+    }
+
+    let mut data_stream = match ftp.retr_as_stream(&ftp_url.path) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = ftp.quit();
+            return None;
+        }
+    };
+
+    data_stream
+        .get_ref()
+        .set_read_timeout(Some(FTP_DATA_READ_TIMEOUT))
+        .ok();
+
+    // 读取至多 2 字节即可判别：合规服务器只会送 1 字节。
+    let mut buf = [0u8; 2];
+    let mut got: usize = 0;
+    let honoured = loop {
+        match data_stream.read(&mut buf[got..]) {
+            Ok(0) => break got <= 1, // EOF：≤1 字节 → REST 被执行
+            Ok(n) => {
+                got += n;
+                if got > 1 {
+                    break false; // 1 字节之后仍有数据 → REST 被忽略
+                }
+            }
+            // 读错误（含超时）：不确定，不降级。
+            Err(_) => {
+                drop(data_stream);
+                let _ = ftp.quit();
+                return None;
+            }
+        }
+    };
+
+    // 提前中止传输：直接关闭数据连接，不调用 finalize_retr_stream（会阻塞等 226）。
+    drop(data_stream);
+    let _ = ftp.quit();
+    Some(honoured)
+}
+
+/// 异步包装：在 blocking 线程内执行 REST 探测，避免阻塞单线程 runtime。
+async fn verify_ftp_rest_honoured(
+    ftp_url: &FtpUrl,
+    proxy: &ProxyConfig,
+    total_bytes: i64,
+) -> Option<bool> {
+    let fu = ftp_url.clone();
+    let px = proxy.clone();
+    tokio::task::spawn_blocking(move || {
+        let proxy_opt = if px.is_active() { Some(&px) } else { None };
+        verify_ftp_rest_honoured_sync(&fu, proxy_opt, total_bytes)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +740,42 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         p.segment_count
     };
 
-    let use_segments = info.supports_range && info.total_bytes > 1_048_576 && segments > 1;
+    let mut use_segments = info.supports_range && info.total_bytes > 1_048_576 && segments > 1;
+
+    // F022 防护：多段下载把每段数据写到各自的文件偏移，完全依赖服务器正确执行
+    // REST 偏移。若服务器对 REST 返回 350 却仍从字节 0 发送，多段会产生“字节数
+    // 正确但内容整体错位”的静默损坏（最终 DB 求和与磁盘大小核对都无法发现）。
+    // 因此在启用多段前先做一次内容无关的 REST 探测；仅当探测明确判定 REST 被
+    // 忽略（Some(false)）时降级为单流。探测出错/不确定（None）不降级，避免误伤
+    // 合规服务器。
+    if use_segments {
+        match verify_ftp_rest_honoured(&parse_ftp_url(&p.url)?, &p.proxy_config, info.total_bytes)
+            .await
+        {
+            Some(false) => {
+                log_info!(
+                    "[ftp-download] task {} server ignores REST offset; \
+                     falling back to single-stream to avoid content misplacement",
+                    p.task_id
+                );
+                use_segments = false;
+                // 降级单流时清除可能残留的旧多段记录,维持"不使用分段则 DB 无段行"
+                // 的不变式;否则下次续传 load_segments 命中残留行会误入多段,而这些段
+                // 的内容实际由单流写入,造成内容空洞(与 HTTP RangeNotSupported 回退一致)。
+                let _ = p.db.delete_segments(&p.task_id).await;
+            }
+            Some(true) => {
+                log_info!("[ftp-download] task {} REST offset verified", p.task_id);
+            }
+            None => {
+                log_info!(
+                    "[ftp-download] task {} REST verification inconclusive; \
+                     proceeding with multi-segment",
+                    p.task_id
+                );
+            }
+        }
+    }
 
     log_info!(
         "[ftp-download] task {} mode={}, segments={}",
@@ -689,8 +859,13 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                     seg_total, info.total_bytes
                 )));
             }
-            // Also verify actual file size on disk (guards against DB/disk mismatch
-            // caused by crashes or external file modifications).
+            // 磁盘大小核对：注意多段路径在下载前已用 set_len(total_bytes) 预分配
+            // （见 ftp_download_multi_segment 的预分配块），因此正常情况下
+            // file_len 恒等于 total_bytes，此处的 `file_len < total_bytes` 仅能
+            // 捕获“临时文件被外部删除/截断”这类极端情形，**无法**检测预分配区域
+            // 内的内容空洞（稀疏空洞读为 0 但 len 不变）。真正的内容完整性依赖上面
+            // 的 DB 求和核对，以及多段启用前的 REST 偏移探测（verify_ftp_rest_*）。
+            // 此处保留为对“文件被外部删除/截断”的最后一道防线。
             let file_len = tokio::fs::metadata(&temp_path)
                 .await
                 .map(|m| m.len() as i64)
@@ -703,11 +878,26 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             }
         } else {
             let meta = tokio::fs::metadata(&temp_path).await?;
-            if (meta.len() as i64) != info.total_bytes {
+            let disk_len = meta.len() as i64;
+            if disk_len != info.total_bytes {
+                // 文件比期望更大：几乎必然是服务器接受 REST(350) 却从字节 0 开始
+                // 发送（REST 被忽略），导致整文件被追加到旧分片之后。保留这种
+                // oversized 临时文件毫无意义——下次续传会从更大的 existing_len
+                // 继续，陷入永久失败且每次浪费整文件流量。这里主动删除损坏文件，
+                // 让下次重试从零开始。
+                if disk_len > info.total_bytes {
+                    log_info!(
+                        "[ftp-download] task {} temp file oversized ({} > {} bytes), \
+                         REST may have been ignored by server; removing corrupted temp file",
+                        p.task_id,
+                        disk_len,
+                        info.total_bytes
+                    );
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                }
                 return Err(DownloadError::Other(format!(
                     "FTP size mismatch: expected {} bytes, got {} bytes",
-                    info.total_bytes,
-                    meta.len()
+                    info.total_bytes, disk_len
                 )));
             }
         }
@@ -791,6 +981,9 @@ async fn ftp_download_single(
 
     // Reset DB progress if starting fresh
     if !resume {
+        // 单流新起时一并清除可能残留的多段记录(上次多段失败/降级遗留),保证
+        // "不使用分段则 DB 无段行"不变式,防止后续续传被 load_segments 误判为多段。
+        let _ = db.delete_segments(task_id).await;
         let _ = db.update_task_progress(task_id, 0).await;
     }
 
@@ -922,9 +1115,14 @@ async fn ftp_download_single(
         tokio::select! {
             _ = cancel_token.cancelled() => {
                 cancelled_writer.store(true, Ordering::SeqCst);
-                file.flush().await?;
+                // flush 用 best-effort: 即便失败也要继续落库进度并清理 reader,否则 ?
+                // 会以 Io 错误绕过这些清理,且重试包装器会因非 Cancelled 而错误重试。
+                let _ = file.flush().await;
                 let _ = db.update_task_progress(&task_id, downloaded).await;
                 cancel_watcher.abort();
+                // close() 唤醒可能因 channel 满而阻塞在 blocking_send 的 reader,
+                // 避免下面 ftp_reader.await 死锁(与写错误分支一致)。
+                chunk_rx.close();
                 // Wait for blocking thread to finish
                 let _ = ftp_reader.await;
                 return Err(DownloadError::Cancelled);
@@ -1019,6 +1217,14 @@ async fn ftp_download_multi_segment(
             Err(_) => 0,
         };
 
+        // 注意（best-effort）：本检查只能检测“临时文件被删除/整体截断”
+        // （file_len==0 或明显小于 DB 记账量）。由于本函数随后会用
+        // set_len(total_bytes) 稀疏预分配，多段乱序写入下 file_len 反映的是
+        // “最高已写偏移”而非“实际已写内容总量”——即使中间段全是空洞（读为 0），
+        // 只要末段写过一点 file_len 就会接近 total_bytes，使
+        // `file_len < db_downloaded` 多为假，**无法**检测中间内容空洞。真正的
+        // 内容正确性依赖多段启用前的 REST 偏移探测（verify_ftp_rest_*）与每段
+        // 短读校验，不能依赖此处的 file_len 断言。
         if db_downloaded > 0 && (file_len == 0 || file_len < db_downloaded) {
             db.reset_segments_progress(task_id).await?;
             existing_segments = db.load_segments(task_id).await?;
@@ -1036,6 +1242,14 @@ async fn ftp_download_multi_segment(
     }
 
     let seg_defs: Vec<(i32, i64, i64, i64)> = if existing_segments.is_empty() {
+        // 防御:用户手动把分段数设得比文件总字节数还大时,chunk_size = total/count
+        // 会变 0,导致非末段 end_byte=-1 被跳过、只下载末段造成不完整传输。夹紧到
+        // [1, total_bytes],保证每段至少 1 字节(自动分段路径永不触发,仅极端手动值)。
+        let segment_count = if (segment_count as i64) > total_bytes {
+            total_bytes.max(1) as i32
+        } else {
+            segment_count.max(1)
+        };
         let chunk_size = total_bytes / segment_count as i64;
         let mut defs = Vec::new();
         for i in 0..segment_count {
@@ -1364,6 +1578,26 @@ async fn ftp_do_segment(
                 }
             }
 
+            // 短读校验：若未被取消却读到的字节数少于本段所需（服务器/网络在
+            // 段中途提前关闭数据连接、chunked 提前 EOF 等），必须报错而非当成
+            // 正常完成——否则该段会留下未下载的尾部（预分配区域恒为 0 字节），
+            // 导致整任务在最终完整性校验处失败且无法重试。以 cancelled 标志作
+            // 守卫：取消导致的提前 break 由 writer 的 cancel 分支单独返回
+            // Cancelled，不应在此误判为错误。
+            //
+            // 此处返回 Err 后，writer 已在 reader_result? 之前完成 flush 与
+            // update_segment_progress 落库，故 DB 偏移准确；
+            // ftp_do_segment_with_retry 会以 seg_start+downloaded 重发 REST 续传
+            // 本段，而不是让整任务失败。
+            if !cancelled.load(Ordering::SeqCst) && bytes_read < seg_bytes_needed {
+                drop(data_stream);
+                let _ = ftp.quit();
+                return Err(DownloadError::Other(format!(
+                    "FTP segment {} closed early: got {}/{} bytes",
+                    seg_idx, bytes_read, seg_bytes_needed
+                )));
+            }
+
             // On cancel, skip finalize_retr_stream (it blocks waiting for 226).
             if cancelled.load(Ordering::SeqCst) {
                 drop(data_stream);
@@ -1389,13 +1623,18 @@ async fn ftp_do_segment(
         tokio::select! {
             _ = cancel.cancelled() => {
                 cancelled_writer.store(true, Ordering::SeqCst);
-                file.flush().await?;
+                // flush 用 best-effort: 即便失败也要继续落库段进度并清理 reader,否则 ?
+                // 会以 Io 错误绕过这些清理,且重试包装器会因非 Cancelled 而错误重试。
+                let _ = file.flush().await;
                 if let Ok(mut states) = seg_states.lock()
                     && let Some(s) = states.iter_mut().find(|s| s.index == seg_idx) {
                         s.downloaded_bytes = seg_downloaded;
                     }
                 let _ = db.update_segment_progress(task_id, seg_idx, seg_downloaded).await;
                 cancel_watcher.abort();
+                // close() 唤醒可能因 channel 满而阻塞在 blocking_send 的 reader,
+                // 避免 ftp_reader.await 死锁(与写错误分支一致)。
+                chunk_rx.close();
                 let _ = ftp_reader.await;
                 return Err(DownloadError::Cancelled);
             }
@@ -1405,12 +1644,42 @@ async fn ftp_do_segment(
                         let n = bytes.len();
                         // Speed limiter
                         let mut offset = 0usize;
+                        let mut write_err: Option<std::io::Error> = None;
                         while offset < n {
                             let rem = (n - offset) as u64;
                             let allowed = speed_limiter.consume(rem).await;
                             let end = offset + allowed as usize;
-                            file.write_all(&bytes[offset..end]).await?;
+                            if let Err(e) = file.write_all(&bytes[offset..end]).await {
+                                write_err = Some(e);
+                                break;
+                            }
                             offset = end;
+                        }
+
+                        // 写失败时，先持久化已完整记账的 seg_downloaded（不含本段
+                        // 部分写入字节），再向上传播错误。否则错误会直接经 `?`
+                        // 冒泡，跳过函数末尾的 update_segment_progress，使 DB 偏移
+                        // 落后于真实进度；重试时按陈旧偏移续传虽因字节相同不致损坏，
+                        // 但会让 DB 求和完整性核对出现不一致。这里不 flush 本段
+                        // 部分写入字节，避免磁盘超前于 DB；下次以 DB 偏移 REST 续传
+                        // 时会重新 seek 到 actual_start 覆盖写，幂等且安全。
+                        if let Some(e) = write_err {
+                            if let Ok(mut states) = seg_states.lock()
+                                && let Some(s) = states.iter_mut().find(|s| s.index == seg_idx) {
+                                    s.downloaded_bytes = seg_downloaded;
+                                }
+                            let _ = db
+                                .update_segment_progress(task_id, seg_idx, seg_downloaded)
+                                .await;
+                            cancelled_writer.store(true, Ordering::SeqCst);
+                            cancel_watcher.abort();
+                            // 关闭 receiver，保证阻塞 reader 即便正卡在
+                            // blocking_send（通道满）也会立刻得到 Err 而退出，避免
+                            // ftp_reader.await 死锁。close() 只需 &mut self，不会与
+                            // select! 宏对 chunk_rx 的可变借用冲突。
+                            chunk_rx.close();
+                            let _ = ftp_reader.await;
+                            return Err(DownloadError::Io(e));
                         }
 
                         let len = n as i64;
@@ -1481,7 +1750,8 @@ async fn ftp_do_segment(
 #[cfg(test)]
 mod tests {
     use super::{
-        FTP_DATA_READ_TIMEOUT, PROBE_MAX_RETRIES, PROBE_RETRY_BASE_DELAY, parse_ftp_url, url_decode,
+        FTP_DATA_READ_TIMEOUT, PROBE_MAX_RETRIES, PROBE_RETRY_BASE_DELAY, hex_nibble, parse_ftp_url,
+        url_decode,
     };
     use crate::downloader::sanitize_filename;
     use crate::speed_limiter::SpeedLimiter;
@@ -1542,6 +1812,50 @@ mod tests {
     #[test]
     fn url_decode_mixed_encoded_and_plain() {
         assert_eq!(url_decode("my%20file%28copy%29.txt"), "my file(copy).txt");
+    }
+
+    // -----------------------------------------------------------------------
+    // FX01: url_decode 不得在非 char 边界处 panic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hex_nibble_parses_valid_and_rejects_invalid() {
+        assert_eq!(hex_nibble(b'0'), Some(0));
+        assert_eq!(hex_nibble(b'9'), Some(9));
+        assert_eq!(hex_nibble(b'a'), Some(10));
+        assert_eq!(hex_nibble(b'f'), Some(15));
+        assert_eq!(hex_nibble(b'A'), Some(10));
+        assert_eq!(hex_nibble(b'F'), Some(15));
+        assert_eq!(hex_nibble(b'g'), None);
+        assert_eq!(hex_nibble(b'%'), None);
+        // 多字节 UTF-8 字符的首字节绝不能被当作合法 nibble。
+        assert_eq!(hex_nibble("折".as_bytes()[0]), None);
+    }
+
+    #[test]
+    fn url_decode_percent_followed_by_literal_multibyte_no_panic() {
+        // `%` 后紧跟字面多字节 UTF-8 字符（如 "50%折扣.txt"）。旧实现用
+        // &s[i+1..i+3] 切片会落在 "折" 字符内部触发 char-boundary panic。
+        // 字节级解析下：`%` 后的字节不是合法 hex nibble，应原样保留。
+        let input = "50%折扣.txt";
+        let decoded = url_decode(input);
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn url_decode_percent_one_hex_then_multibyte_no_panic() {
+        // `%a折`：`%` 后第一个字节 'a' 是合法 nibble，但第二个字节是 "折" 的
+        // 首字节（非 hex）。必须不 panic 且原样保留 '%'。
+        let input = "x%a折y";
+        let decoded = url_decode(input);
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn url_decode_valid_encoding_still_works_after_byte_rewrite() {
+        // 确认字节级重写后合法编码仍正确解码（回归保护）。
+        assert_eq!(url_decode("%2F"), "/");
+        assert_eq!(url_decode("a%2Bb"), "a+b");
     }
 
     // -----------------------------------------------------------------------

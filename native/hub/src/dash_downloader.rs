@@ -204,11 +204,14 @@ async fn mux_audio_video(
     }
 
     // Replace the original video-only file with the muxed version
-    tokio::fs::rename(&muxed_tmp, video_path)
-        .await
-        .map_err(|e| {
-            DownloadError::Other(format!("failed to replace video with muxed file: {}", e))
-        })?;
+    if let Err(e) = tokio::fs::rename(&muxed_tmp, video_path).await {
+        // rename 失败时清理临时 mux 产物,避免残留临时文件
+        let _ = tokio::fs::remove_file(&muxed_tmp).await;
+        return Err(DownloadError::Other(format!(
+            "failed to replace video with muxed file: {}",
+            e
+        )));
+    }
 
     Ok(())
 }
@@ -365,8 +368,9 @@ async fn run_dash_download_inner(
                 {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        // Clean up partially-downloaded audio file on error
-                        let _ = tokio::fs::remove_file(&audio_path).await;
+                        // download_track 失败时已清理自身的 .fdownloading 临时文件;
+                        // 不要在此删除最终 audio_path——rename 未发生时它尚不存在,
+                        // 误删反而可能清掉上一轮遗留的同名文件。
                         return Err(e);
                     }
                 }
@@ -954,18 +958,43 @@ fn build_from_template(
                 Some(r) if r >= 0 => r as u64,
                 Some(-1) => {
                     let next_t = timeline.segments.get(idx + 1).and_then(|next| next.t);
-                    let end_time = if let Some(t) = next_t {
-                        t
+                    if let Some(t) = next_t {
+                        // 后续 S 元素带显式 @t：本段须精确填满 [time_value, t)。
+                        // 连续时间轴中 (t - time_value) 应为 s.d 的整数倍，故用
+                        // floor 计数；若用 ceil 会多生成一个越过下一段起点的
+                        // 重叠/越界分段。
+                        let total = t.saturating_sub(time_value);
+                        if total == 0 {
+                            // 区间长度为 0（畸形/重复时间戳）：跳过该 S，不生成
+                            // 任何分段，避免越界伪段（F030）。
+                            current_time = time_value;
+                            continue;
+                        }
+                        (total / s.d).saturating_sub(1)
                     } else if let Some(end) = period_end_time {
-                        end
+                        // 末段：以 period/MPD 时长作结束时间。period_end_time 以
+                        // 0 为基线，而时间轴 @t 可能以 presentationTimeOffset
+                        // (PTO) 为基线；需把 PTO 加回 end_time 才能与 time_value
+                        // 处于同一坐标系，否则 saturating_sub 会下溢为 0 而只生成
+                        // 1 个分段，造成严重内容缺失（F028）。
+                        let pto = template.presentationTimeOffset.unwrap_or(0);
+                        let end_time = pto.saturating_add(end);
+                        let total = end_time.saturating_sub(time_value);
+                        if total == 0 {
+                            // 末段 @t 恰为 period 结束（或上述下溢场景）：区间为空，
+                            // 跳过该 S，消除原实现产生的越界伪分段（F030）。
+                            current_time = time_value;
+                            continue;
+                        }
+                        // 末段时长通常不是分段时长的整数倍：必须用 ceil 才能涵盖
+                        // 最后一个不足整段的分段，否则视频结尾被截断（F027）。
+                        // 注意此处与 @duration 分支（下方 div_ceil）语义对齐。
+                        total.div_ceil(s.d).saturating_sub(1)
                     } else {
                         return Err(DownloadError::Other(
                             "cannot determine r=-1 repeat count".to_string(),
                         ));
-                    };
-                    let total = end_time.saturating_sub(time_value);
-                    let segs = total / s.d;
-                    segs.saturating_sub(1)
+                    }
                 }
                 Some(other) => {
                     return Err(DownloadError::Other(format!(
@@ -1120,12 +1149,39 @@ async fn download_track(
     dest_path: &Path,
     progress_state: &mut ProgressState,
 ) -> Result<i64, DownloadError> {
+    // 薄包装: 计算临时文件路径并在内部任意错误路径(取消/分段失败/flush/
+    // rename)退出后统一 best-effort 异步清理 .fdownloading 临时文件,避免泄漏。
     let temp_path = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
+    let result = download_track_inner(
+        p,
+        reference_url,
+        init_seg,
+        media_segs,
+        dest_path,
+        &temp_path,
+        progress_state,
+    )
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+    result
+}
+
+async fn download_track_inner(
+    p: &DownloadParams,
+    reference_url: &str,
+    init_seg: &Option<DashSegment>,
+    media_segs: &[DashSegment],
+    dest_path: &Path,
+    temp_path: &Path,
+    progress_state: &mut ProgressState,
+) -> Result<i64, DownloadError> {
     if let Some(parent) = temp_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let mut file = File::create(&temp_path).await?;
+    let mut file = File::create(temp_path).await?;
     let mut total_track: i64 = 0;
 
     let ctx = SegmentDownloadContext {
@@ -1201,7 +1257,7 @@ async fn download_track(
         let _ = tokio::fs::remove_file(dest_path).await;
     }
 
-    tokio::fs::rename(&temp_path, dest_path)
+    tokio::fs::rename(temp_path, dest_path)
         .await
         .map_err(|e| {
             DownloadError::Other(format!(
@@ -1286,6 +1342,19 @@ async fn download_segment_streaming(
         _ = ctx.cancel_token.cancelled() => return Err(DownloadError::Cancelled),
         r = req.send() => r?.error_for_status()?,
     };
+
+    // Range 请求必须返回 206 Partial Content。若服务器/中间代理忽略 Range 返回
+    // 200 全量响应，本函数会把整份资源写入文件——而这些 range 段会被拼接到同一
+    // 文件，导致重复/超长内容，文件损坏且不可播放。这里显式拒绝非 206 响应，让
+    // download_segment_with_retry 重试或最终失败（与 segment_coordinator.rs 的
+    // 既有防护对齐）。SegmentTemplate 路径 range 恒为 None，不受影响（F029/F032）。
+    if range.is_some() && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(DownloadError::Other(format!(
+            "DASH range segment expected 206 Partial Content, got {}",
+            resp.status()
+        )));
+    }
+
     // Transparently decompress if the server returned compressed content.
     let encoding = crate::downloader::detect_content_encoding(resp.headers());
     if encoding.is_some() {
@@ -1294,6 +1363,17 @@ async fn download_segment_streaming(
             encoding
         );
     }
+
+    // 提前 EOF 截断防护（F032）：仅当无 Content-Encoding（写入字节数即原始字节数）
+    // 且服务器声明了 Content-Length、且非 Range 段时，记录期望字节数；EOF 后断言
+    // written == expected。压缩段解压后 written 必然 != 压缩后的 content_length，
+    // 故必须跳过，否则会误伤合法压缩分段。Range 段已由上方 206 校验把关，且其
+    // content_length 语义为区间长度，这里不重复断言以避免与解压/区间逻辑纠缠。
+    let expected_len: Option<u64> = if encoding.is_none() && range.is_none() {
+        resp.content_length()
+    } else {
+        None
+    };
 
     let raw_stream = resp.bytes_stream();
     let mut stream = crate::downloader::maybe_decompress_stream(raw_stream, encoding);
@@ -1331,12 +1411,146 @@ async fn download_segment_streaming(
         written += chunk_len as i64;
     }
 
+    // 提前 EOF 截断检测（F032）：流正常结束（stream.next() 返回 None）可能源自
+    // 服务器在分段中途关闭连接（TCP RST / chunked 提前 EOF，而非 reqwest error），
+    // 此时分段只写入了部分字节却被当作成功。若服务器声明了精确 Content-Length 且
+    // 无压缩，写入字节数应与之相等；不等说明被截断，返回 Err 触发重试（重试前由
+    // download_segment_with_retry 的 set_len(start_pos) 回退本段已写字节）。
+    if let Some(expected) = expected_len
+        && written as u64 != expected
+    {
+        return Err(DownloadError::Other(format!(
+            "DASH segment truncated: wrote {written} bytes but Content-Length declared {expected}"
+        )));
+    }
+
     Ok(written)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_dash_url, resolve_url_template};
+    use super::{build_from_template, is_dash_url, resolve_url_template};
+
+    /// 构造一个仅含 SegmentTimeline 的最小 SegmentTemplate，用于驱动
+    /// build_from_template 的 r=-1 末段计数测试。
+    fn template_with_timeline(
+        timeline: dash_mpd::SegmentTimeline,
+        timescale: Option<u64>,
+        pto: Option<u64>,
+    ) -> dash_mpd::SegmentTemplate {
+        dash_mpd::SegmentTemplate {
+            media: Some("seg-$Time$.m4s".to_string()),
+            timescale,
+            startNumber: Some(1),
+            SegmentTimeline: Some(timeline),
+            presentationTimeOffset: pto,
+            ..Default::default()
+        }
+    }
+
+    fn s_elem(t: Option<u64>, d: u64, r: Option<i64>) -> dash_mpd::S {
+        dash_mpd::S {
+            t,
+            d,
+            r,
+            ..Default::default()
+        }
+    }
+
+    /// F027: r=-1 末段计数应使用 ceil，否则丢失最后一个不足整段的分段。
+    /// period_end_time=25, d=10 → floor 给 2 段（错误），ceil 给 3 段（正确）。
+    #[test]
+    fn test_timeline_r_minus_one_uses_ceil_for_last_segment() {
+        let timeline = dash_mpd::SegmentTimeline {
+            segments: vec![s_elem(Some(0), 10, Some(-1))],
+        };
+        let template = template_with_timeline(timeline, Some(1), None);
+        let period = dash_mpd::Period::default();
+        let repr = dash_mpd::Representation::default();
+        let (_init, segs) = build_from_template(
+            "https://cdn.example.com/base/",
+            &period,
+            &repr,
+            &template,
+            Some(25.0),
+        )
+        .expect("build_from_template should succeed");
+        assert_eq!(segs.len(), 3, "ceil(25/10) = 3 segments expected");
+    }
+
+    /// F030: r=-1 且区间长度为 0（period_end_time == t）时不应生成任何伪分段。
+    #[test]
+    fn test_timeline_r_minus_one_zero_interval_produces_no_segments() {
+        let timeline = dash_mpd::SegmentTimeline {
+            segments: vec![s_elem(Some(25), 10, Some(-1))],
+        };
+        let template = template_with_timeline(timeline, Some(1), None);
+        let period = dash_mpd::Period::default();
+        let repr = dash_mpd::Representation::default();
+        let (_init, segs) = build_from_template(
+            "https://cdn.example.com/base/",
+            &period,
+            &repr,
+            &template,
+            Some(25.0),
+        )
+        .expect("build_from_template should succeed");
+        assert!(
+            segs.is_empty(),
+            "zero-length interval must not produce a pseudo-segment"
+        );
+    }
+
+    /// F028: 时间轴 @t 以 presentationTimeOffset 为基线时，末段结束时间须加回
+    /// PTO 才能正确计数；否则 saturating_sub 下溢为 0，只生成 1（或 0）段。
+    /// pto=1000, t=1000, period_end_time(相对)=30, d=10 → 对齐后 total=30,
+    /// ceil(30/10)=3 段。
+    #[test]
+    fn test_timeline_r_minus_one_honours_presentation_time_offset() {
+        let timeline = dash_mpd::SegmentTimeline {
+            segments: vec![s_elem(Some(1000), 10, Some(-1))],
+        };
+        let template = template_with_timeline(timeline, Some(1), Some(1000));
+        let period = dash_mpd::Period::default();
+        let repr = dash_mpd::Representation::default();
+        let (_init, segs) = build_from_template(
+            "https://cdn.example.com/base/",
+            &period,
+            &repr,
+            &template,
+            Some(30.0),
+        )
+        .expect("build_from_template should succeed");
+        assert_eq!(
+            segs.len(),
+            3,
+            "PTO-aligned end_time should yield ceil(30/10) = 3 segments"
+        );
+    }
+
+    /// 回归保护：带显式 next_t 的 r=-1 分段须用 floor（精确填满区间），避免
+    /// 生成越过下一段起点的重叠/越界分段。t0=0,d=10,next_t=30 → 3 段（第一个 S），
+    /// next S 自身再生成 1 段，共 4 段。
+    #[test]
+    fn test_timeline_r_minus_one_with_next_t_uses_floor() {
+        let timeline = dash_mpd::SegmentTimeline {
+            segments: vec![s_elem(Some(0), 10, Some(-1)), s_elem(Some(30), 10, None)],
+        };
+        let template = template_with_timeline(timeline, Some(1), None);
+        let period = dash_mpd::Period::default();
+        let repr = dash_mpd::Representation::default();
+        let (_init, segs) = build_from_template(
+            "https://cdn.example.com/base/",
+            &period,
+            &repr,
+            &template,
+            Some(100.0),
+        )
+        .expect("build_from_template should succeed");
+        // 第一个 S: floor((30-0)/10) = 3 段; 第二个 S: 1 段 → 共 4 段。
+        assert_eq!(segs.len(), 4, "floor count for explicit next_t boundary");
+    }
+
 
     #[test]
     fn test_is_dash_url() {

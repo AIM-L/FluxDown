@@ -943,6 +943,18 @@ async fn resolve_file_info_once(
             .and_then(|v| v.rsplit('/').next())
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0)
+    } else if got_206_from_get {
+        // F021: GET Range:0-0 返回 206 却缺失 Content-Range 头（违反 RFC 9110
+        // 但现实存在的破损服务器/中间件）。此时 Content-Length=1 是【范围长度】
+        // （0-0 这一个字节），不是文件总大小，绝不能拿来当 total_bytes，否则会
+        // 被当成 1 字节文件处理并几乎必然触发后续 size mismatch。改为置 0
+        // （未知大小），走下游 unknown-size 单流路径（读到 EOF、跳过 size 校验），
+        // 语义正确且不会误判。
+        log_info!(
+            "[resolve] WARNING: GET returned 206 without Content-Range — Content-Length is \
+             the range length (not file size); treating total_bytes as unknown (0)"
+        );
+        0
     } else {
         headers
             .get(reqwest::header::CONTENT_LENGTH)
@@ -1316,7 +1328,31 @@ pub fn extract_from_url(url: &str) -> Option<String> {
     Some(sanitize_filename(decoded))
 }
 
+/// 文件名单组件的最大字节数（F051）。
+///
+/// 大多数文件系统（ext4/APFS/NTFS）的单路径组件上限为 255 字节；这里取 200
+/// 作为保守预算，给 `.fdownloading` 临时后缀（13 字节）及未来可能的 dedup
+/// `" (NN)"` 后缀留出余量。超长的 Content-Disposition / URL 段若原样放行，
+/// `save_dir.join(name) + ".fdownloading"` 会触顶导致 create 报 ENAMETOOLONG，
+/// 下载以晦涩 OS 错误失败。多字节 CJK 约 66 字即可触及 200 字节。
+const MAX_FILENAME_BYTES: usize = 200;
+
+/// Windows 保留设备名（不区分大小写，比较时取扩展名前的 stem）。
+///
+/// 在 Windows 上创建这些名字（无论是否带扩展名，如 `CON`、`NUL.txt`）会失败
+/// 或行为异常。本项目主要目标平台为 Windows，故统一在文件名出口处规避。
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// Remove or replace characters that are illegal in file names on Windows/macOS/Linux.
+///
+/// 额外保证（F051）：
+///   - 规避 Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）——在 stem 前
+///     加下划线；
+///   - 把结果按字节截断到 [`MAX_FILENAME_BYTES`]，截断在 char 边界进行，避免
+///     切断多字节 CJK 字符。
 pub fn sanitize_filename(name: &str) -> String {
     let s: String = name
         .chars()
@@ -1328,29 +1364,88 @@ pub fn sanitize_filename(name: &str) -> String {
         .collect();
     let s = s.trim_matches(|c: char| c == '.' || c == ' ');
     if s.is_empty() {
-        "download".to_string()
+        return "download".to_string();
+    }
+
+    // --- F051(1): Windows 保留设备名规避 ---
+    // 取扩展名前的 stem（首个 '.' 之前的部分）做大小写无关比较。
+    let stem_end = s.find('.').unwrap_or(s.len());
+    let stem = &s[..stem_end];
+    let s = if WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|r| stem.eq_ignore_ascii_case(r))
+    {
+        format!("_{}", s)
     } else {
         s.to_string()
+    };
+
+    // --- F051(2): 字节长度截断（在 char 边界） ---
+    if s.len() <= MAX_FILENAME_BYTES {
+        return s;
+    }
+    // 保留扩展名（最后一个 '.' 起的部分），从 stem 尾部按 char 边界裁剪。
+    let ext_start = s.rfind('.').unwrap_or(s.len());
+    let (stem, ext) = s.split_at(ext_start);
+    let budget = MAX_FILENAME_BYTES.saturating_sub(ext.len());
+    // 找到 <= budget 的最大 char 边界。
+    let cut = stem
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= budget)
+        .last()
+        .unwrap_or(0);
+    let truncated = format!("{}{}", &stem[..cut], ext);
+    // 截断后再次 trim 尾部 '.'/' '（避免裁出以点/空格结尾的名）；若整体为空则兜底。
+    let truncated = truncated.trim_matches(|c: char| c == '.' || c == ' ');
+    if truncated.is_empty() {
+        "download".to_string()
+    } else {
+        truncated.to_string()
     }
 }
 
+/// 将单个十六进制 ASCII 字节解析为 0..=15 的半字节（nibble）。
+///
+/// 仅接受 `0-9` / `a-f` / `A-F`；其他字节返回 `None`。供 `urlencoding_decode`
+/// 按字节解析 `%XX` 转义使用，避免对 `&str` 切片导致的字符边界 panic。
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 解码 URL 路径段 / Content-Disposition 文件名中的百分号转义。
+///
+/// **按字节解析，绝不对 `&str` 切片**：原实现用 `&s[i+1..i+3]` 取两位十六进制，
+/// 当 `%` 后紧跟原始多字节 UTF-8 字符（如 `50%折扣.txt`）时，切片终点会落在
+/// 多字节字符内部触发 `byte index N is not a char boundary` panic（F017）。改为
+/// 直接对 `bytes[i+1]` / `bytes[i+2]` 解析半字节后即可消除该 panic。
+///
+/// **不把 `+` 解码为空格**（F046）：按 RFC 3986，`+` 仅在
+/// `application/x-www-form-urlencoded`（query / form body）中表示空格；在 URL
+/// 路径段、Content-Disposition、RFC 5987 `filename*=` 中 `+` 都是字面加号
+/// （空格用 `%20`）。本函数的所有调用方（extract_from_url /
+/// extract_from_content_disposition）均为路径/文件名场景，且 extract_from_url
+/// 在调用前已 `split('?')` 丢弃 query，故 `+`→空格 在所有实际用途下都是错的
+/// （会把 `C++Primer.pdf` 损坏成 `C  Primer.pdf`）。
 fn urlencoding_decode(s: &str) -> Result<String, String> {
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = &s[i + 1..i + 3];
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                result.push(byte);
-                i += 3;
-                continue;
-            }
-        } else if bytes[i] == b'+' {
-            result.push(b' ');
-            i += 1;
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+        {
+            result.push((hi << 4) | lo);
+            i += 3;
             continue;
         }
+        // 非法 `%` 转义或普通字节：原样保留（含字面 `+`）。
         result.push(bytes[i]);
         i += 1;
     }
@@ -2152,6 +2247,32 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
             Err(e) => return Err(e),
         }
     } else {
+        // F025: 续传时从多段切换到单流（例如 effective_total_bytes 经容差修正后
+        // <=1MB、用户改 segment_count=1、或 spec 变 non-GET）。上次多段运行已把临时
+        // 文件【预分配到满尺寸】total_bytes 并写入部分数据，且 DB 仍有 segment 行。
+        // 若直接进入 download_single：
+        //   • existing_len==预分配满尺寸 → want_resume 因 existing_len<total 为假 →
+        //     File::create 截断从 0 重下（丢弃所有进度，纯效率损失）；
+        //   • 若同时命中"文件真实增长"使 new_total 变大 → existing_len<new_total 为真 →
+        //     从旧 total 偏移 append，而预分配 [old_total,new_total] 是空洞零字节 →
+        //     产出含空洞的损坏文件。
+        // 与 RangeNotSupported 回退路径一致地清理：删除 DB segment 行 + 删除预分配
+        // 的临时文件，使 download_single 从 existing_len=0 的干净状态开始，无损坏风险。
+        if p.is_resume {
+            let existing_segs = p.db.load_segments(&p.task_id).await.unwrap_or_default();
+            if !existing_segs.is_empty() {
+                log_info!(
+                    "[download] task {} switching multi-segment → single-stream on resume; \
+                     clearing {} stale segment(s) and pre-allocated temp file",
+                    p.task_id,
+                    existing_segs.len()
+                );
+                let _ = p.db.delete_segments(&p.task_id).await;
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                // 进度归零，避免 UI 显示陈旧的多段累计值。
+                let _ = p.db.update_task_progress(&p.task_id, 0).await;
+            }
+        }
         let result = download_single(
             &p.task_id,
             &p.url,
@@ -2282,8 +2403,49 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
             p.task_id,
             p.checksum
         );
-        verify_checksum(&temp_path, &p.checksum).await?;
+        // F039: checksum 失败表明落盘内容已确认与期望不符（数据损坏/被篡改/
+        // 传输错误），此时残留一个完整大小、内容错误的临时文件毫无意义——既
+        // 占用磁盘，又会让后续 resume 基于 existing_len 做出错误判断。删除它，
+        // 让下次重试从干净状态开始。删除失败仅记日志，不掩盖原始 checksum 错误。
+        if let Err(e) = verify_checksum(&temp_path, &p.checksum).await {
+            if let Err(rm_err) = tokio::fs::remove_file(&temp_path).await {
+                log_info!(
+                    "[download] task {} checksum failed; could not remove corrupt temp {}: {}",
+                    p.task_id,
+                    temp_path.display(),
+                    rm_err
+                );
+            }
+            return Err(e);
+        }
         log_info!("[download] task {} checksum ok", p.task_id);
+    }
+
+    // F034: rename 前对临时文件做 sync_all，确保内核页缓存已持久化到存储介质。
+    //
+    // 之前各下载路径只做 BufWriter::flush（把用户态缓冲刷到内核），从不
+    // sync_all/sync_data。在 ext4(data=writeback/ordered) 等文件系统、崩溃/掉电
+    // 场景下，rename 的元数据可能先于文件数据落盘，导致重启后 dest 存在但内容
+    // 为 0 字节或旧块，而 .fdownloading 已消失——用户得到一个"已完成"的损坏
+    // 文件且无 temp 可恢复。IDM/aria2 在 finalize 前都会 fsync。
+    //
+    // 写入文件句柄此前已 drop，这里重新 open 临时文件后 sync_all。sync 失败属
+    // 真实 IO 错误（如磁盘故障），向上传播而非静默忽略。
+    {
+        let temp_file = tokio::fs::File::open(&temp_path).await.map_err(|e| {
+            DownloadError::Other(format!(
+                "failed to reopen {} for fsync before rename: {}",
+                temp_path.display(),
+                e
+            ))
+        })?;
+        temp_file.sync_all().await.map_err(|e| {
+            DownloadError::Other(format!(
+                "failed to fsync {} before rename: {}",
+                temp_path.display(),
+                e
+            ))
+        })?;
     }
 
     // All data verified — rename temp file to final destination.
@@ -2363,7 +2525,30 @@ async fn download_single(
         req = req.header("Range", format!("bytes={}-", existing_len));
     }
 
-    let resp = req.send().await?.error_for_status()?;
+    let mut resp = req.send().await?.error_for_status()?;
+
+    // F019: 当我们发了开放式 Range 请求 `bytes=N-`，服务器返回 206 且带
+    // Content-Encoding（部分 CDN 行为）时，响应体是【压缩流任意中间字节】起的
+    // 一段，无法从 existing_len（解压后偏移）正确续传，也无法当全量解压。此时
+    // 必须丢弃该响应、不带 Range 重新请求一次拿到完整压缩流，再从头解压全量
+    // 重下。仅在 want_resume（即确实带了 Range）时才可能触发，无 Range 的普通
+    // 请求不受影响。
+    if want_resume
+        && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+        && detect_content_encoding(resp.headers()).is_some()
+    {
+        log_info!(
+            "[download-single] task {} got Content-Encoding on a 206 Range response — \
+             compressed byte ranges cannot be resumed; re-requesting full file without Range \
+             (existing_len={} discarded)",
+            task_id,
+            existing_len
+        );
+        drop(resp);
+        // 不带 Range 重新构造请求，拿到从 byte 0 起的完整（压缩）响应。
+        let full_req = build_request(client, url, spec.method.clone(), spec);
+        resp = full_req.send().await?.error_for_status()?;
+    }
 
     // ---- Safety net: HTML response on a binary download ---------------------
     //
@@ -2423,14 +2608,23 @@ async fn download_single(
     // HTTP 206 Partial Content  → server honoured Range → safe to append
     // HTTP 200 OK               → server ignored Range  → must restart from 0
     // Any other 2xx             → treat as non-resumable for safety
-    let actual_resume = want_resume && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    //
+    // F019: `encoding.is_none()` 仍作为续传安全的额外必要条件做防御兜底。压缩
+    // 206 的核心修复已在上方"re-request full file without Range"完成（重发后
+    // resp 为 200 全量压缩流）；此处 encoding 守卫确保万一上方逻辑未覆盖某种
+    // 边界（如重发后服务器仍返回 206+encoding）也绝不会把压缩字节范围当作可
+    // append 的续传数据，避免静默损坏。
+    let actual_resume = want_resume
+        && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+        && encoding.is_none();
 
     if want_resume && !actual_resume {
         log_info!(
-            "[download-single] task {} server returned {} instead of 206; \
-             falling back to full download (existing_len={} discarded)",
+            "[download-single] task {} server returned {} (encoding={:?}) instead of a plain \
+             206; falling back to full download (existing_len={} discarded)",
             task_id,
             resp.status(),
+            encoding,
             existing_len
         );
     }
@@ -2673,6 +2867,39 @@ mod tests {
         assert_eq!(sanitize_filename("ファイル.tar.gz"), "ファイル.tar.gz");
     }
 
+    #[test]
+    fn sanitize_windows_reserved_names() {
+        // F051: Windows 保留设备名（含/不含扩展名、混合大小写）应加下划线规避。
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("NUL.txt"), "_NUL.txt");
+        assert_eq!(sanitize_filename("com1"), "_com1");
+        assert_eq!(sanitize_filename("LpT9.log"), "_LpT9.log");
+        assert_eq!(sanitize_filename("Aux.tar.gz"), "_Aux.tar.gz");
+        // 非保留名不受影响（仅 stem 完全匹配才规避）。
+        assert_eq!(sanitize_filename("CONSOLE.txt"), "CONSOLE.txt");
+        assert_eq!(sanitize_filename("COM10.txt"), "COM10.txt");
+    }
+
+    #[test]
+    fn sanitize_truncates_overlong_names_at_char_boundary() {
+        // F051: 超过 200 字节的名字应截断，且保留扩展名、不切断多字节字符。
+        let long_ascii = format!("{}.bin", "a".repeat(300));
+        let out = sanitize_filename(&long_ascii);
+        assert!(out.len() <= 200, "ascii truncated len = {}", out.len());
+        assert!(out.ends_with(".bin"), "extension preserved: {out}");
+
+        // 多字节 CJK：每个 '永' 3 字节，120 个 = 360 字节。
+        let long_cjk = format!("{}.mp4", "永".repeat(120));
+        let out = sanitize_filename(&long_cjk);
+        assert!(out.len() <= 200, "cjk truncated len = {}", out.len());
+        assert!(out.ends_with(".mp4"), "extension preserved: {out}");
+        // 截断必须落在 char 边界——能成功重新解析为合法 UTF-8（String 本身保证）。
+        assert!(out.starts_with('永'));
+
+        // 未超限的名字原样返回。
+        assert_eq!(sanitize_filename("short.txt"), "short.txt");
+    }
+
     // -----------------------------------------------------------------------
     // extract_from_url
     // -----------------------------------------------------------------------
@@ -2709,6 +2936,23 @@ mod tests {
         let name = extract_from_url("https://example.com");
         // The last segment is "example.com" — should extract it
         assert!(name.is_some());
+    }
+
+    #[test]
+    fn extract_from_url_preserves_literal_plus() {
+        // F046: 含字面 `+` 的文件名（C++ 教材、版本号 build metadata）不应被
+        // `+`→空格 损坏。
+        let name = extract_from_url("https://example.com/C++Primer.pdf");
+        assert_eq!(name.as_deref(), Some("C++Primer.pdf"));
+        let name = extract_from_url("https://example.com/v1.2+build.bin");
+        assert_eq!(name.as_deref(), Some("v1.2+build.bin"));
+    }
+
+    #[test]
+    fn extract_from_url_literal_percent_with_unicode_no_panic() {
+        // F017: URL 路径段含字面 `%` 紧跟多字节 UTF-8 字符不应 panic。
+        let name = extract_from_url("https://example.com/50%折扣.txt");
+        assert_eq!(name.as_deref(), Some("50%折扣.txt"));
     }
 
     #[test]
@@ -2754,11 +2998,34 @@ mod tests {
     }
 
     #[test]
-    fn urlencoding_decode_plus_to_space() {
+    fn urlencoding_decode_plus_is_literal() {
+        // F046: `+` 在 URL 路径段 / Content-Disposition 文件名中是字面加号，
+        // 不应被解码为空格（空格用 %20）。所有调用方均为路径/文件名场景。
         assert_eq!(
             urlencoding_decode("hello+world").unwrap_or_default(),
-            "hello world"
+            "hello+world"
         );
+        assert_eq!(
+            urlencoding_decode("C++Primer.pdf").unwrap_or_default(),
+            "C++Primer.pdf"
+        );
+        // 混合：%20 仍解码为空格，`+` 保留为字面。
+        assert_eq!(
+            urlencoding_decode("v1.2+build%20final.bin").unwrap_or_default(),
+            "v1.2+build final.bin"
+        );
+    }
+
+    #[test]
+    fn urlencoding_decode_no_panic_on_non_char_boundary() {
+        // F017: `%` 紧跟原始多字节 UTF-8 字符时，旧实现 `&s[i+1..i+3]` 会在
+        // 非字符边界处 panic。按字节解析后应安全地把 `%` 当字面量保留。
+        // "50%折扣.txt"：`%` 后是 `折`（E6 8A 98），i+3 落在多字节字符内部。
+        let result = urlencoding_decode("50%折扣.txt").unwrap_or_default();
+        assert_eq!(result, "50%折扣.txt");
+        // `%X` 后接多字节字符：第二位非 hex，亦应原样保留 `%`。
+        let result = urlencoding_decode("%a你.zip").unwrap_or_default();
+        assert_eq!(result, "%a你.zip");
     }
 
     #[test]

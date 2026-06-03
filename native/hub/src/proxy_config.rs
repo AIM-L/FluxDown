@@ -429,6 +429,16 @@ fn parse_host_port(addr: &str) -> (String, u16) {
 // URL percent-encoding helpers (for proxy credentials)
 // ---------------------------------------------------------------------------
 
+/// 把单个 ASCII 十六进制数字字节转成 nibble 值（0-15）；非 hex 返回 `None`。
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Decode percent-encoded strings (e.g. `p%40ss` → `p@ss`).
 /// Used to decode usernames/passwords from proxy URLs.
 fn percent_decode(s: &str) -> String {
@@ -436,11 +446,15 @@ fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // 按字节解析 %XX，绝不对 `&str` 切片：`%` 后紧跟原始（未编码）多字节
+        // UTF-8 字符时（如 `user%中:pass` / `%😀`，用户在代理 URL 凭据里输入
+        // 非 ASCII 即可触发），`&s[i+1..i+3]` 的切点会落在多字节序列内部，
+        // 触发 char-boundary panic。此处只对 `bytes` 按下标取值，安全。
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
         {
-            result.push(byte);
+            result.push((hi << 4) | lo);
             i += 3;
             continue;
         }
@@ -859,7 +873,7 @@ pub fn http_connect_proxy_sync(
     target_port: u16,
     timeout: std::time::Duration,
 ) -> Result<std::net::TcpStream, DownloadError> {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
 
     let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
@@ -889,25 +903,50 @@ pub fn http_connect_proxy_sync(
     }
     req.push_str("\r\n");
 
-    let mut stream_write = stream;
-    stream_write
+    let mut stream = stream;
+    stream
         .write_all(req.as_bytes())
         .map_err(|e| DownloadError::Other(format!("HTTP CONNECT write error: {}", e)))?;
 
-    // Read response status line
-    let mut reader = BufReader::new(stream_write);
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .map_err(|e| DownloadError::Other(format!("HTTP CONNECT read error: {}", e)))?;
+    // Read the response header block byte-by-byte, stopping exactly at the
+    // `\r\n\r\n` terminator.  We deliberately avoid `BufReader` here: it would
+    // greedily read past the header terminator and buffer whatever bytes follow,
+    // then `into_inner()` would silently discard that buffer.  When this tunnel
+    // carries an FTP control connection, the server's `220` welcome banner can
+    // arrive in the *same* TCP segment as the proxy's CONNECT response, so those
+    // banner bytes would be lost — leaving suppaftp's handshake to hang until
+    // the read timeout.  Reading one byte at a time guarantees the kernel socket
+    // buffer keeps everything after the header for the next reader.
+    //
+    // Upper bound on the proxy response header size; generous enough for any
+    // realistic CONNECT response while bounding memory and read iterations
+    // against a misbehaving proxy that never sends the terminator.
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
+    let mut header = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream
+            .read(&mut byte)
+            .map_err(|e| DownloadError::Other(format!("HTTP CONNECT read error: {}", e)))?;
+        if n == 0 {
+            return Err(DownloadError::Other(
+                "HTTP CONNECT proxy closed connection before sending full response".to_string(),
+            ));
+        }
+        header.push(byte[0]);
+        if header.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if header.len() >= MAX_HEADER_BYTES {
+            return Err(DownloadError::Other(
+                "HTTP CONNECT response header exceeded maximum size".to_string(),
+            ));
+        }
+    }
 
-    // Parse status code (e.g., "HTTP/1.1 200 Connection established")
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-
+    // Parse the status code from the first line
+    // (e.g. "HTTP/1.1 200 Connection established").
+    let (status_code, status_line) = parse_connect_status_line(&header);
     if status_code != 200 {
         return Err(DownloadError::Other(format!(
             "HTTP CONNECT failed: {}",
@@ -915,22 +954,26 @@ pub fn http_connect_proxy_sync(
         )));
     }
 
-    // Read remaining headers until empty line
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| DownloadError::Other(format!("HTTP CONNECT header read error: {}", e)))?;
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-
-    let stream = reader.into_inner();
     stream.set_read_timeout(None).ok();
     stream.set_write_timeout(None).ok();
 
     Ok(stream)
+}
+
+/// Parse the HTTP status code from a CONNECT response header block.
+///
+/// Returns the numeric status code (0 if unparseable) and the first line of the
+/// header (the status line) as a lossy UTF-8 string for diagnostics. Expects a
+/// header such as `b"HTTP/1.1 200 Connection established\r\n...\r\n\r\n"`.
+fn parse_connect_status_line(header: &[u8]) -> (u16, String) {
+    let status_line: &[u8] = header.split(|&b| b == b'\n').next().unwrap_or(header);
+    let status_line_str = String::from_utf8_lossy(status_line).into_owned();
+    let status_code = status_line_str
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status_code, status_line_str)
 }
 
 /// Simple base64 encoder (avoids external dependency for a single use).
@@ -1081,8 +1124,8 @@ pub async fn test_proxy_connection(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProxyConfig, ProxyMode, ProxyType, base64_encode, parse_host_port,
-        parse_multi_protocol_proxy, parse_windows_proxy_server, percent_decode,
+        ProxyConfig, ProxyMode, ProxyType, base64_encode, parse_connect_status_line,
+        parse_host_port, parse_multi_protocol_proxy, parse_windows_proxy_server, percent_decode,
         percent_encode_userinfo,
     };
     use std::collections::HashMap;
@@ -1611,5 +1654,42 @@ mod tests {
         let result = super::detect_system_proxy();
         assert!(result.is_ok());
         assert!(result.unwrap_or(None).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP CONNECT response parsing (F006)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_connect_status_line_success() {
+        let header = b"HTTP/1.1 200 Connection established\r\n\r\n";
+        let (code, line) = parse_connect_status_line(header);
+        assert_eq!(code, 200);
+        assert_eq!(line.trim(), "HTTP/1.1 200 Connection established");
+    }
+
+    #[test]
+    fn parse_connect_status_line_extracts_only_first_line() {
+        // The buffer may include trailing headers; only the status line matters,
+        // and the parser must not be confused by subsequent header lines.
+        let header = b"HTTP/1.1 200 OK\r\nProxy-Agent: x\r\n\r\n";
+        let (code, line) = parse_connect_status_line(header);
+        assert_eq!(code, 200);
+        assert_eq!(line.trim(), "HTTP/1.1 200 OK");
+    }
+
+    #[test]
+    fn parse_connect_status_line_non_200() {
+        let header = b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n";
+        let (code, line) = parse_connect_status_line(header);
+        assert_eq!(code, 407);
+        assert_eq!(line.trim(), "HTTP/1.1 407 Proxy Authentication Required");
+    }
+
+    #[test]
+    fn parse_connect_status_line_malformed_yields_zero() {
+        let header = b"garbage-without-code\r\n\r\n";
+        let (code, _line) = parse_connect_status_line(header);
+        assert_eq!(code, 0);
     }
 }

@@ -66,12 +66,32 @@ async fn handle_task_panic(
 // Auto-retry constants
 // ---------------------------------------------------------------------------
 
+/// 用户主动取消任务时写入 DB 的 error_message 字面量。
+///
+/// 取消复用了 error 状态码（status=4），与真实网络错误共用同一状态。
+/// 自动重试守卫 `is_task_in_error` 依据此字面量把"取消"与"可重试错误"
+/// 区分开，避免用户取消的任务被自动重试逻辑重新启动。
+/// `cancel_task` 写入、`is_task_in_error` 读取，两处必须保持一致，
+/// 故提取为具名常量。
+const CANCELLED_ERROR_MESSAGE: &str = "cancelled";
+
 /// 任务级自动重试最大次数。网络 stall、连接重置等瞬时错误触发后，
 /// 自动延迟恢复下载，避免大文件下载中途停止需要用户手动操作。
 const MAX_TASK_AUTO_RETRIES: u32 = 3;
 
 /// 自动重试基础延迟（秒）。实际延迟 = base × attempt，即 5s / 10s / 15s。
 const AUTO_RETRY_BASE_DELAY_SECS: u64 = 5;
+
+/// `invalidate_bt_session` 在关停前等待 inflight `add_torrent` 任务归零的
+/// 总上限。BT 监听端口由这些 detached 任务持有的 `Arc<Session>` 绑定，
+/// 超时后即便仍有 inflight 也强行继续关停（避免无限等待挂死配置变更）。
+/// 5s 取自 magnet DHT 元数据解析的典型耗时上界。
+const INVALIDATE_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `invalidate_bt_session` 轮询 inflight `add_torrent` 状态的间隔。
+/// 200ms 足够细以快速响应归零，又不会空耗 CPU。
+const INVALIDATE_INFLIGHT_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(200);
 
 /// 判断错误信息是否属于可自动重试的瞬时网络错误。
 /// 排除永久性错误（404、403、checksum 等），仅重试网络层问题。
@@ -119,10 +139,18 @@ fn is_bt_url(url: &str) -> bool {
 }
 
 /// Returns true only when `name` is safe to join onto a base directory for
-/// deletion purposes.  Rejects three classes of dangerous values:
-///   1. empty string  → `save_dir.join("")` == `save_dir` itself
-///   2. absolute path → `PathBuf::join` silently replaces `save_dir` entirely
-///   3. `..` component → path traversal that escapes `save_dir`
+/// deletion purposes.  Rejects every value that would make `save_dir.join(name)`
+/// resolve to anything other than a direct child of `save_dir`:
+///   1. empty string    → `save_dir.join("")` == `save_dir` itself
+///   2. absolute path    → `PathBuf::join` silently replaces `save_dir` entirely
+///   3. `..` component    → path traversal that escapes `save_dir`
+///   4. `.` (CurDir)      → `save_dir.join(".")` normalises back to `save_dir`,
+///                          so `name == "."` would target the save directory
+///                          itself (e.g. the user's Downloads folder).  Without
+///                          this guard the BT delete path could `remove_dir_all`
+///                          the entire save directory.
+///   5. Windows `Prefix`  → drive-relative names like `C:foo` would replace the
+///                          `save_dir` drive component.
 fn is_safe_file_name(name: &str) -> bool {
     use std::path::Component;
     if name.is_empty() {
@@ -130,9 +158,71 @@ fn is_safe_file_name(name: &str) -> bool {
     }
     let p = std::path::Path::new(name);
     !p.is_absolute()
-        && !p
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+        && !p.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir
+                    | Component::RootDir
+                    | Component::CurDir
+                    | Component::Prefix(_)
+            )
+        })
+}
+
+/// 延迟二次清理：删除任务时若等待 spawned 下载 handle 超时，下载任务可能
+/// 在首次清理之后才落盘临时/分段文件。本函数 sleep 一段时间后再次删除残留。
+///
+/// 单任务（`delete_task`）与批量（`delete_tasks_batch`）两条删除路径共用此
+/// 逻辑，确保批量删除活跃任务时不会泄漏孤立文件（F010）。
+///
+/// 行为与历史单任务 deferred 兜底保持一致：
+///   - BT：删除最终路径（文件或目录）+ task-scoped staging 目录；
+///   - 其它协议：删除 `.fdownloading` 临时文件 + 最终文件。
+/// 所有删除均为 best-effort，缺失路径静默忽略。
+async fn deferred_file_cleanup(
+    save_dir: String,
+    file_name: String,
+    url: String,
+    delete_files: bool,
+    task_id: String,
+) {
+    // 给仍在退出的下载任务留出时间落盘后再清理；2s 与单任务路径一致，
+    // 配合下载器内新增的早期 cancel 检查已能覆盖绝大多数残留窗口。
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let path = PathBuf::from(&save_dir).join(&file_name);
+    if is_bt_url(&url) {
+        if delete_files && is_safe_file_name(&file_name) {
+            if path.is_dir() {
+                let _ = tokio::fs::remove_dir_all(&path).await;
+            } else {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+        let stage_dir = bt_downloader::bt_stage_dir(&save_dir, &task_id);
+        if stage_dir.exists() {
+            log_info!(
+                "[manager] delete {} deferred: removing staging dir {}",
+                task_id,
+                stage_dir.display()
+            );
+            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        }
+    } else {
+        let temp_path = PathBuf::from(format!("{}{}", path.display(), downloader::TEMP_EXT));
+        if let Err(e) = tokio::fs::remove_file(&temp_path).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log_info!(
+                "[manager] delete {} deferred: remove temp {} failed: {}",
+                task_id,
+                temp_path.display(),
+                e
+            );
+        }
+        if delete_files && is_safe_file_name(&file_name) {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
 }
 
 /// Synchronous version of `dedup_filename` for use in the manager's
@@ -462,15 +552,20 @@ impl DownloadManager {
         self.retry_rx.take()
     }
 
-    /// 检查任务是否仍处于 error(4) 状态，供 actor loop 在自动重试前确认。
-    /// 如果用户已手动暂停/恢复/删除了该任务，返回 false 跳过重试。
+    /// 检查任务是否仍处于"可自动重试的 error(4)"状态，供 actor loop 在自动
+    /// 重试前确认。如果用户已手动暂停/恢复/删除了该任务，返回 false 跳过重试。
+    ///
+    /// 关键：取消任务复用了 status=4（见 [`CANCELLED_ERROR_MESSAGE`]）。延迟
+    /// 重试任务已 spawn 且无法 abort，若用户在延迟睡眠期间取消任务，actor loop
+    /// 仍会收到重试信号。此处显式排除 error_message 为 "cancelled" 的任务，
+    /// 防止用户明确取消的下载被自动重启。
     pub async fn is_task_in_error(&self, task_id: &str) -> bool {
         self.db
             .load_task_by_id(task_id)
             .await
             .ok()
             .flatten()
-            .map(|t| t.status == 4)
+            .map(|t| t.status == 4 && t.error_message != CANCELLED_ERROR_MESSAGE)
             .unwrap_or(false)
     }
 
@@ -654,6 +749,24 @@ impl DownloadManager {
             // Give in-flight BT download loops a moment to detect
             // cancellation and exit cleanly before we tear down the runtime.
             tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        }
+
+        // 2b. 等待仍在进行的 detached `add_torrent` 任务（如 magnet 的 DHT
+        //     元数据解析）结束后再关停。这些任务持有 `Arc<Session>`，绑定着
+        //     BT 监听端口；若在它们结束前关停并重建 session，下一次 BT 下载
+        //     会因端口仍被占用而立即失败。与 `maybe_release_bt_session` 的
+        //     inflight 检查对齐——固定 600ms 是经验值，无法保证 add_torrent
+        //     已完成，故在此显式轮询直至归零或超时。
+        if let Some(ref bt) = self.bt_session {
+            let deadline = tokio::time::Instant::now() + INVALIDATE_INFLIGHT_TIMEOUT;
+            while bt.has_inflight_adds() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(INVALIDATE_INFLIGHT_POLL_INTERVAL).await;
+            }
+            if bt.has_inflight_adds() {
+                log_info!(
+                    "[manager] invalidate: inflight add_torrent still pending after timeout, forcing shutdown"
+                );
+            }
         }
 
         // 3. Destroy the session on a background thread (block_on inside).
@@ -1130,20 +1243,35 @@ impl DownloadManager {
                             }
                         }
                         Some((3 /* STATUS_COMPLETED */, _, _, _)) => {
-                            // Case A: completed task — staging dir must be gone.
-                            // rescue_stranded_staging_files already moved any
-                            // real data; what remains is only librqbit placeholder
-                            // files (0-byte stubs) or an empty dir.
-                            log_info!(
-                                "[manager] startup cleanup: removing completed-task staging dir {}",
-                                path.display()
-                            );
-                            if let Err(e) = std::fs::remove_dir_all(&path) {
+                            // Case A: completed task — staging dir 通常应已为空。
+                            // rescue_stranded_staging_files 已迁出真实数据,剩下的一般
+                            // 只是 librqbit 占位文件(0 字节)或空目录。但若 rescue 因
+                            // 部分移动失败(权限/跨盘/IO)而保留了仍含真实数据的目录,
+                            // 这里必须同样用 has_real_data 守卫保留,否则无条件
+                            // remove_dir_all 会把这些文件永久删除(与 Case B 一致)。
+                            let has_real_data = std::fs::read_dir(&path)
+                                .map(|rd| {
+                                    rd.filter_map(|e| e.ok())
+                                        .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
+                                })
+                                .unwrap_or(false);
+                            if has_real_data {
                                 log_info!(
-                                    "[manager] startup cleanup: failed to remove completed staging dir {}: {}",
-                                    path.display(),
-                                    e
+                                    "[manager] startup cleanup: keeping completed-task staging dir {} (still has real data; rescue likely partially failed)",
+                                    path.display()
                                 );
+                            } else {
+                                log_info!(
+                                    "[manager] startup cleanup: removing completed-task staging dir {}",
+                                    path.display()
+                                );
+                                if let Err(e) = std::fs::remove_dir_all(&path) {
+                                    log_info!(
+                                        "[manager] startup cleanup: failed to remove completed staging dir {}: {}",
+                                        path.display(),
+                                        e
+                                    );
+                                }
                             }
                         }
                         Some(_) => {
@@ -1331,19 +1459,37 @@ impl DownloadManager {
             let probe_tid = queued.task_id.clone();
             let probe_url = queued.url.clone();
             let probe_name = queued.file_name.clone();
+            // F020：用任务的鉴权上下文（cookies/referrer/extra_headers）构造
+            // probe 的 RequestSpec，使背景 HEAD probe 与真正下载请求一致，
+            // 避免鉴权站点把缺鉴权的裸 HEAD 重定向到登录页污染 DB 文件名。
+            let probe_spec = downloader::RequestSpec::from_nm(&crate::native_messaging::DownloadRequest {
+                url: queued.url.clone(),
+                filename: queued.file_name.clone(),
+                referrer: queued.referrer.clone(),
+                cookies: queued.cookies.clone(),
+                headers: Some(queued.extra_headers.clone()),
+                file_size: None,
+                mime_type: None,
+                method: queued.method.clone(),
+                body: queued.body.clone(),
+            });
             self.pending_queue.push_back(queued);
             // 广播最新队列位置
             self.broadcast_queue_positions();
             // Spawn 元数据探测（后台，非阻塞）
             let probe_client = self.client.clone();
             let probe_db = self.db.clone();
-            let probe_proxy = self.proxy_config.clone();
+            // 用 resolve() 展开 System→Manual：ftp_connect_sync_with_proxy 直接读
+            // host/port，未解析的 System 代理 host/port 为空会被静默降级直连。实际
+            // 下载路径(do_start_task/do_resume_task)均调 .resolve()，后台探测须对齐。
+            let probe_proxy = self.proxy_config.resolve();
             tokio::spawn(async move {
                 let (name, size) = crate::meta_prober::probe_task_meta(
                     &probe_url,
                     &probe_name,
                     &probe_client,
                     &probe_proxy,
+                    &probe_spec,
                 )
                 .await;
                 if !name.is_empty() || size > 0 {
@@ -1646,11 +1792,28 @@ impl DownloadManager {
                 // Step 1b: DB 中也没有名字（未排队，或背景 probe 未完成/失败）
                 // → 在此 await 一次 probe。注意此 .await 在同步预订段之前，
                 // 不会破坏 dedup+insert 的原子性。
+                //
+                // F020：probe 携带任务的鉴权上下文（cookies/referrer/extra_headers），
+                // 与下方真正下载用的 `spec` 同源，避免鉴权站点把缺鉴权的裸 HEAD
+                // 重定向到登录页、用错误页的 Content-Disposition 污染文件名。
+                let probe_spec =
+                    downloader::RequestSpec::from_nm(&crate::native_messaging::DownloadRequest {
+                        url: url.clone(),
+                        filename: file_name.clone(),
+                        referrer: referrer.clone(),
+                        cookies: cookies.clone(),
+                        headers: Some(extra_headers.clone()),
+                        file_size: None,
+                        mime_type: None,
+                        method: method.clone(),
+                        body: body.clone(),
+                    });
                 let (probed_name, _probed_size) = crate::meta_prober::probe_task_meta(
                     &url,
                     &file_name,
                     &task_client,
                     &task_proxy,
+                    &probe_spec,
                 )
                 .await;
                 if !probed_name.is_empty() {
@@ -1665,7 +1828,50 @@ impl DownloadManager {
                 }
             }
 
-            // Step 2: 同步原子段——dedup + insert reserved。无 .await！
+            // HLS：在 dedup + 预订之前把名称归一化为 .ts，使 manager 级 dedup 和
+            // reserved_temp_paths 预订都基于 HLS 下载器最终的落盘名。否则不同前缀名
+            // （clip.m3u8 / clip.mp4）会在 HLS 下载器内 force_ts 后塌缩为同一 clip.ts，
+            // 绕过 manager dedup，导致两个任务静默覆盖同一文件。force_ts_extension
+            // 幂等；HLS 下载器内仍保留幂等的 force_ts 作为兜底/续传安全网。
+            //
+            // 即使 probe 后 file_name 仍为空，也用 URL 末段兜底出与 HLS 下载器空名
+            // 分支一致的名称（extract_from_url + force_ts），使空名 HLS 任务也纳入
+            // dedup + 预订协调——否则两个同源、均探测不到名的并发 HLS 任务会各自
+            // 塌缩为同一 .ts 并互相 truncate/交错写入而损坏内容。
+            if hls_downloader::is_hls_url(&url) {
+                let base = if file_name.is_empty() {
+                    downloader::extract_from_url(&url)
+                        .unwrap_or_else(|| "download.ts".to_string())
+                } else {
+                    file_name.clone()
+                };
+                let ts_name = hls_downloader::force_ts_extension(&base);
+                if ts_name != file_name {
+                    file_name = ts_name;
+                    let _ = self.db.update_task_file_name(&task_id, &file_name).await;
+                }
+            }
+
+            // DASH：probe 后仍空名时,用 URL 末段兜底为 .mp4(与 DASH 下载器空名分支
+            // 一致),使空名 DASH 任务也纳入 dedup + 预订协调,避免两个同源、均探测不到
+            // 名的并发 DASH 任务塌缩到同一 .mp4 路径互相覆盖。非空名 DASH 下载器原样
+            // 使用 p.file_name(不强制扩展名),故此处仅处理空名,不改非空名。
+            if file_name.is_empty() && dash_downloader::is_dash_url(&url) {
+                let url_name = downloader::extract_from_url(&url)
+                    .unwrap_or_else(|| "download.mpd".to_string());
+                file_name = match url_name.rfind('.') {
+                    Some(pos) => format!("{}.mp4", &url_name[..pos]),
+                    None => format!("{}.mp4", url_name),
+                };
+                let _ = self.db.update_task_file_name(&task_id, &file_name).await;
+            }
+
+            // Step 2: dedup + insert reserved。
+            // dedup_filename_sync 本身是同步的；仅当 dedup 改名时有一次
+            // update_task_file_name 落库 .await（须在 insert 前完成，否则 spawned
+            // task 可能用到旧名）。do_start_task 持有 &mut self 且运行于
+            // current_thread runtime，同一时刻只有一个实例执行，故
+            // dedup→落库→insert 之间不会与兄弟任务的预订交错，无竞态。
             // 此时 self.reserved_temp_paths 中只有兄弟任务的预订，不包含自己，
             // 因此不会出现"自我冲突"。
             let reserved_temp_path: Option<std::path::PathBuf> = if !file_name.is_empty() {
@@ -1942,6 +2148,9 @@ impl DownloadManager {
                     method: None, // 不持久化 method/body，恢复时按 GET 重发
                     body: None,
                 });
+                // 入队后立即广播最新队列位置(与 create_task 一致),否则要等后续
+                // drain_queue 才广播,期间 UI 显示过时的排队位置。
+                self.broadcast_queue_positions();
             }
         }
     }
@@ -2285,9 +2494,16 @@ impl DownloadManager {
     }
 
     pub async fn cancel_task(&mut self, task_id: &str) {
+        // 清除自动重试计数，与 delete_task / resume_task 对齐。取消是用户的
+        // 明确意图，必须从自动重试状态中移除，使后续 create/resume 干净起步。
+        self.auto_retry_counts.remove(task_id);
+
         // Remove from pending queue if queued.
         if let Some(pos) = self.pending_queue.iter().position(|q| q.task_id == task_id) {
             self.pending_queue.remove(pos);
+            // 移除排队任务后立即广播,使其余排队任务位置实时前移(与 pause_task/
+            // delete_tasks_batch 一致;否则要等后续 drain_queue 期间 UI 显示过时位置)。
+            self.broadcast_queue_positions();
         }
 
         if let Some(entry) = self.active_tasks.remove(task_id) {
@@ -2306,7 +2522,10 @@ impl DownloadManager {
             }
         }
 
-        let _ = self.db.update_task_status(task_id, 4, "cancelled").await;
+        let _ = self
+            .db
+            .update_task_status(task_id, 4, CANCELLED_ERROR_MESSAGE)
+            .await;
 
         // Send update with actual task info if available
         let (file_name, save_dir, url) = match self.db.load_task_by_id(task_id).await {
@@ -2323,7 +2542,7 @@ impl DownloadManager {
             file_name,
             save_dir,
             url,
-            error_message: "cancelled".to_string(),
+            error_message: CANCELLED_ERROR_MESSAGE.to_string(),
         }
         .send_signal_to_dart();
 
@@ -2344,6 +2563,8 @@ impl DownloadManager {
         // Remove from pending queue if queued.
         if let Some(pos) = self.pending_queue.iter().position(|q| q.task_id == task_id) {
             self.pending_queue.remove(pos);
+            // 移除排队任务后立即广播剩余排队任务位置(与 delete_tasks_batch 一致)。
+            self.broadcast_queue_positions();
         }
 
         // Cancel the active download (if any) and wait for the spawned task
@@ -2354,11 +2575,20 @@ impl DownloadManager {
         } else {
             None
         };
-        let handle_timed_out = if let Some(handle) = maybe_handle {
+        let handle_timed_out = if let Some(mut handle) = maybe_handle {
             // Timeout guard: don't block forever if the task misbehaves.
-            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
-                .await
-                .is_err()
+            // 取 `&mut handle` 使超时后仍能 abort：纯 async 的 HTTP/coordinator
+            // 任务会在下一个 await 点立即取消，比单纯 drop(detach) 更快释放
+            // 连接/文件句柄，避免被删任务在我们清理文件后又写回孤立文件。
+            // 对 BT/FTP 的 spawn_blocking 内层阻塞线程，abort 外层 future 不影响
+            // 阻塞线程本身，仍依赖 cancel_token + 下方 deferred_cleanup 兜底。
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
+                Ok(_) => false,
+                Err(_) => {
+                    handle.abort();
+                    true
+                }
+            }
         } else {
             false
         };
@@ -2382,6 +2612,13 @@ impl DownloadManager {
                     t.url.clone(),
                     delete_files,
                 ));
+                // handle 被 abort 时 spawned task 的 TaskDone 不会发出,on_task_done
+                // 无法释放 reserved_temp_paths 预订。此处按 DB 中(已 dedup 落库的)
+                // file_name 重建预订路径并主动移除,避免残留到进程重启(否则后续同名
+                // 下载会被误判为占用而 dedup 改名)。HashSet::remove 幂等无副作用。
+                let reserved = PathBuf::from(&t.save_dir)
+                    .join(format!("{}{}", t.file_name, downloader::TEMP_EXT));
+                self.reserved_temp_paths.remove(&reserved);
             }
             let path = PathBuf::from(&t.save_dir).join(&t.file_name);
 
@@ -2493,48 +2730,9 @@ impl DownloadManager {
         // 下载器中新增的早期 cancel 检查已大幅缩小竞争窗口，此处为兜底保护。
         if let Some((save_dir, file_name, url, del_files)) = deferred_cleanup {
             let tid = task_id.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let path = PathBuf::from(&save_dir).join(&file_name);
-                if is_bt_url(&url) {
-                    if del_files && is_safe_file_name(&file_name) {
-                        if path.is_dir() {
-                            let _ = tokio::fs::remove_dir_all(&path).await;
-                        } else {
-                            let _ = tokio::fs::remove_file(&path).await;
-                        }
-                    }
-                    // Also clean up the task-scoped staging directory in the
-                    // deferred path: if the handle timed out the download task
-                    // may still be writing into the staging dir, so we give it
-                    // 2 s (the sleep above) before attempting removal.
-                    let stage_dir = bt_downloader::bt_stage_dir(&save_dir, &tid);
-                    if stage_dir.exists() {
-                        log_info!(
-                            "[manager] delete_task {} deferred: removing staging dir {}",
-                            tid,
-                            stage_dir.display()
-                        );
-                        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
-                    }
-                } else {
-                    let temp_path =
-                        PathBuf::from(format!("{}{}", path.display(), crate::downloader::TEMP_EXT));
-                    if let Err(e) = tokio::fs::remove_file(&temp_path).await
-                        && e.kind() != std::io::ErrorKind::NotFound
-                    {
-                        log_info!(
-                            "[manager] delete_task {} deferred: remove temp {} failed: {}",
-                            tid,
-                            temp_path.display(),
-                            e
-                        );
-                    }
-                    if del_files && is_safe_file_name(&file_name) {
-                        let _ = tokio::fs::remove_file(&path).await;
-                    }
-                }
-            });
+            tokio::spawn(deferred_file_cleanup(
+                save_dir, file_name, url, del_files, tid,
+            ));
         }
 
         // Bug 4 修复：被删除的任务从 auto_paused_ids 中移除，
@@ -2573,6 +2771,10 @@ impl DownloadManager {
         // 1. Remove from pending queue in one pass.
         self.pending_queue
             .retain(|q| !id_set.contains(q.task_id.as_str()));
+        // 队列变更后立即广播剩余排队任务的最新位置(与 pause_task 一致),否则要等到
+        // 后续 drain_queue 才广播,中间历经 handle 取消+文件清理(最长 15s)期间 UI
+        // 会显示过时的队列位置。broadcast_queue_positions 是只读广播,无副作用。
+        self.broadcast_queue_positions();
 
         // 2. Cancel all active downloads + collect (task_id, JoinHandle) pairs.
         //    We pair each handle with its task ID so we can send per-task
@@ -2625,12 +2827,26 @@ impl DownloadManager {
                     // case path == save_dir and path.parent() would be the
                     // *parent* of save_dir — wrong).
                     let save_dir_owned = t.save_dir.clone();
+                    // 供 handle 超时后的延迟二次清理使用（F010）。
+                    let file_name_owned = t.file_name.clone();
+                    let url_owned = t.url.clone();
                     cleanup_futs.push(tokio::spawn(async move {
                         // Wait for this task's download handle (10s per-task timeout).
-                        if let Some(h) = maybe_handle {
-                            let _ =
-                                tokio::time::timeout(std::time::Duration::from_secs(10), h).await;
-                        }
+                        // 超时后 abort 外层 future，加速纯 async 任务释放连接/句柄，
+                        // 与 delete_task 单任务路径一致（F011）。
+                        let handle_timed_out = if let Some(mut h) = maybe_handle {
+                            if tokio::time::timeout(std::time::Duration::from_secs(10), &mut h)
+                                .await
+                                .is_err()
+                            {
+                                h.abort();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
                         // BT session delete
                         if let Some(ref bt) = bt_session {
                             let found = bt.delete_task(&tid_owned, delete_files).await;
@@ -2669,7 +2885,7 @@ impl DownloadManager {
                         // Signal completion
                         let _ = ptx
                             .send(ProgressUpdate {
-                                task_id: tid_owned,
+                                task_id: tid_owned.clone(),
                                 downloaded_bytes: 0,
                                 total_bytes: 0,
                                 status: 4,
@@ -2678,16 +2894,40 @@ impl DownloadManager {
                                 segment_details: None,
                             })
                             .await;
+                        // F010：handle 超时时下载任务可能仍在写盘，延迟二次清理
+                        // 兜底孤立的最终文件/staging 目录，与单任务路径一致。
+                        if handle_timed_out {
+                            tokio::spawn(deferred_file_cleanup(
+                                save_dir_owned,
+                                file_name_owned,
+                                url_owned,
+                                delete_files,
+                                tid_owned,
+                            ));
+                        }
                     }));
                 } else {
                     let url = t.url.clone();
                     let file_name = t.file_name.clone();
+                    // 供 handle 超时后的延迟二次清理使用（F010）。
+                    let save_dir_owned = t.save_dir.clone();
                     cleanup_futs.push(tokio::spawn(async move {
                         // Wait for this task's download handle (10s per-task timeout).
-                        if let Some(h) = maybe_handle {
-                            let _ =
-                                tokio::time::timeout(std::time::Duration::from_secs(10), h).await;
-                        }
+                        // 超时后 abort 外层 future，加速纯 async 任务释放连接/句柄，
+                        // 与 delete_task 单任务路径一致（F011）。
+                        let handle_timed_out = if let Some(mut h) = maybe_handle {
+                            if tokio::time::timeout(std::time::Duration::from_secs(10), &mut h)
+                                .await
+                                .is_err()
+                            {
+                                h.abort();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
                         let Ok(_permit) = sem.acquire().await else {
                             return;
                         };
@@ -2738,7 +2978,7 @@ impl DownloadManager {
                         // Signal completion
                         let _ = ptx
                             .send(ProgressUpdate {
-                                task_id: tid_owned,
+                                task_id: tid_owned.clone(),
                                 downloaded_bytes: 0,
                                 total_bytes: 0,
                                 status: 4,
@@ -2747,14 +2987,31 @@ impl DownloadManager {
                                 segment_details: None,
                             })
                             .await;
+                        // F010：handle 超时时下载任务可能仍在写临时文件，延迟
+                        // 二次清理兜底，与单任务路径一致。
+                        if handle_timed_out {
+                            tokio::spawn(deferred_file_cleanup(
+                                save_dir_owned,
+                                file_name,
+                                url,
+                                delete_files,
+                                tid_owned,
+                            ));
+                        }
                     }));
                 }
             } else {
                 // Task NOT in DB (already cleaned / no record) — just wait
                 // for handle (if any) then signal immediately.
                 cleanup_futs.push(tokio::spawn(async move {
-                    if let Some(h) = maybe_handle {
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), h).await;
+                    // 超时后 abort，与其它清理路径一致（F011）。
+                    if let Some(mut h) = maybe_handle {
+                        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut h)
+                            .await
+                            .is_err()
+                        {
+                            h.abort();
+                        }
                     }
                     let _ = ptx
                         .send(ProgressUpdate {
@@ -2891,6 +3148,9 @@ impl DownloadManager {
                 method: None,
                 body: None,
             });
+            // 入队后立即广播最新队列位置(覆盖单个 resume 与 batch_resume 批量入队;
+            // broadcast_queue_positions 为只读信号,多次调用无副作用)。
+            self.broadcast_queue_positions();
         }
     }
 
@@ -3061,6 +3321,16 @@ impl DownloadManager {
         // queue limiter takes effect on next resume.
         if let Some(entry) = self.active_tasks.get_mut(&task_id) {
             entry.queue_id = queue_id.clone();
+        }
+        // 若任务仍在 pending_queue 等待中,同步更新其 queue_id;否则 drain_queue 会用
+        // 陈旧 queue_id 做 has_queue_capacity 门控,do_start_task 又据其选定限速器与
+        // 写入 active 条目,导致任务实际跑在旧队列下、并发/限速归错队列且与 DB/UI 不一致。
+        // task_id 在 pending_queue 中唯一(入队前有去重守卫),命中即可 break。
+        for entry in self.pending_queue.iter_mut() {
+            if entry.task_id == task_id {
+                entry.queue_id = queue_id.clone();
+                break;
+            }
         }
         log_info!("[manager] moved task {} to queue '{}'", task_id, queue_id);
         self.send_all_queues().await;
@@ -3467,7 +3737,12 @@ pub async fn progress_reporter(mut rx: mpsc::Receiver<ProgressUpdate>, db: Db) {
                 let tid = update.task_id.clone();
                 let dl = update.downloaded_bytes;
                 tokio::spawn(async move {
-                    let _ = db_clone.update_task_progress(&tid, dl).await;
+                    // F009：单调写入。fire-and-forget 的 status=1 进度写入与下方
+                    // awaited 的 status=3 完成写入竞争同一把 DB Connection 锁，
+                    // 落库顺序不确定。一个先发起、携带中途较小 downloaded_bytes
+                    // 的后台写入可能在完成写入之后才抢到锁，把 100% 覆盖回中途值。
+                    // 用 MAX 语义的单调写入彻底消除该顺序依赖（进度只前进不回退）。
+                    let _ = db_clone.update_task_progress_monotonic(&tid, dl).await;
                 });
                 *task_last_save = now;
             }
@@ -3482,8 +3757,12 @@ pub async fn progress_reporter(mut rx: mpsc::Receiver<ProgressUpdate>, db: Db) {
         // the final values are persisted before we clean up state.
         if update.status == 3 {
             if update.downloaded_bytes > 0 {
+                // F009：同样走单调写入。完成写入是该任务进度的最终权威值
+                // （= 文件总大小），用 MAX 语义后，任何在其之后才落库的陈旧
+                // status=1 后台写入（携带更小的中途值）都会被钳制为 no-op，
+                // 不会把已显示的 100% 覆盖回中途进度。
                 let _ = db
-                    .update_task_progress(&update.task_id, update.downloaded_bytes)
+                    .update_task_progress_monotonic(&update.task_id, update.downloaded_bytes)
                     .await;
             }
             // Use total_bytes when available; fall back to downloaded_bytes
@@ -3509,5 +3788,62 @@ pub async fn progress_reporter(mut rx: mpsc::Receiver<ProgressUpdate>, db: Db) {
             last_dart_send.remove(&update.task_id);
             last_db_save.remove(&update.task_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F042 回归：`is_safe_file_name` 必须拒绝所有会使
+    /// `save_dir.join(name)` 退化为 `save_dir` 本身或逃逸出 `save_dir` 的输入。
+    /// 尤其是 `"."`（CurDir），历史上被漏判为安全，可导致 BT 删除路径
+    /// `remove_dir_all` 整个保存目录。
+    #[test]
+    fn is_safe_file_name_rejects_dangerous_names() {
+        // 危险输入：必须返回 false。
+        assert!(!is_safe_file_name(""), "empty string must be rejected");
+        assert!(!is_safe_file_name("."), "CurDir must be rejected (F042)");
+        assert!(!is_safe_file_name(".."), "ParentDir must be rejected");
+        assert!(
+            !is_safe_file_name("../escape.txt"),
+            "leading parent traversal must be rejected"
+        );
+        assert!(
+            !is_safe_file_name("foo/../bar"),
+            "embedded parent traversal must be rejected"
+        );
+        assert!(
+            !is_safe_file_name("./file.txt"),
+            "leading CurDir must be rejected"
+        );
+        #[cfg(unix)]
+        assert!(
+            !is_safe_file_name("/etc/passwd"),
+            "absolute path must be rejected"
+        );
+    }
+
+    /// 合法的单段文件名（含中文、空格、点号扩展名）必须仍判为安全，
+    /// 确保 F042 的收紧没有误伤正常下载文件名。
+    #[test]
+    fn is_safe_file_name_accepts_normal_names() {
+        assert!(is_safe_file_name("movie.mp4"));
+        assert!(is_safe_file_name("我的文件 (1).zip"));
+        assert!(is_safe_file_name("archive.tar.gz"));
+        assert!(is_safe_file_name("name_without_ext"));
+        // BT 单顶层目录名（无分隔符）仍是合法的直接子项。
+        assert!(is_safe_file_name("My Torrent Folder"));
+    }
+
+    /// F041 守卫前提：取消标记不能被 `is_retriable_error` 误判为可重试。
+    /// 否则 `on_task_done` 会为取消任务自发 spawn 重试，绕过
+    /// `is_task_in_error` 守卫。此测试锁定该不变量。
+    #[test]
+    fn cancelled_marker_is_not_retriable() {
+        assert!(
+            !is_retriable_error(CANCELLED_ERROR_MESSAGE),
+            "cancelled tasks must never be treated as retriable network errors"
+        );
     }
 }

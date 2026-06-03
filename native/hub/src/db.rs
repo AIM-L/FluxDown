@@ -169,6 +169,41 @@ impl Db {
         .await?
     }
 
+    /// 单调进度写入：`downloaded_bytes` 只增不减（SQL 用 `MAX` 钳制）。
+    ///
+    /// 与 [`update_task_progress`](Self::update_task_progress) 的唯一区别是 SQL
+    /// 用 `MAX(downloaded_bytes, ?1)` 而非直接赋值，因此 DB 中的进度只会前进、
+    /// 永不回退。
+    ///
+    /// **动机（F009）**：`progress_reporter` 中 status=1 的进度写入是
+    /// fire-and-forget（spawn 后不 await），与 status=3 完成时 awaited 的最终
+    /// 写入竞争同一把 `Arc<Mutex<Connection>>` 锁，落库先后顺序不确定。一个先
+    /// 发起、携带中途较小 `downloaded_bytes` 的后台写入可能在完成写入之后才抢
+    /// 到锁，把 DB 里的 100% 覆盖回中途值，导致重启后进度倒退。单调写入消除了
+    /// 这一顺序依赖。
+    ///
+    /// **不可替代 `update_task_progress`**：downloader / ftp_downloader 在切多段
+    /// →单流重下、`File::create` 从头开始时会主动传入 `0` 复位进度；若把那条
+    /// 路径也改成 `MAX`，复位会退化成 no-op、残留陈旧高值。因此这里必须是独立
+    /// 的新方法，仅供 `progress_reporter` 这类“只前进”的场景使用。
+    pub async fn update_task_progress_monotonic(
+        &self,
+        id: &str,
+        downloaded_bytes: i64,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|_| DbError::LockPoisoned)?;
+            conn.execute(
+                "UPDATE tasks SET downloaded_bytes = MAX(downloaded_bytes, ?1) WHERE id = ?2",
+                params![downloaded_bytes, id],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
     pub async fn update_task_status(
         &self,
         id: &str,
@@ -1702,6 +1737,94 @@ mod tests {
             "2-byte drift on 100-byte file must exceed 1-byte floor threshold"
         );
         assert_eq!(effective, probed);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // update_task_progress_monotonic (F009)
+    // -----------------------------------------------------------------------
+
+    /// 单调写入只前进：先写大值再写小值，DB 须保留大值（MAX 钳制）。
+    /// 复现 F009 的核心场景——陈旧的 status=1 中途写入晚于完成写入落库时，
+    /// 不得把已落库的 100% 覆盖回中途值。
+    #[tokio::test]
+    async fn progress_monotonic_does_not_regress() {
+        let (db, dir) = open_test_db();
+        insert_task_with_size(&db, "m1", 1000).await;
+
+        // 完成写入：最终权威值。
+        db.update_task_progress_monotonic("m1", 1000)
+            .await
+            .expect("monotonic write 1000");
+        // 陈旧的中途写入晚到——必须被钳制为 no-op。
+        db.update_task_progress_monotonic("m1", 300)
+            .await
+            .expect("monotonic write 300");
+
+        let task = db
+            .load_task_by_id("m1")
+            .await
+            .expect("load")
+            .expect("task exists");
+        assert_eq!(
+            task.downloaded_bytes, 1000,
+            "陈旧的较小进度写入不得覆盖已落库的较大值"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 单调写入对更大的值仍正常前进。
+    #[tokio::test]
+    async fn progress_monotonic_advances_forward() {
+        let (db, dir) = open_test_db();
+        insert_task_with_size(&db, "m2", 1000).await;
+
+        db.update_task_progress_monotonic("m2", 200)
+            .await
+            .expect("monotonic write 200");
+        db.update_task_progress_monotonic("m2", 800)
+            .await
+            .expect("monotonic write 800");
+
+        let task = db
+            .load_task_by_id("m2")
+            .await
+            .expect("load")
+            .expect("task exists");
+        assert_eq!(
+            task.downloaded_bytes, 800,
+            "更大的进度值必须正常写入"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 非单调的 `update_task_progress` 必须仍能复位到 0（验证两方法语义不同：
+    /// downloader/ftp 的从头重下依赖此行为，不可被 MAX 语义破坏）。
+    #[tokio::test]
+    async fn plain_progress_can_reset_to_zero() {
+        let (db, dir) = open_test_db();
+        insert_task_with_size(&db, "m3", 1000).await;
+
+        db.update_task_progress_monotonic("m3", 900)
+            .await
+            .expect("monotonic write 900");
+        // 普通写入复位到 0（切多段→单流重下场景）。
+        db.update_task_progress("m3", 0)
+            .await
+            .expect("plain reset to 0");
+
+        let task = db
+            .load_task_by_id("m3")
+            .await
+            .expect("load")
+            .expect("task exists");
+        assert_eq!(
+            task.downloaded_bytes, 0,
+            "update_task_progress 必须能把进度复位到 0（不被 MAX 钳制）"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

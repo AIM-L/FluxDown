@@ -64,7 +64,7 @@ fn cookies_for_url<'a>(playlist_url: &str, target_url: &str, cookies: &'a str) -
 const MAX_RETRIES: u32 = 3;
 const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-fn force_ts_extension(name: &str) -> String {
+pub(crate) fn force_ts_extension(name: &str) -> String {
     if let Some(dot_pos) = name.rfind('.') {
         format!("{}.ts", &name[..dot_pos])
     } else {
@@ -186,6 +186,12 @@ pub async fn parse_m3u8(
     req = crate::downloader::apply_extra_headers(req, extra_headers);
 
     let resp = req.send().await?.error_for_status()?;
+    // 相对 URI 必须以"最终检索到的资源 URL"为 base 解析(RFC 3986 §5.1)。
+    // reqwest 默认跟随重定向(见 downloader.rs),播放列表被负载均衡/短链
+    // 重定向时,请求 url 与实际返回内容的 URL 不同;若仍用请求前的 url 作
+    // base,会把相对段/密钥 URI 拼到错误的主机/路径。无重定向时
+    // base_url == url,行为不变。与同仓 downloader.rs 既定做法对齐。
+    let base_url = resp.url().to_string();
     let bytes = resp.bytes().await?;
 
     let (_remaining, playlist) = m3u8_rs::parse_playlist(&bytes)
@@ -201,7 +207,7 @@ pub async fn parse_m3u8(
                     HlsVariant {
                         bandwidth: v.bandwidth,
                         resolution,
-                        uri: resolve_uri(url, &v.uri),
+                        uri: resolve_uri(&base_url, &v.uri),
                     }
                 })
                 .collect();
@@ -227,7 +233,7 @@ pub async fn parse_m3u8(
                     current_key = match &key.method {
                         &m3u8_rs::KeyMethod::AES128 => {
                             let key_uri = match key.uri.as_ref() {
-                                Some(u) if !u.is_empty() => resolve_uri(url, u),
+                                Some(u) if !u.is_empty() => resolve_uri(&base_url, u),
                                 _ => {
                                     return Err(DownloadError::Other(
                                         "AES-128 KEY tag missing URI".to_string(),
@@ -267,7 +273,7 @@ pub async fn parse_m3u8(
                 });
 
                 segments.push(HlsSegment {
-                    uri: resolve_uri(url, &seg.uri),
+                    uri: resolve_uri(&base_url, &seg.uri),
                     duration: seg.duration,
                     key: seg_key,
                 });
@@ -293,10 +299,13 @@ pub async fn parse_m3u8(
 // ---------------------------------------------------------------------------
 
 use aes::Aes128;
-use cbc::cipher::block_padding::Pkcs7;
+use cbc::cipher::block_padding::{NoPadding, Pkcs7};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
+
+/// AES block size in bytes (AES-128-CBC operates on 16-byte blocks).
+const AES_BLOCK_SIZE: usize = 16;
 
 /// Fetch an AES-128 key from the given URI, with caching.
 async fn fetch_key(
@@ -357,6 +366,26 @@ fn parse_iv_hex(iv_str: &str) -> Result<[u8; 16], DownloadError> {
     Ok(iv)
 }
 
+/// Parse an HLS resume checkpoint string.
+///
+/// 支持的格式(向后兼容):
+/// - `"idx:byte_offset:media_sequence"`(当前)
+/// - `"idx:byte_offset"`(旧,media_sequence 视为未知 → `None`)
+/// - `"idx"`(更早,byte_offset 视为 0)
+///
+/// 返回 `(saved_idx, saved_bytes, saved_media_seq)`;无法解析 idx 时返回
+/// `(0, 0, None)`(等同于不 resume)。
+fn parse_resume_checkpoint(s: &str) -> (usize, i64, Option<u64>) {
+    let mut parts = s.splitn(3, ':');
+    let idx = parts.next().and_then(|p| p.parse().ok());
+    let Some(idx) = idx else {
+        return (0, 0, None);
+    };
+    let bytes = parts.next().and_then(|b| b.parse().ok()).unwrap_or(0i64);
+    let media_seq = parts.next().and_then(|m| m.parse::<u64>().ok());
+    (idx, bytes, media_seq)
+}
+
 /// Compute the default IV from media_sequence + segment_index.
 /// IV = (media_sequence + segment_index) as 128-bit big-endian.
 fn compute_default_iv(media_sequence: u64, segment_index: usize) -> [u8; 16] {
@@ -368,18 +397,67 @@ fn compute_default_iv(media_sequence: u64, segment_index: usize) -> [u8; 16] {
 }
 
 /// Decrypt AES-128-CBC encrypted segment data in-place.
+///
 /// Returns the decrypted data (may be shorter than input due to PKCS7 padding removal).
-fn decrypt_segment(data: &mut [u8], key: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, DownloadError> {
+///
+/// RFC 8216 要求 AES-128-CBC 段使用 PKCS7 填充,故首选 Pkcs7 解密。但现实中
+/// 存在两类合规变体:某些 CDN/编码器(尤其转封装管线)产出"无填充"的密文,
+/// 其总长度可能不是 16 的倍数 —— 此时 Pkcs7 解密必然失败,但数据本身有效。
+/// 因此:
+/// - 当 `data.len() % 16 != 0`(段本身非块对齐,说明源省略了填充):用
+///   NoPadding 解密前 `(len/16)*16` 字节,尾部不足一块的字节丢弃。
+/// - 当 `data.len() % 16 == 0` 但 Pkcs7 失败:**不** fallback,保留报错。
+///   对齐却解不开通常意味着密钥/IV 错误,fallback 会掩盖真实解密失败、
+///   产出垃圾数据。
+///
+/// `seg_idx` 仅用于在出错时给出可诊断的段索引。
+fn decrypt_segment(
+    data: &mut [u8],
+    key: &[u8],
+    iv: &[u8; 16],
+    seg_idx: usize,
+) -> Result<Vec<u8>, DownloadError> {
     let key_array: [u8; 16] = key
         .try_into()
         .map_err(|_| DownloadError::Other("AES key must be 16 bytes".to_string()))?;
 
+    // 非块对齐:源省略了 PKCS7 填充。用 NoPadding 解密对齐前缀,丢弃尾部
+    // 不足一块的残余字节(它们无法构成完整密文块)。
+    if data.len() % AES_BLOCK_SIZE != 0 {
+        let aligned = (data.len() / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+        if aligned == 0 {
+            return Err(DownloadError::Other(format!(
+                "decrypt_segment: segment {} too short to decrypt ({} bytes, < one AES block)",
+                seg_idx,
+                data.len()
+            )));
+        }
+        let decryptor = Aes128CbcDec::new_from_slices(&key_array, iv)
+            .map_err(|e| DownloadError::Other(format!("AES init error: {}", e)))?;
+        let decrypted = decryptor
+            .decrypt_padded_mut::<NoPadding>(&mut data[..aligned])
+            .map_err(|e| {
+                DownloadError::Other(format!(
+                    "decrypt_segment: segment {} NoPadding decrypt error: {}",
+                    seg_idx, e
+                ))
+            })?;
+        return Ok(decrypted.to_vec());
+    }
+
+    // 块对齐:按 RFC 8216 用 PKCS7 解密。失败不 fallback,直接报错(疑似
+    // 密钥/IV 错误),避免掩盖真实解密失败。
     let decryptor = Aes128CbcDec::new_from_slices(&key_array, iv)
         .map_err(|e| DownloadError::Other(format!("AES init error: {}", e)))?;
 
     let decrypted = decryptor
         .decrypt_padded_mut::<Pkcs7>(data)
-        .map_err(|e| DownloadError::Other(format!("AES decrypt error: {}", e)))?;
+        .map_err(|e| {
+            DownloadError::Other(format!(
+                "decrypt_segment: segment {} PKCS7 decrypt error (likely wrong key/IV): {}",
+                seg_idx, e
+            ))
+        })?;
 
     Ok(decrypted.to_vec())
 }
@@ -593,7 +671,14 @@ async fn run_hls_download_inner(
     // Parse the M3U8 playlist
     let content = parse_m3u8(&p.client, &p.url, &p.cookies, &p.extra_headers).await?;
 
-    let (segments, media_sequence) = match content {
+    // media_playlist_url 是"实际列出 segment/key 的播放列表 URL"：
+    // master→media 两级结构里是选中的 media playlist(selected_uri),
+    // 直接 media 路径里就是 p.url 本身。段/密钥的同源 cookie 判定必须以
+    // 它为基准——master 与 media playlist 经常跨主机(master 在主域、
+    // media+segments+key 在 CDN),用 master URL 判同源会错误剥离 CDN
+    // 鉴权 cookie 导致 403/401。直接 media 路径下 media_playlist_url==p.url,
+    // 行为不变。
+    let (segments, media_sequence, media_playlist_url) = match content {
         M3u8Content::Master { variants } => {
             let selected_uri =
                 select_variant(&p.task_id, &variants, quality_rx, &p.cancel_token).await?;
@@ -602,14 +687,19 @@ async fn run_hls_download_inner(
                 return Err(DownloadError::Cancelled);
             }
 
+            // 拉取所选 variant 时按同源过滤 cookie：selected_uri 可能指向
+            // 与 p.url 不同源的 CDN，无条件透传 p.cookies 会把用户为原站点
+            // 提供的会话/鉴权令牌泄露给第三方。与 fetch_key/download_segment
+            // 的同源策略保持一致。
+            let variant_cookies = cookies_for_url(&p.url, &selected_uri, &p.cookies);
             let media_content =
-                parse_m3u8(&p.client, &selected_uri, &p.cookies, &p.extra_headers).await?;
+                parse_m3u8(&p.client, &selected_uri, variant_cookies, &p.extra_headers).await?;
             match media_content {
                 M3u8Content::Media {
                     segments,
                     total_duration: _,
                     media_sequence,
-                } => (segments, media_sequence),
+                } => (segments, media_sequence, selected_uri),
                 M3u8Content::Master { .. } => {
                     return Err(DownloadError::Other(
                         "nested master playlist not supported".to_string(),
@@ -621,7 +711,7 @@ async fn run_hls_download_inner(
             segments,
             total_duration: _,
             media_sequence,
-        } => (segments, media_sequence),
+        } => (segments, media_sequence, p.url.clone()),
     };
 
     let segment_count = segments.len();
@@ -690,32 +780,62 @@ async fn run_hls_download_inner(
     // If so, skip already-downloaded segments and open the temp file in append mode.
     let resume_seg_key = format!("hls_resume_{}", p.task_id);
     let (mut file, skip_segments, mut downloaded_bytes) = if p.is_resume {
-        // Parse checkpoint: new format is "idx:byte_offset", old format is just "idx".
-        // Old markers without ':' get saved_bytes = 0 (no truncation — same as before).
-        let (saved_idx, saved_bytes): (usize, i64) =
+        // Parse checkpoint. 当前格式 "idx:byte_offset:media_sequence";
+        // 向后兼容旧格式 "idx:byte_offset"(缺 media_sequence 视为未知)与
+        // 更早的 "idx"(缺 byte_offset 视为 0,不截断)。
+        //
+        // saved_media_seq = None 表示该字段未知(旧 checkpoint)。
+        let (saved_idx, saved_bytes, saved_media_seq): (usize, i64, Option<u64>) =
             p.db.get_config(&resume_seg_key)
                 .await
                 .ok()
                 .flatten()
-                .and_then(|s| {
-                    let mut parts = s.splitn(2, ':');
-                    let idx = parts.next()?.parse().ok()?;
-                    let bytes = parts.next().and_then(|b| b.parse().ok()).unwrap_or(0i64);
-                    Some((idx, bytes))
-                })
-                .unwrap_or((0, 0));
+                .map(|s| parse_resume_checkpoint(&s))
+                .unwrap_or((0, 0, None));
+
+        // IV 计算(无显式 IV 的加密段)依赖 media_sequence。若服务器在两次
+        // 抓取之间重写了 EXT-X-MEDIA-SEQUENCE(VOD 被 CDN 重新生成等),已
+        // 跳过的段与新解析的 media_sequence 组合会让续传段用错 IV,解密出
+        // 垃圾数据。检测到不一致时放弃 resume,走全量重下保证 IV 与首次一致。
+        // 旧格式 checkpoint(saved_media_seq=None)无法判断服务器是否改写了
+        // EXT-X-MEDIA-SEQUENCE。仅当播放列表确实含"AES-128 且无显式 IV"的段
+        // (其 IV=compute_default_iv(media_sequence,idx),依赖 media_sequence)时,
+        // media_sequence 漂移才会导致解密错位;此时对旧 checkpoint 保守放弃 resume
+        // 全量重下。明文 / 显式 IV / 常量 media_sequence(VOD 通常恒为 0)等常见场景
+        // 不受影响,继续 resume 以保留有效进度。
+        let uses_computed_iv = segments.iter().any(|s| {
+            s.key
+                .as_ref()
+                .is_some_and(|k| k.method == HlsKeyMethod::Aes128 && k.iv.is_none())
+        });
+        let media_seq_changed = match saved_media_seq {
+            Some(prev) => prev != media_sequence,
+            None => uses_computed_iv,
+        };
+        if media_seq_changed {
+            log_info!(
+                "[hls] task {} media_sequence changed across resume (saved={:?}, now={}), \
+                 abandoning resume and re-downloading from scratch to keep IV consistent",
+                p.task_id,
+                saved_media_seq,
+                media_sequence
+            );
+        }
+
         let file_size = tokio::fs::metadata(&temp_path)
             .await
             .map(|m| m.len() as i64)
             .unwrap_or(0);
-        if saved_idx > 0 && file_size > 0 {
+        // 续传要求 saved_bytes > 0(三字段 checkpoint 记录的已完整落盘字节数)。
+        // 早期版本只写 "idx"(无字节数)的旧 checkpoint 解析出 saved_bytes=0,此时
+        // 无法确认磁盘上第 saved_idx 段是否完整——若上次硬崩在 write_all 中途,
+        // file_size 会含残字节;旧逻辑用 file_size 当 safe_size 不截断,会把残字节当
+        // 有效数据、后续段追加其后导致输出损坏。故对无字节偏移的旧 checkpoint 保守
+        // 放弃 resume、全量重下(仅影响从早期版本升级、且恰好硬崩在段中途的遗留任务)。
+        if saved_idx > 0 && file_size > 0 && saved_bytes > 0 && !media_seq_changed {
             // Truncate to the exact byte offset of the last fully-completed segment.
             // This removes any partially-written data from a crashed segment.
-            let safe_size = if saved_bytes > 0 {
-                saved_bytes.min(file_size)
-            } else {
-                file_size
-            };
+            let safe_size = saved_bytes.min(file_size);
             if safe_size < file_size {
                 log_info!(
                     "[hls] task {} truncating temp file {} -> {} bytes (removing partial segment data)",
@@ -775,7 +895,8 @@ async fn run_hls_download_inner(
             &p.client,
             &segment.uri,
             &p.cookies,
-            &p.url,
+            // 同源判定以实际列出该段的 media playlist 为基准（见 media_playlist_url）。
+            &media_playlist_url,
             &p.cancel_token,
             &p.task_id,
             seg_idx,
@@ -791,7 +912,8 @@ async fn run_hls_download_inner(
                     &p.client,
                     &key_info.uri,
                     &p.cookies,
-                    &p.url,
+                    // 同源判定以实际列出该密钥的 media playlist 为基准。
+                    &media_playlist_url,
                     &mut key_cache,
                     &p.extra_headers,
                 )
@@ -806,7 +928,7 @@ async fn run_hls_download_inner(
 
                 // Decrypt
                 let mut data_buf = seg_data;
-                decrypt_segment(&mut data_buf, &key_bytes, &iv)?
+                decrypt_segment(&mut data_buf, &key_bytes, &iv, seg_idx)?
             } else {
                 seg_data
             }
@@ -814,26 +936,61 @@ async fn run_hls_download_inner(
             seg_data
         };
 
-        // Apply speed limiter and write to file
+        // Apply speed limiter and write to file.
+        //
+        // seg_start_pos 是本段写入前文件的逻辑长度。resume 时文件已被
+        // truncate 到恰好 safe_size(== 初始 downloaded_bytes),此后每段以
+        // append 方式精确追加 chunk_len 字节,故文件磁盘长度始终等于
+        // downloaded_bytes —— 用它作为出错回退点是准确的。
         let chunk_len = output_data.len();
+        let seg_start_pos = downloaded_bytes;
         let mut offset = 0usize;
+        let mut write_result: Result<(), std::io::Error> = Ok(());
         while offset < chunk_len {
             let remaining = (chunk_len - offset) as u64;
             let allowed = p.speed_limiter.consume(remaining).await;
             let end = offset + allowed as usize;
-            file.write_all(&output_data[offset..end]).await?;
+            if let Err(e) = file.write_all(&output_data[offset..end]).await {
+                write_result = Err(e);
+                break;
+            }
             offset = end;
+        }
+
+        if let Err(e) = write_result {
+            // 写入中途失败(常见:磁盘满 ENOSPC)。本段已部分写入,先把文件
+            // 回退到本段写入前的长度,避免残留半截分段污染后续 resume(与
+            // dash_downloader 的 set_len(start_pos) 兜底一致)。回退失败仅记录
+            // 日志,不掩盖原始写入错误。
+            if let Err(trunc_err) = file.set_len(seg_start_pos as u64).await {
+                log_info!(
+                    "[hls] task {} segment {} rollback set_len({}) failed: {}",
+                    p.task_id,
+                    seg_idx,
+                    seg_start_pos,
+                    trunc_err
+                );
+            }
+            // 磁盘空间不足(ENOSPC, errno 28 / ErrorKind::StorageFull)给出
+            // 明确提示,便于用户区分"磁盘满"与普通 IO 错误。
+            if e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
+                return Err(DownloadError::Other(
+                    "磁盘空间不足，请清理磁盘后重试".to_string(),
+                ));
+            }
+            return Err(DownloadError::Io(e));
         }
 
         downloaded_bytes += chunk_len as i64;
 
-        // Save resume checkpoint (segment index + byte offset) for HLS resume support.
-        // Format: "next_seg_idx:total_bytes_written" — on resume we truncate to
-        // this byte offset to discard any partially-written segment data.
+        // Save resume checkpoint for HLS resume support.
+        // Format: "next_seg_idx:total_bytes_written:media_sequence" — on resume
+        // we truncate to this byte offset to discard any partially-written
+        // segment data,并比对 media_sequence 以保证续传段的 IV 计算与首次一致。
         let _ =
             p.db.set_config(
                 &resume_seg_key,
-                &format!("{}:{}", seg_idx + 1, downloaded_bytes),
+                &format!("{}:{}:{}", seg_idx + 1, downloaded_bytes, media_sequence),
             )
             .await;
 
@@ -925,7 +1082,10 @@ async fn run_hls_download_inner(
                         task_id: p.task_id.clone(),
                         downloaded_bytes: mp4_size,
                         total_bytes: mp4_size,
-                        status: 1,
+                        // remux 成功即完成,发 status=3(完成);外层 run_hls_download
+                        // 还会再发一次 status=3,Dart 端有 oldStatus!=completed 守卫,
+                        // 不会重复触发完成回调。
+                        status: 3,
                         error_message: String::new(),
                         file_name: mp4_file_name,
                         segment_details: None,
@@ -1111,6 +1271,14 @@ async fn download_segment_once(
 
     // Transparently decompress if the server returned compressed content.
     let encoding = crate::downloader::detect_content_encoding(resp.headers());
+    // 声明的 body 字节数。仅当响应"无 Content-Encoding"时它才等于实际写入
+    // 的字节数；压缩响应解压后 buf 长度必然 != content_length(压缩后的值),
+    // 故下方的截断校验只对未压缩响应启用,避免误伤合法压缩分段。
+    let declared_len = if encoding.is_none() {
+        resp.content_length()
+    } else {
+        None
+    };
     let raw_stream = resp.bytes_stream();
     let mut stream = crate::downloader::maybe_decompress_stream(raw_stream, encoding);
 
@@ -1136,6 +1304,22 @@ async fn download_segment_once(
         }
         buf.extend_from_slice(&chunk_data);
     }
+
+    // 完整性校验：当服务器声明了 Content-Length(且无压缩)时,EOF 后实际字节
+    // 必须恰好等于声明值。服务器在分段中途关闭连接(TCP RST / chunked 提前
+    // EOF)会让 stream 返回 None 被当作正常结束,只写入部分字节;不校验会把
+    // 截断分段静默 append 进 .ts 造成缺帧/花屏,而任务被标记完成。返回 Err
+    // 触发上层 download_segment_with_retry 重试。
+    if let Some(expected) = declared_len {
+        if buf.len() as u64 != expected {
+            return Err(DownloadError::Other(format!(
+                "HLS segment truncated: got {} bytes, declared content-length {}",
+                buf.len(),
+                expected
+            )));
+        }
+    }
+
     Ok(buf)
 }
 
@@ -1145,7 +1329,36 @@ async fn download_segment_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_default_iv, is_hls_url, parse_iv_hex, resolve_uri};
+    use super::{
+        compute_default_iv, decrypt_segment, is_hls_url, parse_iv_hex, parse_resume_checkpoint,
+        resolve_uri,
+    };
+    use aes::Aes128;
+    use cbc::cipher::block_padding::{NoPadding, Pkcs7};
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+
+    type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+
+    /// PKCS7-encrypt `plaintext` with the given key/iv, returning ciphertext.
+    /// 返回 `None` 时由调用方断言失败,避免在测试中使用 `unwrap`/`expect`。
+    fn encrypt_pkcs7(plaintext: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Option<Vec<u8>> {
+        let enc = Aes128CbcEnc::new_from_slices(key, iv).ok()?;
+        // 输出缓冲需容纳 padding(最多多一整块)。
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        let ct = enc
+            .encrypt_padded_b2b_mut::<Pkcs7>(plaintext, &mut buf)
+            .ok()?;
+        Some(ct.to_vec())
+    }
+
+    /// No-padding encrypt (input must be block-aligned), returning ciphertext.
+    fn encrypt_nopad(plaintext: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Option<Vec<u8>> {
+        let enc = Aes128CbcEnc::new_from_slices(key, iv).ok()?;
+        let mut buf = plaintext.to_vec();
+        let len = buf.len();
+        let ct = enc.encrypt_padded_mut::<NoPadding>(&mut buf, len).ok()?;
+        Some(ct.to_vec())
+    }
 
     #[test]
     fn test_is_hls_url_m3u8() {
@@ -1232,5 +1445,122 @@ mod tests {
     fn test_is_hls_ftp_m3u8() {
         // FTP URL with .m3u8 extension — still detected as HLS
         assert!(is_hls_url("ftp://example.com/stream.m3u8"));
+    }
+
+    // --- F036: decrypt_segment padding handling ---
+
+    #[test]
+    fn test_decrypt_segment_pkcs7_roundtrip() {
+        // 块对齐明文经 PKCS7 加密后,decrypt_segment 应正确解出原文。
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+        let plaintext = b"hello world, hls!".to_vec(); // 17 bytes -> padded to 32
+        let Some(mut ct) = encrypt_pkcs7(&plaintext, &key, &iv) else {
+            panic!("test fixture encryption failed");
+        };
+        assert_eq!(ct.len() % 16, 0, "pkcs7 ciphertext must be block-aligned");
+        let out = decrypt_segment(&mut ct, &key, &iv, 0);
+        match out {
+            Ok(decoded) => assert_eq!(decoded, plaintext),
+            Err(e) => panic!("pkcs7 decrypt should succeed: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_decrypt_segment_nopadding_when_unaligned() {
+        // 源省略填充导致密文非块对齐:decrypt_segment 应走 NoPadding 解出
+        // 对齐前缀,丢弃尾部不足一块的残余字节,而非整体失败(F036 核心)。
+        let key = [0x33u8; 16];
+        let iv = [0x44u8; 16];
+        let plaintext = [0xABu8; 48]; // 3 blocks, no padding
+        let Some(ct_aligned) = encrypt_nopad(&plaintext, &key, &iv) else {
+            panic!("test fixture nopadding encryption failed");
+        };
+        // 追加 5 字节"残余",模拟非块对齐密文(总长 53)。
+        let mut ct = ct_aligned.clone();
+        ct.extend_from_slice(&[0x99u8; 5]);
+        assert_ne!(ct.len() % 16, 0, "fixture must be unaligned");
+
+        let out = decrypt_segment(&mut ct, &key, &iv, 7);
+        match out {
+            // 仅解出对齐前缀(48 字节),尾部 5 字节被丢弃。
+            Ok(decoded) => assert_eq!(decoded, plaintext.to_vec()),
+            Err(e) => panic!("nopadding fallback should succeed for unaligned data: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_decrypt_segment_aligned_wrong_key_errors() {
+        // 块对齐但 PKCS7 解密失败(错误密钥)时,必须报错而非 fallback,
+        // 避免掩盖真实解密失败(F036 安全约束)。
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let plaintext = b"some aligned data here padded".to_vec();
+        let Some(mut ct) = encrypt_pkcs7(&plaintext, &key, &iv) else {
+            panic!("test fixture encryption failed");
+        };
+        let wrong_key = [0x00u8; 16];
+        // 用错误密钥解密块对齐数据:绝大多数情况下 PKCS7 校验失败。
+        let out = decrypt_segment(&mut ct, &wrong_key, &iv, 3);
+        // 不强制必然 Err(理论上极小概率出现"看似合法"的尾字节),但若 Err
+        // 必须携带段索引以便诊断;此处主要验证不会 panic 且未走 NoPadding
+        // 静默通过——只要是 Ok 也应解码为非原文。
+        match out {
+            Err(e) => assert!(
+                e.to_string().contains("segment 3"),
+                "error must carry segment index for diagnostics: {e}"
+            ),
+            Ok(decoded) => assert_ne!(decoded, plaintext),
+        }
+    }
+
+    #[test]
+    fn test_decrypt_segment_too_short_errors() {
+        // 不足一个完整块(< 16 字节)无法解密,应返回携带段索引的错误。
+        let key = [0x77u8; 16];
+        let iv = [0x88u8; 16];
+        let mut data = vec![0x01u8; 10];
+        let out = decrypt_segment(&mut data, &key, &iv, 9);
+        match out {
+            Err(e) => assert!(e.to_string().contains("segment 9"), "got: {e}"),
+            Ok(_) => panic!("data shorter than one AES block must error"),
+        }
+    }
+
+    // --- F040: resume checkpoint parsing (backward compatibility) ---
+
+    #[test]
+    fn test_parse_resume_checkpoint_three_fields() {
+        assert_eq!(parse_resume_checkpoint("5:1024:42"), (5, 1024, Some(42)));
+    }
+
+    #[test]
+    fn test_parse_resume_checkpoint_two_fields_legacy() {
+        // 旧格式无 media_sequence -> None。
+        assert_eq!(parse_resume_checkpoint("3:512"), (3, 512, None));
+    }
+
+    #[test]
+    fn test_parse_resume_checkpoint_idx_only_legacy() {
+        // 更早格式仅有 idx -> byte_offset 视为 0,media_sequence 未知。
+        assert_eq!(parse_resume_checkpoint("7"), (7, 0, None));
+    }
+
+    #[test]
+    fn test_parse_resume_checkpoint_garbage() {
+        // 完全无法解析 -> (0, 0, None),等同于不 resume。
+        assert_eq!(parse_resume_checkpoint("not-a-number"), (0, 0, None));
+        assert_eq!(parse_resume_checkpoint(""), (0, 0, None));
+    }
+
+    // --- F016: relative URI resolution against (redirect-final) base ---
+
+    #[test]
+    fn test_resolve_uri_cross_host_base() {
+        // media playlist 重定向到 CDN 后,相对段 URI 应拼到 CDN 主机。
+        assert_eq!(
+            resolve_uri("https://cdn.example.com/path/media.m3u8", "seg1.ts"),
+            "https://cdn.example.com/path/seg1.ts"
+        );
     }
 }

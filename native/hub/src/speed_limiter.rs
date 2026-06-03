@@ -176,17 +176,25 @@ impl SpeedLimiter {
                 // compensate for interval jitter / missed-tick bursts.
                 let now = Instant::now();
                 let elapsed_us = (now - last_refill).as_micros() as u64;
-                last_refill = now;
 
                 // refill = limit * elapsed_us / 1_000_000
                 // Use u128 intermediate to avoid overflow for very large limits.
                 let refill = ((limit as u128) * (elapsed_us as u128) / 1_000_000u128) as u64;
 
                 if refill == 0 {
-                    // Extremely low limit + short interval — skip this tick;
-                    // tokens will accumulate on the next one with larger elapsed.
+                    // Extremely low limit + short interval — skip this tick.
+                    // Crucially, do NOT advance `last_refill` here: the elapsed
+                    // microseconds that were too small to form a whole token must
+                    // accumulate into the next tick's `elapsed_us`, otherwise this
+                    // fractional time is permanently discarded and the limiter
+                    // would systematically deliver below the configured rate at
+                    // very low limits (e.g. < ~20 B/s).
                     continue;
                 }
+
+                // A whole token's worth of time has elapsed — advance the
+                // baseline only now that the elapsed time has been accounted for.
+                last_refill = now;
 
                 // Cap: 250 ms worth of the current limit.  For very low limits
                 // ensure at least 2× nominal-tick amount so tokens aren't
@@ -341,6 +349,35 @@ mod tests {
         assert!(
             ratio < 1.15,
             "throughput {actual_bps:.0} B/s exceeds limit {limit_bps} B/s (ratio {ratio:.3})"
+        );
+    }
+
+    /// Regression for F008: at extremely low limits the per-tick refill
+    /// truncates to 0; the fractional elapsed time must accumulate across ticks
+    /// instead of being discarded, otherwise throughput stalls below the limit.
+    #[tokio::test]
+    async fn very_low_limit_accumulates_tokens_over_time() {
+        // 10 B/s with a 50 ms tick yields ~0.5 B/refill, so the refill==0 branch
+        // is exercised on most ticks. Tokens must still accumulate to ~1 B every
+        // ~100 ms rather than perpetually rounding to zero.
+        let limit_bps: u64 = 10;
+        let limiter = SpeedLimiter::new(limit_bps);
+        limiter.spawn_refill_task();
+
+        let start = Instant::now();
+        let mut total = 0u64;
+        // Aim for ~5 bytes, which at 10 B/s should take roughly 0.5 s; bail out
+        // after a generous deadline so a regression manifests as too-few bytes.
+        let deadline = start + Duration::from_secs(3);
+        while total < 5 && Instant::now() < deadline {
+            let got = limiter.consume(5 - total).await;
+            total += got;
+        }
+
+        assert!(
+            total >= 5,
+            "very low limit stalled: got only {total} bytes in {:?} — refill==0 elapsed time was discarded",
+            start.elapsed()
         );
     }
 
