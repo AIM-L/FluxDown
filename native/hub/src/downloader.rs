@@ -2542,14 +2542,23 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
     //
     // 写入文件句柄此前已 drop，这里重新 open 临时文件后 sync_all。sync 失败属
     // 真实 IO 错误（如磁盘故障），向上传播而非静默忽略。
+    //
+    // 必须以写权限打开：sync_all 在 Windows 上映射到 FlushFileBuffers，而该
+    // API 要求句柄具备写权限，对只读句柄（File::open 的默认行为）会返回
+    // ERROR_ACCESS_DENIED (os error 5)，导致下载在 100% 完成后于 rename 前
+    // 失败。Linux/macOS 的 fsync 允许只读 fd，故此 bug 仅在 Windows 触发。
     {
-        let temp_file = tokio::fs::File::open(&temp_path).await.map_err(|e| {
-            DownloadError::Other(format!(
-                "failed to reopen {} for fsync before rename: {}",
-                temp_path.display(),
-                e
-            ))
-        })?;
+        let temp_file = OpenOptions::new()
+            .write(true)
+            .open(&temp_path)
+            .await
+            .map_err(|e| {
+                DownloadError::Other(format!(
+                    "failed to reopen {} for fsync before rename: {}",
+                    temp_path.display(),
+                    e
+                ))
+            })?;
         temp_file.sync_all().await.map_err(|e| {
             DownloadError::Other(format!(
                 "failed to fsync {} before rename: {}",
