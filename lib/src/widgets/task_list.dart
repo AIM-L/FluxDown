@@ -92,41 +92,29 @@ class _TaskListState extends State<TaskList> {
         color: c.textPrimary,
         action: () => widget.onNewDownload?.call(),
       ),
+      // 对标迅雷：全部开始 / 全部暂停 常驻显示，不可用时置灰
+      ContextMenuItem(
+        icon: LucideIcons.play,
+        label: s.startAll,
+        color: c.textPrimary,
+        enabled: hasPausedOrError,
+        action: () => widget.controller.resumeAll(),
+      ),
+      ContextMenuItem(
+        icon: LucideIcons.pause,
+        label: s.pauseAll,
+        color: c.textPrimary,
+        enabled: hasActive,
+        action: () => widget.controller.pauseAll(),
+      ),
     ];
 
-    if (hasActive || hasPausedOrError) {
-      final dividers = <int>{0}; // 新建下载后加分隔线
-
-      if (hasActive) {
-        items.add(
-          ContextMenuItem(
-            icon: LucideIcons.pause,
-            label: s.pauseAll,
-            color: c.textPrimary,
-            action: () => widget.controller.pauseAll(),
-          ),
-        );
-      }
-      if (hasPausedOrError) {
-        items.add(
-          ContextMenuItem(
-            icon: LucideIcons.play,
-            label: s.startAll,
-            color: c.textPrimary,
-            action: () => widget.controller.resumeAll(),
-          ),
-        );
-      }
-
-      showContextMenu(
-        context,
-        details.globalPosition,
-        items: items,
-        dividerAfterIndices: dividers,
-      );
-    } else {
-      showContextMenu(context, details.globalPosition, items: items);
-    }
+    showContextMenu(
+      context,
+      details.globalPosition,
+      items: items,
+      dividerAfterIndices: const {0}, // 新建下载后加分隔线
+    );
   }
 
   @override

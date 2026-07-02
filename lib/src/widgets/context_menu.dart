@@ -8,11 +8,15 @@ class ContextMenuItem {
   final Color color;
   final VoidCallback action;
 
+  /// 是否可用。false 时置灰显示且不响应点击。
+  final bool enabled;
+
   const ContextMenuItem({
     required this.icon,
     required this.label,
     required this.color,
     required this.action,
+    this.enabled = true,
   });
 }
 
@@ -117,10 +121,12 @@ class _ContextMenuOverlay extends StatelessWidget {
           item: items[i],
           itemHeight: itemHeight,
           colors: colors,
-          onTap: () {
-            onDismiss();
-            items[i].action();
-          },
+          onTap: items[i].enabled
+              ? () {
+                  onDismiss();
+                  items[i].action();
+                }
+              : null,
         ),
       );
       if (dividerAfterIndices.contains(i)) {
@@ -161,7 +167,7 @@ class _ContextMenuItemWidget extends StatefulWidget {
   final ContextMenuItem item;
   final double itemHeight;
   final AppColors colors;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   const _ContextMenuItemWidget({
     required this.item,
@@ -179,10 +185,12 @@ class _ContextMenuItemWidgetState extends State<_ContextMenuItemWidget> {
 
   @override
   Widget build(BuildContext context) {
+    final enabled = widget.item.enabled;
+    final color = enabled ? widget.item.color : widget.colors.textMuted;
     return MouseRegion(
       onEnter: (_) => setState(() => _isHovered = true),
       onExit: (_) => setState(() => _isHovered = false),
-      cursor: SystemMouseCursors.click,
+      cursor: enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
       child: GestureDetector(
         onTap: widget.onTap,
         child: Container(
@@ -190,16 +198,18 @@ class _ContextMenuItemWidgetState extends State<_ContextMenuItemWidget> {
           padding: const EdgeInsets.symmetric(horizontal: 12),
           margin: const EdgeInsets.symmetric(horizontal: 4),
           decoration: BoxDecoration(
-            color: _isHovered ? widget.colors.hoverBg : Colors.transparent,
+            color: enabled && _isHovered
+                ? widget.colors.hoverBg
+                : Colors.transparent,
             borderRadius: BorderRadius.circular(4),
           ),
           child: Row(
             children: [
-              Icon(widget.item.icon, size: 15, color: widget.item.color),
+              Icon(widget.item.icon, size: 15, color: color),
               const SizedBox(width: 10),
               Text(
                 widget.item.label,
-                style: TextStyle(fontSize: 13, color: widget.item.color),
+                style: TextStyle(fontSize: 13, color: color),
               ),
             ],
           ),
