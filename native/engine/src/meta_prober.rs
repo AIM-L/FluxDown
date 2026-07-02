@@ -52,6 +52,21 @@ pub async fn probe_task_meta(
         return (name, 0);
     }
 
+    // ed2k:// — 链接自带文件名与大小，无网络探测（HEAD 无意义）
+    if lower_prefix.starts_with("ed2k://") {
+        return match crate::ed2k::link::parse_ed2k_link(url) {
+            Ok(link) => {
+                let name = if file_name.is_empty() {
+                    link.file_name
+                } else {
+                    String::new()
+                };
+                (name, link.total_bytes as i64)
+            }
+            Err(_) => (String::new(), 0),
+        };
+    }
+
     // ftp:// — 使用现有 FTP 解析逻辑（FTP 无 HTTP 鉴权头语义，忽略 spec）
     if lower_prefix.starts_with("ftp://") {
         return probe_ftp_meta(url, file_name, proxy_config).await;

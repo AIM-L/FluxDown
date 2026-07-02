@@ -379,6 +379,7 @@ class DownloadTask {
     if (lower.startsWith('magnet:')) return 'BT';
     if (lower.startsWith('torrent-file://')) return 'BT';
     if (lower.startsWith('ftp://')) return 'FTP';
+    if (lower.startsWith('ed2k://')) return 'ED2K';
     return 'HTTP';
   }
 

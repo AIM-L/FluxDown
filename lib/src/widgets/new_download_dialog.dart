@@ -360,8 +360,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
 
       final lower = trimmed.toLowerCase();
       final magnetIdx = lower.indexOf('magnet:?');
+      final ed2kIdx = lower.indexOf('ed2k://');
       if (magnetIdx != -1) {
         current = _ParsedEntry(trimmed.substring(magnetIdx));
+      } else if (ed2kIdx != -1) {
+        current = _ParsedEntry(trimmed.substring(ed2kIdx));
       } else if (loose) {
         // loose 模式取行内第一个 URL 并设为 current，使后续选项行（out=/checksum=）
         // 能正常附着。直接 add 会跳过 current，导致 TXT 导入时选项全部丢失。

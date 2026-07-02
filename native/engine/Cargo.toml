@@ -18,10 +18,14 @@ cbc = "0.1"
 chrono = { version = "0.4.43", default-features = false, features = ["clock", "std"] }
 dash-mpd = { version = "0.19", default-features = false }
 encoding_rs = "0.8"
+flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
+igd-next = { version = "0.17.1", features = ["aio_tokio"] }
 m3u8-rs = "6"
 md-5 = "0.10"
+md4 = "0.10"
+rand = "0.9"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"

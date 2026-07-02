@@ -651,3 +651,29 @@ pub struct TrackerSubscriptionResult {
     /// Non-empty when all sources failed (error summary).
     pub error: String,
 }
+
+// ========== ED2K server subscription signals ==========
+
+/// Manually refresh the ED2K server subscription (server.met) now (Dart → Rust).
+/// Rust fetches all configured server.met URLs, parses + dedupes the result,
+/// caches it in the config table and replies with [Ed2kServerSubscriptionResult].
+#[derive(Deserialize, DartSignal)]
+pub struct UpdateEd2kServerSubscription {}
+
+/// Result of an ED2K server subscription refresh (Rust → Dart).
+/// Sent after both manual refreshes and the automatic startup refresh.
+#[derive(Serialize, RustSignal)]
+pub struct Ed2kServerSubscriptionResult {
+    /// True when at least one subscription source was fetched successfully.
+    pub success: bool,
+    /// Number of unique servers parsed across all sources (after dedup).
+    pub server_count: i32,
+    /// Number of sources fetched successfully.
+    pub ok_sources: i32,
+    /// Total number of subscription sources attempted.
+    pub total_sources: i32,
+    /// Unix seconds of this refresh. 0 when the refresh failed.
+    pub updated_at: i64,
+    /// Non-empty when all sources failed (error summary).
+    pub error: String,
+}

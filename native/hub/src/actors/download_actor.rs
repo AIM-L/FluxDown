@@ -21,12 +21,14 @@ use crate::rinf_sink::RinfEventSink;
 use crate::signals::{
     BatchControlTask, BatchCreateTask, CheckFileAssociation, CheckForUpdate, CheckUrlProtocol,
     ConfigEntry, ConfigLoaded, ConfirmExternalDownload, ControlTask, CreateQueue, CreateTask,
-    DeleteQueue, DetectSystemProxy, DownloadUpdate, ExternalDownloadRequest, FileAssociationStatus,
+    DeleteQueue, DetectSystemProxy, DownloadUpdate, Ed2kServerSubscriptionResult,
+    ExternalDownloadRequest, FileAssociationStatus,
     InstallUpdate, MoveTaskToQueue, ProbeTorrentMeta, ProxyTestResult, RequestAllQueues,
     RequestAllTasks, RequestConfig, RequestUpdateFailureMarker, RevealFile, SaveConfig,
     SelectBtFiles, SelectHlsQuality, SetFileAssociation, SetPriorityTask, SetUrlProtocol,
     SystemProxyInfo, TestProxyConnection, TrackerSubscriptionResult, UpdateCheckResult,
-    UpdateFailureMarker, UpdateQueue, UpdateTrackerSubscription, UrlProtocolStatus,
+    UpdateFailureMarker, UpdateQueue, UpdateEd2kServerSubscription, UpdateTrackerSubscription,
+    UrlProtocolStatus,
 };
 use crate::updater;
 
@@ -112,6 +114,90 @@ fn spawn_tracker_sub_refresh(
             }
         }
         let _ = tx.send(outcome).await;
+    });
+}
+
+/// Spawn a background task that fetches all ED2K server.met subscription
+/// sources, persists the deduped `ip:port` list to the config table, then
+/// reports the outcome back to the actor loop (which notifies Dart).
+///
+/// Unlike BT trackers, the ED2K server list is read fresh at each download's
+/// find-sources step, so no shared session needs invalidating here.
+fn spawn_ed2k_server_sub_refresh(
+    db: Db,
+    tx: mpsc::Sender<fluxdown_engine::ed2k::server_subscription::ServerFetchOutcome>,
+) {
+    tokio::spawn(async move {
+        let cfg = db.get_all_config().await.unwrap_or_default();
+        let urls = cfg.get("ed2k_server_sub_urls").cloned().unwrap_or_else(
+            fluxdown_engine::ed2k::server_subscription::default_server_met_urls,
+        );
+        let outcome =
+            fluxdown_engine::ed2k::server_subscription::fetch_server_subscriptions(&urls).await;
+        if outcome.is_success() {
+            let now = chrono::Utc::now().timestamp();
+            if let Err(e) = db
+                .set_config("ed2k_server_sub_cache", &outcome.servers.join(","))
+                .await
+            {
+                log_info!("[actor] failed to save ed2k server sub cache: {}", e);
+            }
+            if let Err(e) = db
+                .set_config("ed2k_server_sub_updated_at", &now.to_string())
+                .await
+            {
+                log_info!("[actor] failed to save ed2k server sub timestamp: {}", e);
+            }
+            if let Err(e) = db
+                .set_config(
+                    "ed2k_server_sub_cache_version",
+                    &fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION.to_string(),
+                )
+                .await
+            {
+                log_info!("[actor] failed to save ed2k server sub cache version: {}", e);
+            }
+        }
+        let _ = tx.send(outcome).await;
+    });
+}
+
+/// Kad nodes.dat 刷新间隔（秒）：24 小时。
+const ED2K_NODES_DAT_REFRESH_SECS: i64 = 24 * 60 * 60;
+
+/// Spawn a fire-and-forget task that downloads `nodes.dat` from the configured
+/// URL and caches it (base64) in the config table for Kad bootstrap.
+///
+/// Binary blob with no Dart-visible state, so no result channel — failures are
+/// logged and tolerated (Kad simply stays inactive until a later refresh).
+fn spawn_ed2k_nodes_dat_refresh(db: Db) {
+    tokio::spawn(async move {
+        use base64::Engine as _;
+        let cfg = db.get_all_config().await.unwrap_or_default();
+        let url = cfg
+            .get("ed2k_nodes_dat_url")
+            .cloned()
+            .unwrap_or_default();
+        if url.is_empty() {
+            return;
+        }
+        match fluxdown_engine::ed2k::kad::fetch_nodes_dat(&url).await {
+            Ok(bytes) => {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let now = chrono::Utc::now().timestamp();
+                if let Err(e) = db.set_config("ed2k_nodes_dat_cache", &encoded).await {
+                    log_info!("[actor] failed to save ed2k nodes.dat cache: {}", e);
+                }
+                if let Err(e) = db
+                    .set_config("ed2k_nodes_dat_updated_at", &now.to_string())
+                    .await
+                {
+                    log_info!("[actor] failed to save ed2k nodes.dat timestamp: {}", e);
+                }
+                log_info!("[actor] ed2k nodes.dat refreshed ({} bytes)", bytes.len());
+            }
+            Err(e) => log_info!("[actor] ed2k nodes.dat refresh failed: {}", e),
+        }
     });
 }
 
@@ -348,6 +434,75 @@ pub async fn run(db_dir: PathBuf) {
         }
     }
 
+    let update_ed2k_sub_recv = UpdateEd2kServerSubscription::get_dart_signal_receiver();
+
+    // ED2K 服务器订阅刷新通道：后台 fetch 任务完成后把结果送回 actor 循环通知 Dart。
+    let (ed2k_sub_tx, mut ed2k_sub_rx) =
+        mpsc::channel::<fluxdown_engine::ed2k::server_subscription::ServerFetchOutcome>(4);
+
+    // 启动时自动刷新：订阅启用且缓存超过 24 小时未更新。
+    {
+        let cfg = engine.db.get_all_config().await.unwrap_or_default();
+        let sub_enabled = cfg
+            .get("ed2k_server_sub_enabled")
+            .map(|v| v == "true")
+            .unwrap_or(true);
+        let updated_at = cfg
+            .get("ed2k_server_sub_updated_at")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        // 缓存格式版本：pre-fix（v1）写入的缓存 IP 字节序被反转，全为死主机。
+        // 版本不符即清空缓存 + 归零时间戳，强制用修正后的解析器重取。
+        let cache_version = cfg
+            .get("ed2k_server_sub_cache_version")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let version_stale =
+            cache_version < fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION;
+        if version_stale {
+            log_info!(
+                "[actor] ed2k server sub cache version {} < {}, invalidating (byte-order fix)",
+                cache_version,
+                fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION
+            );
+            let _ = engine.db.set_config("ed2k_server_sub_cache", "").await;
+        }
+        let now = chrono::Utc::now().timestamp();
+        if sub_enabled
+            && (version_stale
+                || now.saturating_sub(updated_at)
+                    > fluxdown_engine::ed2k::server_subscription::REFRESH_INTERVAL_SECS)
+        {
+            log_info!(
+                "[actor] ed2k server subscription stale (updated_at={}, version_stale={}), auto-refreshing",
+                updated_at,
+                version_stale
+            );
+            spawn_ed2k_server_sub_refresh(engine.db.clone(), ed2k_sub_tx.clone());
+        }
+    }
+
+    // 启动时自动刷新 Kad nodes.dat：启用 Kad 且缓存超过 24 小时未更新（或为空）。
+    {
+        let cfg = engine.db.get_all_config().await.unwrap_or_default();
+        let kad_enabled = cfg
+            .get("ed2k_enable_kad")
+            .map(|v| v == "true")
+            .unwrap_or(true);
+        let updated_at = cfg
+            .get("ed2k_nodes_dat_updated_at")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let now = chrono::Utc::now().timestamp();
+        if kad_enabled && now.saturating_sub(updated_at) > ED2K_NODES_DAT_REFRESH_SECS {
+            log_info!(
+                "[actor] ed2k nodes.dat stale (updated_at={}), auto-refreshing",
+                updated_at
+            );
+            spawn_ed2k_nodes_dat_refresh(engine.db.clone());
+        }
+    }
+
     // Shared channel for external download requests. Both the Native Messaging
     // listener (browser extension via the NMH relay) and the local HTTP takeover
     // server (Tampermonkey userscripts via GM_xmlhttpRequest) push
@@ -503,6 +658,25 @@ pub async fn run(db_dir: PathBuf) {
                             || (msg.key == "bt_tracker_sub_enabled" && msg.value == "true")
                         {
                             spawn_tracker_sub_refresh(engine.db.clone(), tracker_sub_tx.clone());
+                        }
+                    }
+                    // ED2K 服务器订阅键：地址变化 / 重新启用 → 后台立即刷新一次。
+                    // 服务器列表在每次下载 find-sources 时新读，无需失效会话。
+                    "ed2k_server_sub_urls" | "ed2k_server_sub_enabled" => {
+                        log_info!("[actor] ED2K server sub config changed: {}={}", msg.key, msg.value);
+                        if msg.key == "ed2k_server_sub_urls"
+                            || (msg.key == "ed2k_server_sub_enabled" && msg.value == "true")
+                        {
+                            spawn_ed2k_server_sub_refresh(engine.db.clone(), ed2k_sub_tx.clone());
+                        }
+                    }
+                    // Kad nodes.dat：URL 变化 / Kad 重新启用 → 后台立即刷新一次。
+                    "ed2k_nodes_dat_url" | "ed2k_enable_kad" => {
+                        log_info!("[actor] ED2K Kad config changed: {}={}", msg.key, msg.value);
+                        if msg.key == "ed2k_nodes_dat_url"
+                            || (msg.key == "ed2k_enable_kad" && msg.value == "true")
+                        {
+                            spawn_ed2k_nodes_dat_refresh(engine.db.clone());
                         }
                     }
                     // Proxy config keys — reload full proxy config from DB
@@ -936,6 +1110,28 @@ pub async fn run(db_dir: PathBuf) {
                 TrackerSubscriptionResult {
                     success: outcome.is_success(),
                     tracker_count: outcome.trackers.len() as i32,
+                    ok_sources: outcome.ok_sources as i32,
+                    total_sources: outcome.total_sources as i32,
+                    updated_at,
+                    error: outcome.error,
+                }
+                .send_signal_to_dart();
+            }
+            // --- Manual ED2K server subscription refresh (Settings page button) ---
+            Some(_) = update_ed2k_sub_recv.recv() => {
+                log_info!("[actor] manual ed2k server subscription refresh requested");
+                spawn_ed2k_server_sub_refresh(engine.db.clone(), ed2k_sub_tx.clone());
+            }
+            // --- ED2K server subscription refresh finished ---
+            Some(outcome) = ed2k_sub_rx.recv() => {
+                let all_cfg = engine.db.get_all_config().await.unwrap_or_default();
+                let updated_at = all_cfg
+                    .get("ed2k_server_sub_updated_at")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0);
+                Ed2kServerSubscriptionResult {
+                    success: outcome.is_success(),
+                    server_count: outcome.servers.len() as i32,
                     ok_sources: outcome.ok_sources as i32,
                     total_sources: outcome.total_sources as i32,
                     updated_at,

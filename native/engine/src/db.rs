@@ -73,7 +73,21 @@ impl Db {
                 default_save_dir TEXT NOT NULL DEFAULT '',
                 position INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_task_segments_task_id ON task_segments(task_id);",
+            CREATE INDEX IF NOT EXISTS idx_task_segments_task_id ON task_segments(task_id);
+            CREATE TABLE IF NOT EXISTS ed2k_blocks (
+                task_id TEXT NOT NULL,
+                block_index INTEGER NOT NULL,
+                state INTEGER NOT NULL DEFAULT 0,
+                downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (task_id, block_index),
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS ed2k_hashset (
+                task_id TEXT PRIMARY KEY,
+                hashes BLOB NOT NULL,
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );",
         )?;
 
         // --- Schema migrations (safe to re-run) ---
@@ -520,6 +534,15 @@ impl Db {
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM task_segments WHERE task_id = ?1", params![id])?;
             tx.execute("DELETE FROM torrent_files WHERE task_id = ?1", params![id])?;
+            // 任务级 config 行(完成幂等哨兵 bt_completion_top_<id>、HLS 断点
+            // hls_resume_<id>)随任务一并清理,防孤儿行累积。
+            tx.execute(
+                "DELETE FROM config WHERE key IN (?1, ?2)",
+                params![
+                    format!("bt_completion_top_{}", id),
+                    format!("hls_resume_{}", id)
+                ],
+            )?;
             tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(())
@@ -561,6 +584,17 @@ impl Db {
                     placeholders
                 );
                 tx.execute(&sql, params.as_slice())?;
+
+                // 任务级 config 行(哨兵/HLS 断点)随任务清理,防孤儿行累积。
+                for id in chunk {
+                    tx.execute(
+                        "DELETE FROM config WHERE key IN (?1, ?2)",
+                        params![
+                            format!("bt_completion_top_{}", id),
+                            format!("hls_resume_{}", id)
+                        ],
+                    )?;
+                }
 
                 let sql = format!("DELETE FROM tasks WHERE id IN ({})", placeholders);
                 tx.execute(&sql, params.as_slice())?;
@@ -824,7 +858,6 @@ impl Db {
     // -----------------------------------------------------------------------
 
     /// Get a single config value by key.
-    #[allow(dead_code)]
     pub async fn get_config(&self, key: &str) -> Result<Option<String>, DbError> {
         let conn = self.conn.clone();
         let key = key.to_owned();
@@ -896,6 +929,7 @@ impl Db {
         let conn = self.conn.clone();
         let default_save_dir = default_save_dir.to_owned();
         let default_sub_urls = crate::tracker_subscription::default_subscription_urls();
+        let default_ed2k_met_urls = crate::ed2k::server_subscription::default_server_met_urls();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().map_err(|_| DbError::LockPoisoned)?;
             let defaults: &[(&str, &str)] = &[
@@ -937,6 +971,28 @@ impl Db {
                 ("local_server_enabled", "true"),
                 ("local_server_port", "17800"),
                 ("local_server_token", ""),
+                // eD2K 服务器列表（逗号分隔 host:port）—— 用户手填/覆盖用。
+                // 公共服务器高频轮换；订阅缓存（ed2k_server_sub_cache）是主要来源，
+                // 二者在找源时合并。以下为写作时常见的长期在线服务器。
+                (
+                    "ed2k_server_list",
+                    "176.123.5.89:4725,45.82.80.155:5687,85.121.5.137:4232,176.123.2.239:4232,145.239.2.134:4661,91.208.162.87:4232,37.15.61.236:4232",
+                ),
+                // eD2K 服务器订阅（server.met）：默认启用，订阅社区维护列表。
+                // cache 由订阅刷新流程写入，updated_at=0 表示从未更新。
+                ("ed2k_server_sub_enabled", "true"),
+                ("ed2k_server_sub_urls", &default_ed2k_met_urls),
+                ("ed2k_server_sub_cache", ""),
+                ("ed2k_server_sub_updated_at", "0"),
+                // eD2K 客户端：监听端口（0=OS 选）、UPnP 端口映射争取 HighID、
+                // Kad DHT 去中心化找源。UPnP/Kad 默认启用（best-effort，失败回退）。
+                ("ed2k_listen_port", "0"),
+                ("ed2k_enable_upnp", "true"),
+                ("ed2k_enable_kad", "true"),
+                // Kad bootstrap：nodes.dat 下载地址（社区维护）+ 缓存（base64）+ 更新时刻。
+                ("ed2k_nodes_dat_url", "https://upd.emule-security.org/nodes.dat"),
+                ("ed2k_nodes_dat_cache", ""),
+                ("ed2k_nodes_dat_updated_at", "0"),
             ];
             for (key, value) in defaults {
                 conn.execute(
@@ -967,6 +1023,126 @@ impl Db {
             )?;
             tx.commit()?;
             Ok(())
+        })
+        .await?
+    }
+
+    // -----------------------------------------------------------------------
+    // ED2K blocks / hashset
+    // -----------------------------------------------------------------------
+
+    /// Initialise all block rows (state=0 missing) for an ed2k task.
+    /// Idempotent per (task_id, block_index) via INSERT OR IGNORE.
+    pub async fn init_ed2k_blocks(&self, task_id: &str, block_count: u64) -> Result<(), DbError> {
+        let conn = self.conn.clone();
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().map_err(|_| DbError::LockPoisoned)?;
+            let tx = conn.transaction()?;
+            for i in 0..block_count {
+                tx.execute(
+                    "INSERT OR IGNORE INTO ed2k_blocks (task_id, block_index, state, downloaded_bytes, retry_count)
+                     VALUES (?1, ?2, 0, 0, 0)",
+                    params![task_id, i as i64],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Load all block rows for an ed2k task, ordered by block_index.
+    /// Returns `(block_index, state, downloaded_bytes, retry_count)`.
+    pub async fn load_ed2k_blocks(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<(u64, i64, i64, i64)>, DbError> {
+        let conn = self.conn.clone();
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|_| DbError::LockPoisoned)?;
+            let mut stmt = conn.prepare(
+                "SELECT block_index, state, downloaded_bytes, retry_count
+                 FROM ed2k_blocks WHERE task_id = ?1 ORDER BY block_index",
+            )?;
+            let rows = stmt.query_map(params![task_id], |row| {
+                let idx: i64 = row.get(0)?;
+                Ok((idx as u64, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    /// Update one block's state (+ optionally bump retry_count).
+    /// `bump_retry` increments retry_count atomically when true.
+    pub async fn update_ed2k_block(
+        &self,
+        task_id: &str,
+        block_index: u64,
+        state: i64,
+        downloaded_bytes: i64,
+        bump_retry: bool,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.clone();
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|_| DbError::LockPoisoned)?;
+            if bump_retry {
+                conn.execute(
+                    "UPDATE ed2k_blocks SET state = ?1, downloaded_bytes = ?2, retry_count = retry_count + 1
+                     WHERE task_id = ?3 AND block_index = ?4",
+                    params![state, downloaded_bytes, task_id, block_index as i64],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE ed2k_blocks SET state = ?1, downloaded_bytes = ?2
+                     WHERE task_id = ?3 AND block_index = ?4",
+                    params![state, downloaded_bytes, task_id, block_index as i64],
+                )?;
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Persist the verified hashset blob (concatenated 16B * part_count block
+    /// hashes, network order, no phantom-tail append). Idempotent (REPLACE).
+    pub async fn save_ed2k_hashset(&self, task_id: &str, hashes: &[u8]) -> Result<(), DbError> {
+        let conn = self.conn.clone();
+        let task_id = task_id.to_owned();
+        let hashes = hashes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|_| DbError::LockPoisoned)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO ed2k_hashset (task_id, hashes) VALUES (?1, ?2)",
+                params![task_id, hashes],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Load the persisted hashset blob, if any.
+    pub async fn load_ed2k_hashset(&self, task_id: &str) -> Result<Option<Vec<u8>>, DbError> {
+        let conn = self.conn.clone();
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|_| DbError::LockPoisoned)?;
+            match conn.query_row(
+                "SELECT hashes FROM ed2k_hashset WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            ) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(DbError::Sqlite(e)),
+            }
         })
         .await?
     }
@@ -1910,6 +2086,83 @@ mod tests {
             "update_task_progress 必须能把进度复位到 0（不被 MAX 钳制）"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // ED2K blocks / hashset
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ed2k_blocks_init_load_roundtrip() {
+        let (db, dir) = open_test_db();
+        insert_task(&db, "e1").await;
+        db.init_ed2k_blocks("e1", 3).await.expect("init blocks");
+        let blocks = db.load_ed2k_blocks("e1").await.expect("load blocks");
+        assert_eq!(blocks.len(), 3);
+        // (block_index, state, downloaded_bytes, retry_count) 全默认。
+        assert_eq!(blocks[0], (0, 0, 0, 0));
+        assert_eq!(blocks[2].0, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ed2k_block_update_and_retry_bump() {
+        let (db, dir) = open_test_db();
+        insert_task(&db, "e2").await;
+        db.init_ed2k_blocks("e2", 2).await.expect("init");
+        // 标记 block 0 verified（state=3），不 bump。
+        db.update_ed2k_block("e2", 0, 3, 100, false)
+            .await
+            .expect("update");
+        // block 1 置 missing 并 bump retry 两次。
+        db.update_ed2k_block("e2", 1, 0, 0, true)
+            .await
+            .expect("bump1");
+        db.update_ed2k_block("e2", 1, 0, 0, true)
+            .await
+            .expect("bump2");
+        let blocks = db.load_ed2k_blocks("e2").await.expect("load");
+        assert_eq!(blocks[0], (0, 3, 100, 0), "verified, retry 未变");
+        assert_eq!(blocks[1], (1, 0, 0, 2), "retry_count 自增两次");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ed2k_hashset_blob_roundtrip() {
+        let (db, dir) = open_test_db();
+        insert_task(&db, "e3").await;
+        assert!(db.load_ed2k_hashset("e3").await.expect("empty").is_none());
+        // 2 个块哈希 = 32 字节（part_count 个，不含 phantom）。
+        let blob: Vec<u8> = (0u8..32).collect();
+        db.save_ed2k_hashset("e3", &blob).await.expect("save");
+        let got = db
+            .load_ed2k_hashset("e3")
+            .await
+            .expect("load")
+            .expect("some");
+        assert_eq!(got, blob);
+        assert_eq!(got.len(), 32, "存 part_count 个块哈希，不含 phantom 追加");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ed2k_server_list_default_parseable() {
+        let (db, dir) = open_test_db();
+        db.init_default_config("/tmp").await.expect("init config");
+        let list = db
+            .get_config("ed2k_server_list")
+            .await
+            .expect("get config")
+            .expect("default present");
+        // 与 server.rs 的解析函数同规则：逗号分隔、每项 host:port。
+        let servers: Vec<&str> = list.split(',').filter(|s| !s.is_empty()).collect();
+        assert!(!servers.is_empty(), "默认列表非空");
+        for s in servers {
+            assert!(s.contains(':'), "每项须 host:port: {s}");
+            let port = s.rsplit(':').next().expect("has port");
+            assert!(port.parse::<u16>().is_ok(), "端口须合法 u16: {s}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

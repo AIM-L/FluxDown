@@ -17,6 +17,7 @@ import '../models/custom_category.dart';
 import '../models/download_controller.dart';
 import '../models/download_queue.dart';
 import '../models/settings_provider.dart';
+import '../services/floating_ball/floating_ball_service.dart';
 import '../services/log_service.dart';
 import '../services/update_service.dart';
 import '../theme/app_colors.dart';
@@ -36,6 +37,7 @@ enum SettingsCategory {
   appearance(icon: LucideIcons.palette),
   download(icon: LucideIcons.download),
   bt(icon: LucideIcons.magnet),
+  ed2k(icon: LucideIcons.share2),
   proxy(icon: LucideIcons.globe),
   localServer(icon: LucideIcons.server),
   about(icon: LucideIcons.info);
@@ -53,6 +55,7 @@ extension SettingsCategoryI18n on SettingsCategory {
       SettingsCategory.appearance => s.settingsCatAppearance,
       SettingsCategory.download => s.settingsCatDownload,
       SettingsCategory.bt => s.settingsCatBt,
+      SettingsCategory.ed2k => s.settingsCatEd2k,
       SettingsCategory.proxy => s.settingsCatProxy,
       SettingsCategory.localServer => s.settingsCatLocalServer,
       SettingsCategory.about => s.settingsCatAbout,
@@ -66,6 +69,7 @@ extension SettingsCategoryI18n on SettingsCategory {
       SettingsCategory.appearance => s.settingsCatAppearanceDesc,
       SettingsCategory.download => s.settingsCatDownloadDesc,
       SettingsCategory.bt => s.settingsCatBtDesc,
+      SettingsCategory.ed2k => s.settingsCatEd2kDesc,
       SettingsCategory.proxy => s.settingsCatProxyDesc,
       SettingsCategory.localServer => s.settingsCatLocalServerDesc,
       SettingsCategory.about => s.settingsCatAboutDesc,
@@ -88,6 +92,12 @@ class SettingsSearchItem {
     required this.keywords,
     required this.icon,
   });
+
+  /// 与查询串（已 toLowerCase）匹配：标签/描述/关键词任一命中。
+  bool matches(String query) =>
+      label.toLowerCase().contains(query) ||
+      description.toLowerCase().contains(query) ||
+      keywords.any((k) => k.toLowerCase().contains(query));
 }
 
 /// 所有可搜索的设置项列表
@@ -110,6 +120,21 @@ List<SettingsSearchItem> get settingsSearchItems {
     ),
     SettingsSearchItem(
       category: SettingsCategory.general,
+      label: s.floatingBall,
+      description: s.floatingBallDesc,
+      keywords: s.searchKeywordsFloatingBall,
+      icon: LucideIcons.circleDot,
+    ),
+    if (Platform.isLinux)
+      SettingsSearchItem(
+        category: SettingsCategory.general,
+        label: s.clipboardWatch,
+        description: s.clipboardWatchDesc,
+        keywords: s.searchKeywordsClipboardWatch,
+        icon: LucideIcons.clipboard,
+      ),
+    SettingsSearchItem(
+      category: SettingsCategory.general,
       label: s.torrentFileAssociation,
       description: s.torrentFileAssociationDesc,
       keywords: s.searchKeywordsFileAssoc,
@@ -128,6 +153,13 @@ List<SettingsSearchItem> get settingsSearchItems {
       description: s.notifyOnCompleteDesc,
       keywords: s.searchKeywordsNotifyOnComplete,
       icon: LucideIcons.bellRing,
+    ),
+    SettingsSearchItem(
+      category: SettingsCategory.general,
+      label: s.keepAwakeWhileDownloading,
+      description: s.keepAwakeWhileDownloadingDesc,
+      keywords: s.searchKeywordsKeepAwake,
+      icon: LucideIcons.coffee,
     ),
     SettingsSearchItem(
       category: SettingsCategory.general,
@@ -208,7 +240,7 @@ List<SettingsSearchItem> get settingsSearchItems {
     ),
     SettingsSearchItem(
       category: SettingsCategory.about,
-      label: s.checkUpdate,
+      label: s.softwareUpdate,
       description: s.checkUpdateDesc,
       keywords: s.searchKeywordsUpdate,
       icon: LucideIcons.refreshCw,
@@ -219,6 +251,13 @@ List<SettingsSearchItem> get settingsSearchItems {
       description: s.btSettingsDesc,
       keywords: s.searchKeywordsBtSettings,
       icon: LucideIcons.magnet,
+    ),
+    SettingsSearchItem(
+      category: SettingsCategory.ed2k,
+      label: s.ed2kSettings,
+      description: s.ed2kSettingsDesc,
+      keywords: s.searchKeywordsEd2kSettings,
+      icon: LucideIcons.share2,
     ),
     SettingsSearchItem(
       category: SettingsCategory.proxy,
@@ -254,25 +293,97 @@ class SettingsPage extends StatefulWidget {
   final DownloadController? downloadController;
   final SettingsCategory? initialCategory;
 
+  /// 从首页搜索跳转进来时携带的高亮项：切到其分类并闪烁定位对应设置卡片。
+  final SettingsSearchItem? initialHighlight;
+
   const SettingsPage({
     super.key,
     required this.onBack,
     required this.settingsProvider,
     this.downloadController,
     this.initialCategory,
+    this.initialHighlight,
   });
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
+/// 一次「定位到设置项」的高亮请求。
+/// [seq] 单调递增，保证连续选择同一项也能重新触发动画。
+class SettingsHighlightRequest {
+  final int seq;
+  final String label;
+  final String description;
+
+  const SettingsHighlightRequest({
+    required this.seq,
+    required this.label,
+    required this.description,
+  });
+
+  /// 卡片是否为本请求的目标（标签或描述与搜索元数据一致即命中）。
+  bool targets(String cardLabel, String cardDescription) =>
+      cardLabel == label || (description.isNotEmpty && cardDescription == description);
+}
+
+/// 向下传递当前高亮请求；_SettingCard 据此自行滚动定位 + 闪烁。
+/// 卡片消费（触发动画）后回调 [onConsumed]，源头清空请求，
+/// 防止用户切走再切回时新建的卡片 State 重复消费同一请求（幽灵重闪）。
+class _HighlightScope extends InheritedWidget {
+  final SettingsHighlightRequest? request;
+  final ValueChanged<int> onConsumed;
+
+  const _HighlightScope({
+    required this.request,
+    required this.onConsumed,
+    required super.child,
+  });
+
+  static _HighlightScope? of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<_HighlightScope>();
+
+  @override
+  bool updateShouldNotify(_HighlightScope old) => old.request != request;
+}
+
 class _SettingsPageState extends State<SettingsPage> {
   late SettingsCategory _selected;
+
+  SettingsHighlightRequest? _highlight;
+  int _highlightSeq = 0;
 
   @override
   void initState() {
     super.initState();
-    _selected = widget.initialCategory ?? SettingsCategory.general;
+    final hl = widget.initialHighlight;
+    _selected = hl?.category ?? widget.initialCategory ?? SettingsCategory.general;
+    if (hl != null) {
+      _highlight = SettingsHighlightRequest(
+        seq: ++_highlightSeq,
+        label: hl.label,
+        description: hl.description,
+      );
+    }
+  }
+
+  /// 搜索结果选中：切换分类并下发高亮请求。
+  void _onSearchSelect(SettingsSearchItem item) {
+    setState(() {
+      _selected = item.category;
+      _highlight = SettingsHighlightRequest(
+        seq: ++_highlightSeq,
+        label: item.label,
+        description: item.description,
+      );
+    });
+  }
+
+  /// 卡片已消费高亮请求 → 清空，防止重复触发。
+  void _onHighlightConsumed(int seq) {
+    if (_highlight?.seq != seq) return;
+    // 消费回调发生在 postFrame，可以安全 setState
+    setState(() => _highlight = null);
   }
 
   @override
@@ -283,7 +394,7 @@ class _SettingsPageState extends State<SettingsPage> {
         // 顶部标题栏
         TitleDragArea(
           child: Container(
-            height: 48,
+            height: 40,
             decoration: BoxDecoration(
               color: c.surface1,
               border: Border(bottom: BorderSide(color: c.border, width: 1)),
@@ -385,15 +496,20 @@ class _SettingsPageState extends State<SettingsPage> {
               _SettingsSidebar(
                 selected: _selected,
                 onSelect: (cat) => setState(() => _selected = cat),
+                onSearchSelect: _onSearchSelect,
               ),
               // 分隔线
               Container(width: 1, color: c.border),
               // 右侧内容区
               Expanded(
-                child: _SettingsContent(
-                  category: _selected,
-                  settingsProvider: widget.settingsProvider,
-                  downloadController: widget.downloadController,
+                child: _HighlightScope(
+                  request: _highlight,
+                  onConsumed: _onHighlightConsumed,
+                  child: _SettingsContent(
+                    category: _selected,
+                    settingsProvider: widget.settingsProvider,
+                    downloadController: widget.downloadController,
+                  ),
                 ),
               ),
             ],
@@ -408,30 +524,226 @@ class _SettingsPageState extends State<SettingsPage> {
 // 设置侧边栏导航
 // ─────────────────────────────────────────────
 
-class _SettingsSidebar extends StatelessWidget {
+class _SettingsSidebar extends StatefulWidget {
   final SettingsCategory selected;
   final ValueChanged<SettingsCategory> onSelect;
+  final ValueChanged<SettingsSearchItem> onSearchSelect;
 
-  const _SettingsSidebar({required this.selected, required this.onSelect});
+  const _SettingsSidebar({
+    required this.selected,
+    required this.onSelect,
+    required this.onSearchSelect,
+  });
+
+  @override
+  State<_SettingsSidebar> createState() => _SettingsSidebarState();
+}
+
+class _SettingsSidebarState extends State<_SettingsSidebar> {
+  final _searchController = TextEditingController();
+  final _focusNode = FocusNode();
+  final _keyboardFocusNode = FocusNode(skipTraversal: true);
+  String _query = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _searchController.addListener(() {
+      final q = _searchController.text.trim().toLowerCase();
+      if (q != _query) setState(() => _query = q);
+    });
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _focusNode.dispose();
+    _keyboardFocusNode.dispose();
+    super.dispose();
+  }
+
+  List<SettingsSearchItem> get _results => _query.isEmpty
+      ? const []
+      : settingsSearchItems.where((i) => i.matches(_query)).toList();
+
+  void _select(SettingsSearchItem item) {
+    widget.onSearchSelect(item);
+    _searchController.clear();
+    _focusNode.unfocus();
+  }
+
+  /// Esc 清空并失焦。用 Focus.onKeyEvent 返回 handled，
+  /// 阻止事件继续冒泡到外层快捷键（KeyboardListener 无拦截语义）。
+  KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
+    if (event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.escape) {
+      _searchController.clear();
+      _focusNode.unfocus();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  /// Enter 提交：选中第一条搜索结果。
+  void _onSubmitted(String _) {
+    final results = _results;
+    if (results.isNotEmpty) _select(results.first);
+  }
 
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
+    final s = LocaleScope.of(context);
+    final searching = _query.isNotEmpty;
+    final results = _results;
+
     return Container(
       width: 180,
       color: c.surface1,
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          for (final cat in SettingsCategory.values)
-            _SettingsNavItem(
-              icon: cat.icon,
-              label: cat.localizedLabel,
-              isSelected: selected == cat,
-              onTap: () => onSelect(cat),
+          // 搜索框
+          Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            decoration: BoxDecoration(
+              color: c.bg,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: searching
+                    ? c.accent.withValues(alpha: 0.6)
+                    : c.border.withValues(alpha: 0.5),
+                width: 1,
+              ),
             ),
+            child: Focus(
+              focusNode: _keyboardFocusNode,
+              onKeyEvent: _handleKey,
+              child: ShadInput(
+                controller: _searchController,
+                focusNode: _focusNode,
+                placeholder: Text(
+                  s.settingsSearchHint,
+                  style: const TextStyle(fontSize: 12),
+                ),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 4,
+                ),
+                constraints: const BoxConstraints(
+                  minHeight: 28,
+                  maxHeight: 28,
+                ),
+                gap: 5,
+                leading: Icon(
+                  LucideIcons.search,
+                  size: 13,
+                  color: searching ? c.accent : c.textMuted,
+                ),
+                style: const TextStyle(fontSize: 12),
+                decoration: const ShadDecoration(
+                  border: ShadBorder.none,
+                  focusedBorder: ShadBorder.none,
+                ),
+                onSubmitted: _onSubmitted,
+              ),
+            ),
+          ),
+          // 搜索中 → 结果列表；否则 → 分类导航
+          if (searching)
+            Expanded(
+              child: results.isEmpty
+                  ? Padding(
+                      padding: const EdgeInsets.only(top: 16),
+                      child: Text(
+                        s.settingsSearchNoResults,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 12, color: c.textMuted),
+                      ),
+                    )
+                  : ListView.builder(
+                      itemCount: results.length,
+                      itemBuilder: (context, i) => _SearchResultItem(
+                        item: results[i],
+                        onTap: () => _select(results[i]),
+                      ),
+                    ),
+            )
+          else
+            for (final cat in SettingsCategory.values)
+              _SettingsNavItem(
+                icon: cat.icon,
+                label: cat.localizedLabel,
+                isSelected: widget.selected == cat,
+                onTap: () => widget.onSelect(cat),
+              ),
         ],
+      ),
+    );
+  }
+}
+
+/// 侧边栏搜索结果项：图标 + 标签 + 所属分类
+class _SearchResultItem extends StatefulWidget {
+  final SettingsSearchItem item;
+  final VoidCallback onTap;
+
+  const _SearchResultItem({required this.item, required this.onTap});
+
+  @override
+  State<_SearchResultItem> createState() => _SearchResultItemState();
+}
+
+class _SearchResultItemState extends State<_SearchResultItem> {
+  bool _isHovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    return MouseRegion(
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: Container(
+          margin: const EdgeInsets.only(bottom: 2),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: _isHovered ? c.hoverBg : Colors.transparent,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            children: [
+              Icon(widget.item.icon, size: 14, color: c.textSecondary),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      widget.item.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: c.textPrimary,
+                      ),
+                    ),
+                    Text(
+                      widget.item.category.localizedLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 10.5, color: c.textMuted),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -568,6 +880,10 @@ class _SettingsContent extends StatelessWidget {
                     key: const ValueKey('bt'),
                     settingsProvider: settingsProvider,
                   ),
+                  SettingsCategory.ed2k => _Ed2kContent(
+                    key: const ValueKey('ed2k'),
+                    settingsProvider: settingsProvider,
+                  ),
                   SettingsCategory.proxy => _ProxyContent(
                     key: const ValueKey('proxy'),
                     settingsProvider: settingsProvider,
@@ -629,7 +945,7 @@ class _SectionHeader extends StatelessWidget {
 // 设置卡片：每个设置项的统一容器
 // ─────────────────────────────────────────────
 
-class _SettingCard extends StatelessWidget {
+class _SettingCard extends StatefulWidget {
   final String label;
   final String description;
   final Widget child;
@@ -643,21 +959,137 @@ class _SettingCard extends StatelessWidget {
   });
 
   @override
+  State<_SettingCard> createState() => _SettingCardState();
+}
+
+/// 高亮消费公共逻辑：监听 _HighlightScope，命中后滚动定位 + 闪烁。
+/// 宿主 State 通过 [highlightLabel]/[highlightDescription] 声明自己的匹配键，
+/// 通过 [flashing] 读取当前闪烁态渲染高亮样式。
+mixin _HighlightConsumer<T extends StatefulWidget> on State<T> {
+  int _consumedSeq = 0;
+  bool _flashing = false;
+  Timer? _flashTimer;
+
+  String get highlightLabel;
+  String get highlightDescription;
+
+  bool get flashing => _flashing;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final scope = _HighlightScope.of(context);
+    final req = scope?.request;
+    if (scope == null || req == null || req.seq == _consumedSeq) return;
+    if (!req.targets(highlightLabel, highlightDescription)) return;
+    _consumedSeq = req.seq;
+    // 等本帧布局完成后再滚动定位（分类切换 AnimatedSwitcher 期间布局已存在）
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      Scrollable.ensureVisible(
+        context,
+        alignment: 0.2,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOutCubic,
+      );
+      _startFlash();
+      // 上报消费 → 源头清空请求，防止分类切走再切回时幽灵重闪
+      scope.onConsumed(req.seq);
+    });
+  }
+
+  /// 闪烁 3 次：300ms 周期亮/灭交替，总时长约 1.5s
+  void _startFlash() {
+    _flashTimer?.cancel();
+    var ticks = 0;
+    setState(() => _flashing = true);
+    _flashTimer = Timer.periodic(const Duration(milliseconds: 300), (t) {
+      ticks++;
+      if (ticks >= 5 || !mounted) {
+        t.cancel();
+        _flashTimer = null;
+        if (mounted) setState(() => _flashing = false);
+        return;
+      }
+      setState(() => _flashing = ticks.isEven);
+    });
+  }
+
+  @override
+  void dispose() {
+    _flashTimer?.cancel();
+    super.dispose();
+  }
+}
+
+/// 无边框高亮区域：包裹非 _SettingCard 的设置小节（如「侧边栏显示」），
+/// 使其同样支持搜索定位 + 闪烁高亮。
+class _HighlightRegion extends StatefulWidget {
+  final String label;
+  final String description;
+  final Widget child;
+
+  const _HighlightRegion({
+    required this.label,
+    required this.description,
+    required this.child,
+  });
+
+  @override
+  State<_HighlightRegion> createState() => _HighlightRegionState();
+}
+
+class _HighlightRegionState extends State<_HighlightRegion>
+    with _HighlightConsumer {
+  @override
+  String get highlightLabel => widget.label;
+  @override
+  String get highlightDescription => widget.description;
+
+  @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+      decoration: BoxDecoration(
+        color: flashing ? c.accent.withValues(alpha: 0.08) : Colors.transparent,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: widget.child,
+    );
+  }
+}
+
+class _SettingCardState extends State<_SettingCard> with _HighlightConsumer {
+  @override
+  String get highlightLabel => widget.label;
+  @override
+  String get highlightDescription => widget.description;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       decoration: BoxDecoration(
-        color: c.surface1,
+        color: _flashing ? c.accent.withValues(alpha: 0.08) : c.surface1,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: c.border.withValues(alpha: 0.6), width: 1),
+        border: Border.all(
+          color: _flashing
+              ? c.accent.withValues(alpha: 0.7)
+              : c.border.withValues(alpha: 0.6),
+          width: 1,
+        ),
       ),
-      child: vertical
+      child: widget.vertical
           ? Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  label,
+                  widget.label,
                   style: TextStyle(
                     fontSize: 13,
                     fontWeight: FontWeight.w500,
@@ -666,11 +1098,11 @@ class _SettingCard extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  description,
+                  widget.description,
                   style: TextStyle(fontSize: 11.5, color: c.textMuted),
                 ),
                 const SizedBox(height: 12),
-                child,
+                widget.child,
               ],
             )
           : Row(
@@ -680,7 +1112,7 @@ class _SettingCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        label,
+                        widget.label,
                         style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w500,
@@ -689,14 +1121,14 @@ class _SettingCard extends StatelessWidget {
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        description,
+                        widget.description,
                         style: TextStyle(fontSize: 11.5, color: c.textMuted),
                       ),
                     ],
                   ),
                 ),
                 const SizedBox(width: 16),
-                child,
+                widget.child,
               ],
             ),
     );
@@ -760,6 +1192,32 @@ class _GeneralContent extends StatelessWidget {
             ),
             const SizedBox(height: 10),
             _SettingCard(
+              label: LocaleScope.of(context).floatingBall,
+              description:
+                  FloatingBallService.instance.isDegraded
+                  ? LocaleScope.of(context).floatingBallWaylandUnsupported
+                  : LocaleScope.of(context).floatingBallDesc,
+              child: ShadSwitch(
+                value: settingsProvider.floatingBallEnabled,
+                enabled: !FloatingBallService.instance.isDegraded,
+                onChanged: (v) => FloatingBallService.instance.setEnabled(v),
+              ),
+            ),
+            if (Platform.isLinux &&
+                FloatingBallService.instance.isDegraded) ...[
+              const SizedBox(height: 10),
+              _SettingCard(
+                label: LocaleScope.of(context).clipboardWatch,
+                description: LocaleScope.of(context).clipboardWatchDesc,
+                child: ShadSwitch(
+                  value: settingsProvider.clipboardWatchEnabled,
+                  onChanged: (v) =>
+                      settingsProvider.setClipboardWatchEnabled(v),
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            _SettingCard(
               label: LocaleScope.of(context).torrentFileAssociation,
               description: LocaleScope.of(context).torrentFileAssociationDesc,
               child: ShadSwitch(
@@ -789,24 +1247,42 @@ class _GeneralContent extends StatelessWidget {
                 onChanged: (v) => settingsProvider.setNotifyOnComplete(v),
               ),
             ),
-            const SizedBox(height: 20),
-            // 侧边栏显示设置 — 小标题
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Text(
-                LocaleScope.of(context).sidebarVisibility,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: AppColors.of(context).textPrimary,
-                ),
+            const SizedBox(height: 10),
+            _SettingCard(
+              label: LocaleScope.of(context).keepAwakeWhileDownloading,
+              description: LocaleScope.of(context).keepAwakeWhileDownloadingDesc,
+              child: ShadSwitch(
+                value: settingsProvider.keepAwakeWhileDownloading,
+                onChanged: (v) => settingsProvider.setKeepAwakeWhileDownloading(v),
               ),
             ),
-            Text(
-              LocaleScope.of(context).sidebarVisibilityDesc,
-              style: TextStyle(
-                fontSize: 11.5,
-                color: AppColors.of(context).textMuted,
+            const SizedBox(height: 20),
+            // 侧边栏显示设置 — 小标题（支持搜索定位高亮）
+            _HighlightRegion(
+              label: LocaleScope.of(context).sidebarVisibility,
+              description: LocaleScope.of(context).sidebarVisibilityDesc,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text(
+                      LocaleScope.of(context).sidebarVisibility,
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.of(context).textPrimary,
+                      ),
+                    ),
+                  ),
+                  Text(
+                    LocaleScope.of(context).sidebarVisibilityDesc,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: AppColors.of(context).textMuted,
+                    ),
+                  ),
+                ],
               ),
             ),
             const SizedBox(height: 10),
@@ -837,8 +1313,12 @@ class _GeneralContent extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 20),
-            // 自定义分类管理
-            _CustomCategoryManager(settingsProvider: settingsProvider),
+            // 自定义分类管理（支持搜索定位高亮）
+            _HighlightRegion(
+              label: LocaleScope.of(context).customCategories,
+              description: LocaleScope.of(context).customCategoriesDesc,
+              child: _CustomCategoryManager(settingsProvider: settingsProvider),
+            ),
           ],
         );
       },
@@ -1647,6 +2127,66 @@ class _BtContent extends StatelessWidget {
                   ),
                 ],
               ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// ED2K 设置
+// ─────────────────────────────────────────────
+
+class _Ed2kContent extends StatelessWidget {
+  final SettingsProvider settingsProvider;
+
+  const _Ed2kContent({super.key, required this.settingsProvider});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: settingsProvider,
+      builder: (context, _) {
+        return Column(
+          children: [
+            _SettingCard(
+              label: LocaleScope.of(context).ed2kServerList,
+              description: LocaleScope.of(context).ed2kServerListDesc,
+              vertical: true,
+              child: _Ed2kServerEditor(settingsProvider: settingsProvider),
+            ),
+            const SizedBox(height: 10),
+            _SettingCard(
+              label: LocaleScope.of(context).ed2kServerSub,
+              description: LocaleScope.of(context).ed2kServerSubDesc,
+              vertical: true,
+              child: _Ed2kServerSubEditor(settingsProvider: settingsProvider),
+            ),
+            const SizedBox(height: 10),
+            _SettingCard(
+              label: LocaleScope.of(context).ed2kEnableKad,
+              description: LocaleScope.of(context).ed2kEnableKadDesc,
+              child: ShadSwitch(
+                value: settingsProvider.ed2kEnableKad,
+                onChanged: (v) => settingsProvider.setEd2kEnableKad(v),
+              ),
+            ),
+            const SizedBox(height: 10),
+            _SettingCard(
+              label: LocaleScope.of(context).ed2kEnableUpnp,
+              description: LocaleScope.of(context).ed2kEnableUpnpDesc,
+              child: ShadSwitch(
+                value: settingsProvider.ed2kEnableUpnp,
+                onChanged: (v) => settingsProvider.setEd2kEnableUpnp(v),
+              ),
+            ),
+            const SizedBox(height: 10),
+            _SettingCard(
+              label: LocaleScope.of(context).ed2kListenPort,
+              description: LocaleScope.of(context).ed2kListenPortDesc,
+              child: _Ed2kListenPortEditor(settingsProvider: settingsProvider),
             ),
           ],
         );
@@ -3238,6 +3778,82 @@ class _BtPortRangeEditorState extends State<_BtPortRangeEditor> {
   }
 }
 
+/// ED2K 监听端口编辑器（单端口；0 或空 = OS 自动选择）。
+class _Ed2kListenPortEditor extends StatefulWidget {
+  final SettingsProvider settingsProvider;
+
+  const _Ed2kListenPortEditor({required this.settingsProvider});
+
+  @override
+  State<_Ed2kListenPortEditor> createState() => _Ed2kListenPortEditorState();
+}
+
+class _Ed2kListenPortEditorState extends State<_Ed2kListenPortEditor> {
+  late TextEditingController _controller;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: '${widget.settingsProvider.ed2kListenPort}');
+  }
+
+  @override
+  void didUpdateWidget(_Ed2kListenPortEditor oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final port = int.tryParse(_controller.text);
+    if (widget.settingsProvider.ed2kListenPort != port) {
+      _controller.text = '${widget.settingsProvider.ed2kListenPort}';
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _tryCommit() {
+    final raw = _controller.text.trim();
+    // 空或 0 = OS 自动选择端口。
+    final port = raw.isEmpty ? 0 : int.tryParse(raw);
+    if (port == null || port < 0 || port > 65535) {
+      setState(() => _error = LocaleScope.of(context).btPortInvalid);
+      return;
+    }
+    setState(() => _error = null);
+    widget.settingsProvider.setEd2kListenPort(port);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        SizedBox(
+          width: 130,
+          child: ShadInput(
+            controller: _controller,
+            placeholder: const Text('0'),
+            keyboardType: TextInputType.number,
+            onSubmitted: (_) => _tryCommit(),
+            onChanged: (_) => _tryCommit(),
+          ),
+        ),
+        if (_error != null) ...[
+          const SizedBox(height: 6),
+          Text(
+            _error!,
+            style: TextStyle(fontSize: 11.5, color: c.statusError),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
 /// BT Tracker 列表编辑器
 ///
 /// 使用与 [new_download_dialog] 相同的 Localizations + Material + TextField
@@ -3781,6 +4397,519 @@ class _BtTrackerSubEditorState extends State<_BtTrackerSubEditor> {
                           fontSize: 11,
                           color: c.textSecondary,
                         ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Spacer(),
+                ShadButton(
+                  size: ShadButtonSize.sm,
+                  onPressed: () {
+                    _save();
+                    setState(() => _isExpanded = false);
+                  },
+                  child: Text(s.confirm),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ],
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// ED2K 服务器编辑器
+// ─────────────────────────────────────────────
+
+/// 内置默认 ED2K 服务器列表（与 Rust 端 db.rs 的 ed2k_server_list 默认值同步）。
+/// "重置为默认"时用此列表恢复。
+const _kDefaultEd2kServers = [
+  '176.123.5.89:4725',
+  '45.82.80.155:5687',
+  '85.121.5.137:4232',
+  '176.123.2.239:4232',
+  '145.239.2.134:4661',
+  '91.208.162.87:4232',
+  '37.15.61.236:4232',
+];
+
+/// 默认 server.met 订阅地址（与 Rust 端 server_subscription::DEFAULT_SERVER_MET_URLS 同步）。
+const _kDefaultEd2kMetUrls = [
+  'http://upd.emule-security.org/server.met',
+  'https://www.shortypower.org/server.met',
+];
+
+/// ED2K 手填服务器编辑器：统计 + 重置默认 + 可展开多行编辑（每行一个 host:port）。
+/// 存储为逗号分隔（与 Rust `parse_server_list` 一致），编辑区按行展示。
+class _Ed2kServerEditor extends StatefulWidget {
+  final SettingsProvider settingsProvider;
+
+  const _Ed2kServerEditor({required this.settingsProvider});
+
+  @override
+  State<_Ed2kServerEditor> createState() => _Ed2kServerEditorState();
+}
+
+class _Ed2kServerEditorState extends State<_Ed2kServerEditor> {
+  late TextEditingController _controller;
+  bool _isExpanded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: _toLines(widget.settingsProvider.ed2kServerList));
+  }
+
+  @override
+  void didUpdateWidget(_Ed2kServerEditor oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final asLines = _toLines(widget.settingsProvider.ed2kServerList);
+    if (asLines != _controller.text && !_isExpanded) {
+      _controller.text = asLines;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  /// 逗号分隔 → 每行一个（编辑展示）。
+  static String _toLines(String csv) => csv
+      .split(',')
+      .map((s) => s.trim())
+      .where((s) => s.isNotEmpty)
+      .join('\n');
+
+  void _save() {
+    // 清洗 + 去重（按 trim 后的小写形式判重），存储为逗号分隔。
+    final seen = <String>{};
+    final items = <String>[];
+    for (final raw in _controller.text.split(RegExp(r'[\n,]'))) {
+      final l = raw.trim();
+      if (l.isEmpty) continue;
+      if (seen.add(l.toLowerCase())) items.add(l);
+    }
+    _controller.text = items.join('\n');
+    widget.settingsProvider.setEd2kServerList(items.join(','));
+  }
+
+  int get _serverCount {
+    final text = _controller.text.trim();
+    if (text.isEmpty) return 0;
+    return text.split(RegExp(r'[\n,]')).where((l) => l.trim().isNotEmpty).length;
+  }
+
+  void _resetToDefault() {
+    showShadDialog(
+      context: context,
+      barrierColor: AppColors.of(context).dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (ctx) => ShadDialog.alert(
+        title: Text(LocaleScope.of(ctx).ed2kResetServers),
+        description: Text(LocaleScope.of(ctx).ed2kResetServersConfirm),
+        actions: [
+          ShadButton.outline(
+            child: Text(LocaleScope.of(ctx).cancel),
+            onPressed: () => Navigator.of(ctx).pop(),
+          ),
+          ShadButton(
+            child: Text(LocaleScope.of(ctx).confirm),
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _controller.text = _kDefaultEd2kServers.join('\n');
+              widget.settingsProvider.setEd2kServerList(_kDefaultEd2kServers.join(','));
+              setState(() {});
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final s = LocaleScope.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Text(
+              s.ed2kServerCount(_serverCount),
+              style: TextStyle(fontSize: 12, color: c.textMuted),
+            ),
+            const Spacer(),
+            ShadButton.ghost(
+              size: ShadButtonSize.sm,
+              onPressed: _resetToDefault,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(LucideIcons.rotateCcw, size: 12, color: c.textSecondary),
+                  const SizedBox(width: 4),
+                  Text(
+                    s.ed2kResetServers,
+                    style: TextStyle(fontSize: 11, color: c.textSecondary),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 4),
+            ShadButton.ghost(
+              size: ShadButtonSize.sm,
+              onPressed: () => setState(() => _isExpanded = !_isExpanded),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _isExpanded ? LucideIcons.chevronUp : LucideIcons.chevronDown,
+                    size: 14,
+                    color: c.textSecondary,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _isExpanded ? s.cancel : s.manage,
+                    style: TextStyle(fontSize: 11, color: c.textSecondary),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        if (_isExpanded) ...[
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 200,
+            child: Localizations(
+              locale: const Locale('en'),
+              delegates: const [
+                DefaultWidgetsLocalizations.delegate,
+                DefaultMaterialLocalizations.delegate,
+              ],
+              child: Material(
+                type: MaterialType.transparency,
+                child: TextSelectionTheme(
+                  data: TextSelectionThemeData(
+                    selectionColor: c.accent.withValues(alpha: 0.25),
+                    cursorColor: c.accent,
+                    selectionHandleColor: c.accent,
+                  ),
+                  child: TextField(
+                    controller: _controller,
+                    maxLines: null,
+                    expands: true,
+                    textAlignVertical: TextAlignVertical.top,
+                    cursorColor: c.accent,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: c.textPrimary,
+                      fontFamily: 'monospace',
+                      height: 1.5,
+                    ),
+                    decoration: InputDecoration(
+                      hintText: s.ed2kServerPlaceholder,
+                      hintStyle: TextStyle(fontSize: 12, color: c.textMuted),
+                      hintMaxLines: 3,
+                      contentPadding: const EdgeInsets.all(10),
+                      filled: true,
+                      fillColor: c.inputBg,
+                      hoverColor: Colors.transparent,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide(color: c.inputBorder),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide(color: c.inputBorder),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide(color: c.inputFocusBorder),
+                      ),
+                    ),
+                    onChanged: (_) => setState(() {}),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerRight,
+            child: ShadButton(
+              size: ShadButtonSize.sm,
+              onPressed: () {
+                _save();
+                setState(() => _isExpanded = false);
+              },
+              child: Text(s.confirm),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// ED2K 服务器订阅编辑器：启用开关 + 订阅状态 + 立即更新 + 订阅地址管理。
+class _Ed2kServerSubEditor extends StatefulWidget {
+  final SettingsProvider settingsProvider;
+
+  const _Ed2kServerSubEditor({required this.settingsProvider});
+
+  @override
+  State<_Ed2kServerSubEditor> createState() => _Ed2kServerSubEditorState();
+}
+
+class _Ed2kServerSubEditorState extends State<_Ed2kServerSubEditor> {
+  late TextEditingController _controller;
+  bool _isExpanded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.settingsProvider.ed2kServerSubUrls);
+  }
+
+  @override
+  void didUpdateWidget(_Ed2kServerSubEditor oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.settingsProvider.ed2kServerSubUrls != _controller.text && !_isExpanded) {
+      _controller.text = widget.settingsProvider.ed2kServerSubUrls;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    final seen = <String>{};
+    final lines = <String>[];
+    for (final raw in _controller.text.split('\n')) {
+      final l = raw.trim();
+      if (l.isEmpty) continue;
+      final key = l.toLowerCase().replaceAll(RegExp(r'/+$'), '');
+      if (seen.add(key)) lines.add(l);
+    }
+    final cleaned = lines.join('\n');
+    _controller.text = cleaned;
+    widget.settingsProvider.setEd2kServerSubUrls(cleaned);
+  }
+
+  void _resetToDefault() {
+    showShadDialog(
+      context: context,
+      barrierColor: AppColors.of(context).dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (ctx) => ShadDialog.alert(
+        title: Text(LocaleScope.of(ctx).ed2kResetServers),
+        description: Text(LocaleScope.of(ctx).ed2kServerSubResetConfirm),
+        actions: [
+          ShadButton.outline(
+            child: Text(LocaleScope.of(ctx).cancel),
+            onPressed: () => Navigator.of(ctx).pop(),
+          ),
+          ShadButton(
+            child: Text(LocaleScope.of(ctx).confirm),
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              final defaults = _kDefaultEd2kMetUrls.join('\n');
+              _controller.text = defaults;
+              widget.settingsProvider.setEd2kServerSubUrls(defaults);
+              setState(() {});
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatUpdatedAt(int unixSecs) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(unixSecs * 1000);
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${dt.year}-${two(dt.month)}-${two(dt.day)} '
+        '${two(dt.hour)}:${two(dt.minute)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final s = LocaleScope.of(context);
+    final sp = widget.settingsProvider;
+
+    final String statusText;
+    if (sp.ed2kServerSubRefreshing) {
+      statusText = s.ed2kServerSubUpdating;
+    } else if (sp.ed2kServerSubUpdatedAt > 0) {
+      statusText =
+          '${s.ed2kServerSubStatus(sp.ed2kServerSubCount)} · '
+          '${s.ed2kServerSubUpdatedAt(_formatUpdatedAt(sp.ed2kServerSubUpdatedAt))}';
+    } else {
+      statusText = s.ed2kServerSubNeverUpdated;
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                statusText,
+                style: TextStyle(fontSize: 12, color: c.textMuted),
+              ),
+            ),
+            ShadSwitch(
+              value: sp.ed2kServerSubEnabled,
+              onChanged: (v) => sp.setEd2kServerSubEnabled(v),
+            ),
+          ],
+        ),
+        if (sp.ed2kServerSubEnabled) ...[
+          if (sp.ed2kServerSubLastError.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(
+              '${s.ed2kServerSubUpdateFailed}: ${sp.ed2kServerSubLastError}',
+              style: TextStyle(fontSize: 11, color: c.statusError),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
+          const SizedBox(height: 4),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              ShadButton.ghost(
+                size: ShadButtonSize.sm,
+                onPressed: sp.ed2kServerSubRefreshing
+                    ? null
+                    : () => sp.refreshEd2kServerSubscription(),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (sp.ed2kServerSubRefreshing)
+                      SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: c.textSecondary,
+                        ),
+                      )
+                    else
+                      Icon(LucideIcons.refreshCw, size: 12, color: c.textSecondary),
+                    const SizedBox(width: 4),
+                    Text(
+                      sp.ed2kServerSubRefreshing
+                          ? s.ed2kServerSubUpdating
+                          : s.ed2kServerSubUpdateNow,
+                      style: TextStyle(fontSize: 11, color: c.textSecondary),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 4),
+              ShadButton.ghost(
+                size: ShadButtonSize.sm,
+                onPressed: () => setState(() => _isExpanded = !_isExpanded),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      _isExpanded ? LucideIcons.chevronUp : LucideIcons.chevronDown,
+                      size: 14,
+                      color: c.textSecondary,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      _isExpanded ? s.cancel : s.manage,
+                      style: TextStyle(fontSize: 11, color: c.textSecondary),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (_isExpanded) ...[
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 100,
+              child: Localizations(
+                locale: const Locale('en'),
+                delegates: const [
+                  DefaultWidgetsLocalizations.delegate,
+                  DefaultMaterialLocalizations.delegate,
+                ],
+                child: Material(
+                  type: MaterialType.transparency,
+                  child: TextSelectionTheme(
+                    data: TextSelectionThemeData(
+                      selectionColor: c.accent.withValues(alpha: 0.25),
+                      cursorColor: c.accent,
+                      selectionHandleColor: c.accent,
+                    ),
+                    child: TextField(
+                      controller: _controller,
+                      maxLines: null,
+                      expands: true,
+                      textAlignVertical: TextAlignVertical.top,
+                      cursorColor: c.accent,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: c.textPrimary,
+                        fontFamily: 'monospace',
+                        height: 1.5,
+                      ),
+                      decoration: InputDecoration(
+                        hintText: s.ed2kServerSubPlaceholder,
+                        hintStyle: TextStyle(fontSize: 12, color: c.textMuted),
+                        hintMaxLines: 3,
+                        contentPadding: const EdgeInsets.all(10),
+                        filled: true,
+                        fillColor: c.inputBg,
+                        hoverColor: Colors.transparent,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(color: c.inputBorder),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(color: c.inputBorder),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide(color: c.inputFocusBorder),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                ShadButton.ghost(
+                  size: ShadButtonSize.sm,
+                  onPressed: _resetToDefault,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(LucideIcons.rotateCcw, size: 12, color: c.textSecondary),
+                      const SizedBox(width: 4),
+                      Text(
+                        s.ed2kResetServers,
+                        style: TextStyle(fontSize: 11, color: c.textSecondary),
                       ),
                     ],
                   ),

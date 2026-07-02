@@ -27,7 +27,14 @@ class SettingsProvider extends ChangeNotifier {
   bool _autoCheckUpdate = true; // 默认启动时自动检查更新
   bool _analyticsEnabled = true; // 默认启用匿名数据分析
   bool _notifyOnComplete = true; // 默认任务完成时弹出通知
+  bool _keepAwakeWhileDownloading = false; // 默认不阻止睡眠/息屏
   int _logMaxSizeMb = 10; // 日志总大小上限（MB），超出自动清理
+
+  // 悬浮球设置
+  bool _floatingBallEnabled = false; // 默认关闭（与 closeToTray 保守默认一致）
+  double _floatingBallX = -1; // 绝对像素坐标；-1 哨兵 = 未设置（用默认停靠）
+  double _floatingBallY = -1;
+  bool _clipboardWatchEnabled = false; // 仅 Linux Wayland 降级分支展示
 
   // 侧边栏区块显示设置
   bool _showSidebarStatus = true;    // 显示状态区块
@@ -73,6 +80,20 @@ class SettingsProvider extends ChangeNotifier {
   bool _btTrackerSubRefreshing = false; // 是否正在刷新订阅
   String _btTrackerSubLastError = ''; // 上次刷新的错误信息（空=成功）
 
+  // ED2K 服务器（手填列表 + server.met 社区订阅，Rust 端拉取解析后合并去重）
+  String _ed2kServerList = ''; // 用户手填服务器（逗号分隔 host:port）
+  bool _ed2kServerSubEnabled = true; // 启用 server.met 订阅
+  String _ed2kServerSubUrls = ''; // 订阅地址（换行分隔）
+  int _ed2kServerSubCount = 0; // 订阅缓存中的服务器数量
+  int _ed2kServerSubUpdatedAt = 0; // 上次订阅更新时间（Unix 秒，0=从未）
+  bool _ed2kServerSubRefreshing = false; // 是否正在刷新订阅
+  String _ed2kServerSubLastError = ''; // 上次刷新的错误信息（空=成功）
+
+  // ED2K 客户端（Kad DHT / UPnP / 监听端口）
+  bool _ed2kEnableKad = true; // Kad DHT 去中心化找源
+  bool _ed2kEnableUpnp = true; // UPnP 端口映射争取 HighID
+  int _ed2kListenPort = 0; // TCP/UDP 监听端口（0=OS 选）
+
   // 本地下载服务（油猴脚本接管）
   bool _localServerEnabled = true;
   int _localServerPort = 17800;
@@ -102,6 +123,7 @@ class SettingsProvider extends ChangeNotifier {
   StreamSubscription<RustSignalPack<ConfigLoaded>>? _configSub;
   StreamSubscription<RustSignalPack<FileAssociationStatus>>? _fileAssocSub;
   StreamSubscription<RustSignalPack<TrackerSubscriptionResult>>? _trackerSubSub;
+  StreamSubscription<RustSignalPack<Ed2kServerSubscriptionResult>>? _ed2kSubSub;
 
   SettingsProvider({bool enableFileAssoc = true})
     : _enableFileAssoc = enableFileAssoc {
@@ -121,6 +143,7 @@ class SettingsProvider extends ChangeNotifier {
     _configSub?.cancel();
     _fileAssocSub?.cancel();
     _trackerSubSub?.cancel();
+    _ed2kSubSub?.cancel();
     if (globalInstance == this) {
       globalInstance = null;
     }
@@ -144,7 +167,14 @@ class SettingsProvider extends ChangeNotifier {
   bool get autoCheckUpdate => _autoCheckUpdate;
   bool get analyticsEnabled => _analyticsEnabled;
   bool get notifyOnComplete => _notifyOnComplete;
+  bool get keepAwakeWhileDownloading => _keepAwakeWhileDownloading;
   int get logMaxSizeMb => _logMaxSizeMb;
+
+  // 悬浮球 Getters
+  bool get floatingBallEnabled => _floatingBallEnabled;
+  double get floatingBallX => _floatingBallX;
+  double get floatingBallY => _floatingBallY;
+  bool get clipboardWatchEnabled => _clipboardWatchEnabled;
 
   // 侧边栏显示 Getters
   bool get showSidebarStatus => _showSidebarStatus;
@@ -189,6 +219,20 @@ class SettingsProvider extends ChangeNotifier {
   int get btTrackerSubUpdatedAt => _btTrackerSubUpdatedAt;
   bool get btTrackerSubRefreshing => _btTrackerSubRefreshing;
   String get btTrackerSubLastError => _btTrackerSubLastError;
+
+  // ED2K 服务器 Getters
+  String get ed2kServerList => _ed2kServerList;
+  bool get ed2kServerSubEnabled => _ed2kServerSubEnabled;
+  String get ed2kServerSubUrls => _ed2kServerSubUrls;
+  int get ed2kServerSubCount => _ed2kServerSubCount;
+  int get ed2kServerSubUpdatedAt => _ed2kServerSubUpdatedAt;
+  bool get ed2kServerSubRefreshing => _ed2kServerSubRefreshing;
+  String get ed2kServerSubLastError => _ed2kServerSubLastError;
+
+  // ED2K 客户端 Getters
+  bool get ed2kEnableKad => _ed2kEnableKad;
+  bool get ed2kEnableUpnp => _ed2kEnableUpnp;
+  int get ed2kListenPort => _ed2kListenPort;
 
   // 本地下载服务 Getters
   bool get localServerEnabled => _localServerEnabled;
@@ -291,11 +335,45 @@ class SettingsProvider extends ChangeNotifier {
     AnalyticsService.instance.setEnabled(value);
   }
 
+  void setFloatingBallEnabled(bool value) {
+    if (_floatingBallEnabled == value) return;
+    _floatingBallEnabled = value;
+    notifyListeners();
+    _saveToRust('floating_ball_enabled', value.toString());
+    AnalyticsService.instance.trackEvent(
+      'floating_ball_toggled',
+      segmentation: {'enabled': value.toString()},
+    );
+  }
+
+  /// 保存悬浮球坐标（绝对像素）。拖动结束时调用，不触发 UI 重建。
+  void setFloatingBallPosition(double x, double y) {
+    if (_floatingBallX == x && _floatingBallY == y) return;
+    _floatingBallX = x;
+    _floatingBallY = y;
+    _saveToRust('floating_ball_x', x.toString());
+    _saveToRust('floating_ball_y', y.toString());
+  }
+
+  void setClipboardWatchEnabled(bool value) {
+    if (_clipboardWatchEnabled == value) return;
+    _clipboardWatchEnabled = value;
+    notifyListeners();
+    _saveToRust('clipboard_watch_enabled', value.toString());
+  }
+
   void setNotifyOnComplete(bool value) {
     if (_notifyOnComplete == value) return;
     _notifyOnComplete = value;
     notifyListeners();
     _saveToRust('notify_on_complete', value.toString());
+  }
+
+  void setKeepAwakeWhileDownloading(bool value) {
+    if (_keepAwakeWhileDownloading == value) return;
+    _keepAwakeWhileDownloading = value;
+    notifyListeners();
+    _saveToRust('keep_awake_while_downloading', value.toString());
   }
 
   void setLogMaxSizeMb(int value) {
@@ -520,6 +598,62 @@ class SettingsProvider extends ChangeNotifier {
     const UpdateTrackerSubscription().sendSignalToRust();
   }
 
+  // ED2K 服务器 Setters
+
+  void setEd2kServerList(String value) {
+    if (_ed2kServerList == value) return;
+    _ed2kServerList = value;
+    notifyListeners();
+    _saveToRust('ed2k_server_list', value);
+  }
+
+  void setEd2kServerSubEnabled(bool value) {
+    if (_ed2kServerSubEnabled == value) return;
+    _ed2kServerSubEnabled = value;
+    notifyListeners();
+    _saveToRust('ed2k_server_sub_enabled', value.toString());
+  }
+
+  void setEd2kEnableKad(bool value) {
+    if (_ed2kEnableKad == value) return;
+    _ed2kEnableKad = value;
+    notifyListeners();
+    _saveToRust('ed2k_enable_kad', value.toString());
+  }
+
+  void setEd2kEnableUpnp(bool value) {
+    if (_ed2kEnableUpnp == value) return;
+    _ed2kEnableUpnp = value;
+    notifyListeners();
+    _saveToRust('ed2k_enable_upnp', value.toString());
+  }
+
+  void setEd2kListenPort(int value) {
+    if (_ed2kListenPort == value) return;
+    _ed2kListenPort = value;
+    notifyListeners();
+    _saveToRust('ed2k_listen_port', value.toString());
+  }
+
+  void setEd2kServerSubUrls(String value) {
+    if (_ed2kServerSubUrls == value) return;
+    _ed2kServerSubUrls = value;
+    // Rust 端会在订阅地址变化后自动后台刷新一次
+    _ed2kServerSubRefreshing = true;
+    _ed2kServerSubLastError = '';
+    notifyListeners();
+    _saveToRust('ed2k_server_sub_urls', value);
+  }
+
+  /// 请求 Rust 立即刷新 ED2K 服务器订阅（结果通过 Ed2kServerSubscriptionResult 回传）
+  void refreshEd2kServerSubscription() {
+    if (_ed2kServerSubRefreshing) return;
+    _ed2kServerSubRefreshing = true;
+    _ed2kServerSubLastError = '';
+    notifyListeners();
+    const UpdateEd2kServerSubscription().sendSignalToRust();
+  }
+
   // 本地下载服务 Setters
 
   void setLocalServerEnabled(bool value) {
@@ -653,6 +787,9 @@ class SettingsProvider extends ChangeNotifier {
     _trackerSubSub = TrackerSubscriptionResult.rustSignalStream.listen(
       _onTrackerSubResult,
     );
+    _ed2kSubSub = Ed2kServerSubscriptionResult.rustSignalStream.listen(
+      _onEd2kServerSubResult,
+    );
     if (_enableFileAssoc) {
       _fileAssocSub = FileAssociationStatus.rustSignalStream.listen(
         _onFileAssocStatus,
@@ -674,6 +811,24 @@ class SettingsProvider extends ChangeNotifier {
       _btTrackerSubLastError = '';
     } else {
       _btTrackerSubLastError = msg.error;
+    }
+    notifyListeners();
+  }
+
+  void _onEd2kServerSubResult(RustSignalPack<Ed2kServerSubscriptionResult> pack) {
+    final msg = pack.message;
+    logInfo(
+      'Settings',
+      'ed2k server subscription result: success=${msg.success}, '
+          'count=${msg.serverCount}, sources=${msg.okSources}/${msg.totalSources}',
+    );
+    _ed2kServerSubRefreshing = false;
+    if (msg.success) {
+      _ed2kServerSubCount = msg.serverCount;
+      _ed2kServerSubUpdatedAt = msg.updatedAt;
+      _ed2kServerSubLastError = '';
+    } else {
+      _ed2kServerSubLastError = msg.error;
     }
     notifyListeners();
   }
@@ -732,12 +887,40 @@ class SettingsProvider extends ChangeNotifier {
           _btTrackerSubCount = cache.isEmpty ? 0 : cache.split('\n').length;
         case 'bt_tracker_sub_updated_at':
           _btTrackerSubUpdatedAt = int.tryParse(entry.value) ?? 0;
+        case 'ed2k_server_list':
+          _ed2kServerList = entry.value;
+        case 'ed2k_server_sub_enabled':
+          _ed2kServerSubEnabled = entry.value == 'true';
+        case 'ed2k_server_sub_urls':
+          _ed2kServerSubUrls = entry.value;
+        case 'ed2k_server_sub_cache':
+          final ed2kCache = entry.value.trim();
+          _ed2kServerSubCount =
+              ed2kCache.isEmpty ? 0 : ed2kCache.split(',').length;
+        case 'ed2k_server_sub_updated_at':
+          _ed2kServerSubUpdatedAt = int.tryParse(entry.value) ?? 0;
+        case 'ed2k_enable_kad':
+          _ed2kEnableKad = entry.value == 'true';
+        case 'ed2k_enable_upnp':
+          _ed2kEnableUpnp = entry.value == 'true';
+        case 'ed2k_listen_port':
+          _ed2kListenPort = int.tryParse(entry.value) ?? 0;
         case 'torrent_assoc_prompted':
           _torrentAssocPrompted = entry.value == 'true';
         case 'analytics_enabled':
           _analyticsEnabled = entry.value != 'false'; // 默认 true
         case 'notify_on_complete':
           _notifyOnComplete = entry.value != 'false'; // 默认 true
+        case 'keep_awake_while_downloading':
+          _keepAwakeWhileDownloading = entry.value == 'true'; // 默认 false
+        case 'floating_ball_enabled':
+          _floatingBallEnabled = entry.value == 'true'; // 默认 false
+        case 'floating_ball_x':
+          _floatingBallX = double.tryParse(entry.value) ?? -1;
+        case 'floating_ball_y':
+          _floatingBallY = double.tryParse(entry.value) ?? -1;
+        case 'clipboard_watch_enabled':
+          _clipboardWatchEnabled = entry.value == 'true'; // 默认 false
         case 'log_max_size_mb':
           _logMaxSizeMb = int.tryParse(entry.value) ?? 10;
           LogService.instance.maxTotalBytes = _logMaxSizeMb * 1024 * 1024;

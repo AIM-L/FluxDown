@@ -1215,7 +1215,10 @@ impl DownloadManager {
 
             // Identify completed BT tasks whose staging dir still exists so
             // we can attempt a rescue move before unconditional cleanup.
-            let rescue_input: Vec<(&str, &str, &str)> = task_map
+            // Owned tuples:rescue 内含 move_path(最坏 2s 瞬时锁重试退避),
+            // 必须经 spawn_blocking 跑,不能在 current_thread runtime 上同步
+            // 阻塞(会冻结进度上报/FFI 响应)。
+            let rescue_input: Vec<(String, String, String)> = task_map
                 .iter()
                 .filter_map(|(&id, (status, save_dir, file_name, _))| {
                     if *status != 3 {
@@ -1223,7 +1226,7 @@ impl DownloadManager {
                     }
                     let stage = bt_downloader::bt_stage_dir(save_dir, id);
                     if stage.exists() {
-                        Some((id, *save_dir, *file_name))
+                        Some((id.to_string(), save_dir.to_string(), file_name.to_string()))
                     } else {
                         None
                     }
@@ -1237,7 +1240,11 @@ impl DownloadManager {
                 .collect();
 
             if !rescue_input.is_empty() {
-                let rescued = bt_downloader::rescue_stranded_staging_files(&rescue_input);
+                let rescued = tokio::task::spawn_blocking(move || {
+                    bt_downloader::rescue_stranded_staging_files(&rescue_input)
+                })
+                .await
+                .unwrap_or_default();
                 for (task_id, final_name) in rescued {
                     let tb = total_bytes_map.get(task_id.as_str()).copied().unwrap_or(0);
                     if let Err(e) = self
@@ -1420,6 +1427,23 @@ impl DownloadManager {
         body: Option<downloader::CapturedRequestBody>,
     ) {
         let task_id = Uuid::new_v4().to_string();
+        // ED2K 链接自带文件名/大小/root hash：调用方未显式给名时从链接回填，
+        // 并把 hint_file_size 设为链接声明的大小（run_ed2k_download 以链接为准）。
+        let (file_name, hint_file_size) = if crate::ed2k::link::is_ed2k_url(&url) {
+            match crate::ed2k::link::parse_ed2k_link(&url) {
+                Ok(link) => {
+                    let name = if file_name.trim().is_empty() {
+                        link.file_name.clone()
+                    } else {
+                        file_name
+                    };
+                    (name, link.total_bytes as i64)
+                }
+                Err(_) => (file_name, hint_file_size),
+            }
+        } else {
+            (file_name, hint_file_size)
+        };
         // When segments <= 0 ("auto"), store 0 in DB and let the downloader
         // dynamically calculate the optimal count after probing file size,
         // CPU cores, and bandwidth.
@@ -1615,6 +1639,7 @@ impl DownloadManager {
         let use_hls = hls_downloader::is_hls_url(&url);
         let use_dash = dash_downloader::is_dash_url(&url);
         let use_bt = is_magnet(&url) || !torrent_file_bytes.is_empty() || is_torrent_file_url(&url);
+        let use_ed2k = crate::ed2k::link::is_ed2k_url(&url);
 
         // Insert a placeholder entry now so capacity/queue checks are correct
         // for any reentrant calls that may occur during BT session init below.
@@ -1964,6 +1989,10 @@ impl DownloadManager {
                     std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
                         .catch_unwind()
                         .await
+                } else if use_ed2k {
+                    std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
+                        .catch_unwind()
+                        .await
                 } else {
                     std::panic::AssertUnwindSafe(downloader::run_download(params))
                         .catch_unwind()
@@ -2237,6 +2266,7 @@ impl DownloadManager {
         let use_hls = hls_downloader::is_hls_url(&task.url);
         let use_dash = dash_downloader::is_dash_url(&task.url);
         let use_bt = is_bt_url(&task.url);
+        let use_ed2k = crate::ed2k::link::is_ed2k_url(&task.url);
 
         // Insert placeholder entry (handle filled in after tokio::spawn).
         self.active_tasks.insert(
@@ -2497,6 +2527,10 @@ impl DownloadManager {
                         .await
                 } else if use_dash {
                     std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
+                        .catch_unwind()
+                        .await
+                } else if use_ed2k {
+                    std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
                         .catch_unwind()
                         .await
                 } else {

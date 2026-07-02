@@ -38,6 +38,13 @@ pub enum DownloadError {
     /// single-stream mode.
     #[error("server does not support Range requests (returned {0} instead of 206 Partial Content)")]
     RangeNotSupported(String),
+    #[error("ed2k error: {0}")]
+    Ed2k(String),
+    /// ED2K 协议完整性违规：hashset 投毒 / 块 MD4 不匹配 / SENDINGPART 越界 /
+    /// 未请求数据 / 区间碎片超限。与 [`DownloadError::Ed2k`]（纯网络类）区分，
+    /// 调度层据此把违规 peer 拉黑（贯穿整个下载调用），而非仅退避。
+    #[error("ed2k integrity violation: {0}")]
+    Ed2kIntegrity(String),
     #[error("{0}")]
     Other(String),
 }

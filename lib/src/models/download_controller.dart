@@ -143,6 +143,7 @@ class DownloadController extends ChangeNotifier {
     final lower = url.toLowerCase();
     if (lower.startsWith('ftp')) return 'ftp';
     if (lower.startsWith('magnet:')) return 'bt';
+    if (lower.startsWith('ed2k://')) return 'ed2k';
     return 'http';
   }
 

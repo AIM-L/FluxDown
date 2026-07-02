@@ -140,6 +140,8 @@ class S {
   String get searchGroupSettings => _t('设置', 'Settings');
   String settingsSearchSubtitle(String catLabel, String desc) =>
       _t('设置 · $catLabel · $desc', 'Settings · $catLabel · $desc');
+  String get settingsSearchHint => _t('搜索设置...', 'Search settings...');
+  String get settingsSearchNoResults => _t('无匹配的设置项', 'No matching settings');
   String get pauseAll => _t('全部暂停', 'Pause All');
   String get resumeAll => _t('全部恢复', 'Resume All');
   String get toggleToLight => _t('切换到亮色模式', 'Switch to Light Mode');
@@ -367,6 +369,8 @@ class S {
       _t('下载引擎配置', 'Download engine settings');
   String get settingsCatBt => _t('BitTorrent', 'BitTorrent');
   String get settingsCatBtDesc => _t('BT 下载设置', 'BitTorrent settings');
+  String get settingsCatEd2k => _t('eD2K', 'eD2K');
+  String get settingsCatEd2kDesc => _t('电驴 / eMule 下载设置', 'eD2K / eMule settings');
   String get settingsCatProxy => _t('代理', 'Proxy');
   String get settingsCatProxyDesc => _t('网络代理配置', 'Network proxy settings');
   String get settingsCatLocalServer => _t('RPC', 'RPC');
@@ -387,6 +391,25 @@ class S {
     '点击关闭按钮时隐藏到系统托盘，而非退出应用',
     'Hide to system tray instead of quitting when closing',
   );
+  String get floatingBall => _t('桌面悬浮球', 'Desktop Floating Ball');
+  String get floatingBallDesc => _t(
+    '桌面常驻置顶小球，显示下载速度与进度，支持拖拽链接/种子快速建任务',
+    'Always-on-top desktop widget showing speed & progress; drag URLs or torrents onto it to create tasks',
+  );
+  String get floatingBallWaylandUnsupported => _t(
+    '当前桌面环境（Wayland）不支持悬浮窗定位与置顶，悬浮球不可用。已启用替代方案：托盘显示实时速度；复制链接后唤起主窗口会自动填入下载对话框。本地文件（含 .torrent）请从主窗口添加或双击文件。',
+    'Your desktop session (Wayland) does not allow positioned always-on-top windows, so the floating ball is unavailable. Alternatives enabled: the tray shows live speed, and copied URLs are auto-filled into the download dialog when you open the main window. Add local files (incl. .torrent) from the main window or by double-clicking them.',
+  );
+  String get clipboardWatch => _t('剪贴板监听', 'Clipboard Watcher');
+  String get clipboardWatchDesc => _t(
+    '主窗口隐藏时监测剪贴板中的下载链接并通知（仅部分桌面环境可用）',
+    'Watch the clipboard for download URLs while the main window is hidden (availability depends on desktop environment)',
+  );
+  String get clipboardUrlDetectedTitle => _t('检测到下载链接', 'Download link detected');
+  String get clipboardUrlDetectedBody =>
+      _t('点击创建下载任务', 'Click to create a download task');
+  String get trayShowFloatingBall => _t('显示悬浮球', 'Show Floating Ball');
+  String get hideFloatingBall => _t('隐藏悬浮球', 'Hide Floating Ball');
   String get torrentFileAssociation =>
       _t('关联 .torrent 文件', 'Associate .torrent Files');
   String get torrentFileAssociationDesc => _t(
@@ -407,6 +430,11 @@ class S {
   String get notifyOnCompleteDesc => _t(
     '任务完成时弹出系统通知，关闭后所有任务完成将不再通知',
     'Show a system notification when a task completes. When disabled, no completion notifications will be shown',
+  );
+  String get keepAwakeWhileDownloading => _t('下载时保持唤醒', 'Keep Awake While Downloading');
+  String get keepAwakeWhileDownloadingDesc => _t(
+    '有任务下载时阻止系统睡眠和息屏，任务完成后自动恢复',
+    'Prevent the system from sleeping or turning off the display while downloads are active. Restores automatically when done',
   );
 
   // 侧边栏显示
@@ -818,6 +846,60 @@ class S {
   );
 
   // ─────────────────────────────────────────────
+  // eD2K 服务器设置
+  // ─────────────────────────────────────────────
+  String get ed2kSettings => _t('eD2K 服务器', 'eD2K Servers');
+  String get ed2kSettingsDesc =>
+      _t('配置电驴服务器与 server.met 订阅', 'Configure eD2K servers and server.met subscription');
+  String get ed2kServerList => _t('服务器列表', 'Server List');
+  String get ed2kServerListDesc => _t(
+    '手动填写的电驴服务器（用于找源），与订阅列表自动合并去重',
+    'Manually configured eD2K servers (for finding sources), merged and deduplicated with the subscription list',
+  );
+  String ed2kServerCount(int n) => _t('$n 个服务器', '$n servers');
+  String get ed2kResetServers => _t('重置为默认', 'Reset to Default');
+  String get ed2kResetServersConfirm =>
+      _t('确定要恢复默认的服务器列表吗？', 'Reset server list to defaults?');
+  String get ed2kServerPlaceholder => _t(
+    '每行一个服务器地址，例如：\n176.123.5.89:4725\n45.82.80.155:5687',
+    'One server per line, e.g.:\n176.123.5.89:4725\n45.82.80.155:5687',
+  );
+  String get ed2kServerSub => _t('服务器订阅', 'Server Subscription');
+  String get ed2kServerSubDesc => _t(
+    '定期从社区维护的 server.met 获取最新服务器，自动与上方列表合并去重',
+    'Periodically fetch up-to-date servers from community-maintained server.met lists, merged and deduplicated with the list above',
+  );
+  String get ed2kEnableKad => _t('Kad DHT 找源', 'Kad DHT source finding');
+  String get ed2kEnableKadDesc => _t(
+    '通过 Kad 分布式网络去中心化找源，服务器全挂时仍可找到文件源',
+    'Find sources via the decentralized Kad network, works even when all servers are down',
+  );
+  String get ed2kEnableUpnp => _t('UPnP 端口映射', 'UPnP port mapping');
+  String get ed2kEnableUpnpDesc => _t(
+    '通过 UPnP 自动映射端口争取 HighID，可连接更多对等端并接收回连',
+    'Auto-map ports via UPnP to obtain HighID, connecting to more peers and receiving callbacks',
+  );
+  String get ed2kListenPort => _t('监听端口', 'Listen port');
+  String get ed2kListenPortDesc => _t(
+    'eD2K 客户端 TCP/UDP 监听端口（0 = 系统自动选择）',
+    'eD2K client TCP/UDP listen port (0 = auto-select)',
+  );
+  String ed2kServerSubStatus(int n) =>
+      _t('已订阅 $n 个服务器', '$n servers subscribed');
+  String get ed2kServerSubNeverUpdated => _t('尚未更新', 'Not updated yet');
+  String ed2kServerSubUpdatedAt(String time) =>
+      _t('更新于 $time', 'Updated at $time');
+  String get ed2kServerSubUpdateNow => _t('立即更新', 'Update Now');
+  String get ed2kServerSubUpdating => _t('更新中…', 'Updating…');
+  String get ed2kServerSubUpdateFailed => _t('更新失败', 'Update failed');
+  String get ed2kServerSubPlaceholder => _t(
+    '每行一个 server.met 地址，例如：\nhttp://upd.emule-security.org/server.met\nhttps://www.shortypower.org/server.met',
+    'One server.met URL per line, e.g.:\nhttp://upd.emule-security.org/server.met\nhttps://www.shortypower.org/server.met',
+  );
+  String get ed2kServerSubResetConfirm =>
+      _t('确定要恢复默认的订阅地址吗？', 'Reset subscription URLs to defaults?');
+
+  // ─────────────────────────────────────────────
   // File picker 错误
   // ─────────────────────────────────────────────
 
@@ -917,6 +999,13 @@ class S {
   List<String> get searchKeywordsCloseToTray =>
       _t('关闭,托盘,最小化', 'close,tray,minimize').split(',')
         ..addAll(['tray', 'close', 'minimize']);
+  List<String> get searchKeywordsFloatingBall =>
+      _t('悬浮球,悬浮窗,桌面,挂件,速度球', 'floating,ball,widget,overlay,desktop')
+          .split(',')
+        ..addAll(['floating', 'ball', 'widget', 'overlay']);
+  List<String> get searchKeywordsClipboardWatch =>
+      _t('剪贴板,监听,链接,复制', 'clipboard,watch,monitor,link,copy').split(',')
+        ..addAll(['clipboard', 'watch', 'monitor']);
   List<String> get searchKeywordsLanguage =>
       _t('语言,中文,英文,切换语言', 'language,chinese,english,locale').split(',')
         ..addAll(['language', 'locale', 'lang']);
@@ -956,10 +1045,18 @@ class S {
     '通知,完成,提醒,弹窗,系统通知',
     'notification,complete,alert,popup,system,toast',
   ).split(',')..addAll(['notification', 'complete', 'toast']);
+  List<String> get searchKeywordsKeepAwake => _t(
+    '唤醒,睡眠,息屏,锁屏,休眠,屏幕',
+    'awake,sleep,screen,lock,display,wake,caffeinate',
+  ).split(',')..addAll(['awake', 'sleep', 'screen', 'wake']);
   List<String> get searchKeywordsBtSettings => _t(
     'BT,BitTorrent,种子,磁力,Tracker,DHT,UPnP,端口',
     'BT,BitTorrent,torrent,magnet,tracker,DHT,UPnP,port',
   ).split(',')..addAll(['bt', 'torrent', 'tracker', 'dht', 'peer']);
+  List<String> get searchKeywordsEd2kSettings => _t(
+    'eD2K,电驴,eMule,ed2k,服务器,server.met,订阅',
+    'eD2K,eMule,ed2k,edonkey,server,server.met,subscription',
+  ).split(',')..addAll(['ed2k', 'emule', 'edonkey', 'server']);
   List<String> get searchKeywordsProxy => _t(
     '代理,HTTP,SOCKS,SOCKS5,SOCKS4,网络代理,代理服务器',
     'proxy,HTTP,SOCKS,SOCKS5,SOCKS4,network,server',
