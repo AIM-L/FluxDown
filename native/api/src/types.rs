@@ -64,6 +64,11 @@ pub struct DownloadRequest {
     pub url: String,
     #[serde(default)]
     pub filename: String,
+    /// 保存目录（aria2 `dir` 选项 / 接管请求 `saveDir` 字段）。
+    /// 空 = 由宿主按分类匹配 / 默认目录决定。
+    #[serde(rename = "saveDir")]
+    #[serde(default)]
+    pub save_dir: String,
     #[serde(default)]
     pub referrer: String,
     #[serde(default)]

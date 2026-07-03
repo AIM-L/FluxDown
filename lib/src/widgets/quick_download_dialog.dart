@@ -52,6 +52,7 @@ void showQuickDownloadDialog(
   required String defaultSaveDir,
   String referrer = '',
   String defaultQueueId = '',
+  bool saveDirFromRequest = false,
 }) {
   showShadDialog(
     context: context,
@@ -67,6 +68,7 @@ void showQuickDownloadDialog(
       referrer: referrer,
       defaultSaveDir: defaultSaveDir,
       defaultQueueId: defaultQueueId,
+      saveDirFromRequest: saveDirFromRequest,
     ),
   );
 }
@@ -81,6 +83,10 @@ class _QuickDownloadDialogContent extends StatefulWidget {
   final String defaultSaveDir;
   final String defaultQueueId;
 
+  /// 保存目录是否由外部请求显式指定（aria2 `dir` / 接管 `saveDir`）。
+  /// true 时跳过按文件名的分类目录自动匹配，尊重请求方指定。
+  final bool saveDirFromRequest;
+
   const _QuickDownloadDialogContent({
     required this.url,
     required this.filename,
@@ -90,6 +96,7 @@ class _QuickDownloadDialogContent extends StatefulWidget {
     required this.referrer,
     required this.defaultSaveDir,
     required this.defaultQueueId,
+    this.saveDirFromRequest = false,
   });
 
   @override
@@ -159,70 +166,22 @@ class _QuickDownloadDialogContentState
     selectedThreads = lastThreads.isNotEmpty
         ? (lastThreads == 'auto' ? null : lastThreads)
         : _effectiveSegmentsOption(_selectedQueueId);
-    // 根据已知文件名自动匹配分类保存目录
-    _tryAutoApplySaveDir(widget.filename);
+    // 根据已知文件名自动匹配分类保存目录（请求方显式指定目录时尊重之，跳过匹配）
+    if (!widget.saveDirFromRequest) {
+      _tryAutoApplySaveDir(widget.filename);
+    }
     // 初始化时计算一次
     _onUrlChanged();
   }
 
   void _onUrlChanged() {
-    final entries = _parseEntries(_urlController.text);
+    final entries = parseQuickDownloadEntries(_urlController.text);
     final count = entries.length;
     if (count != _urlCount) {
       setState(() {
         _urlCount = count;
       });
     }
-  }
-
-  /// 解析 aria2 风格的下载条目（URL + 可选 out=/checksum= 选项行）
-  static List<_QuickEntry> _parseEntries(String text) {
-    final lines = text.split('\n');
-    final entries = <_QuickEntry>[];
-    _QuickEntry? current;
-    final urlPattern = RegExp(r'^(https?|ftp)://\S+', caseSensitive: false);
-
-    for (final line in lines) {
-      // 选项行
-      if (line.startsWith(' ') || line.startsWith('\t')) {
-        if (current == null) continue;
-        final trimmed = line.trim();
-        if (trimmed.startsWith('out=')) {
-          current = _QuickEntry(
-            current.url,
-            fileName: trimmed.substring(4),
-            checksum: current.checksum,
-          );
-        } else if (trimmed.startsWith('checksum=')) {
-          current = _QuickEntry(
-            current.url,
-            fileName: current.fileName,
-            checksum: trimmed.substring(9),
-          );
-        }
-        continue;
-      }
-
-      final trimmed = line.trim();
-      if (trimmed.isEmpty) continue;
-      if (trimmed.startsWith('#')) continue;
-
-      if (current != null) {
-        entries.add(current);
-        current = null;
-      }
-
-      if (trimmed.toLowerCase().startsWith('magnet:?')) {
-        current = _QuickEntry(trimmed);
-      } else {
-        final match = urlPattern.firstMatch(trimmed);
-        if (match != null) {
-          current = _QuickEntry(match.group(0)!);
-        }
-      }
-    }
-    if (current != null) entries.add(current);
-    return entries;
   }
 
   @override
@@ -310,7 +269,7 @@ class _QuickDownloadDialogContentState
     final saveDir = _saveDirController.text.trim();
     if (saveDir.isEmpty) return;
 
-    final entries = _parseEntries(_urlController.text);
+    final entries = parseQuickDownloadEntries(_urlController.text);
     if (entries.isEmpty) return;
 
     // 记录本次保存位置，供"跟随上次保存位置"开关使用
@@ -772,11 +731,64 @@ class _QuickDownloadDialogContentState
 }
 
 /// 解析后的单条下载入口（URL + 可选 out= 文件名 + 可选 checksum=）
-class _QuickEntry {
+class QuickDownloadEntry {
   final String url;
   final String fileName;
   final String checksum;
-  const _QuickEntry(this.url, {this.fileName = '', this.checksum = ''});
+  const QuickDownloadEntry(this.url, {this.fileName = '', this.checksum = ''});
+}
+
+/// 解析 aria2 风格的下载条目（URL + 可选 out=/checksum= 选项行）。
+///
+/// 外部下载请求的 `url` 字段可能是换行连接的多条 URL（aria2 addUri 多 URI /
+/// 脚本接管批量接口约定），快速下载对话框与免打扰静默路径共用本解析器。
+List<QuickDownloadEntry> parseQuickDownloadEntries(String text) {
+  final lines = text.split('\n');
+  final entries = <QuickDownloadEntry>[];
+  QuickDownloadEntry? current;
+  final urlPattern = RegExp(r'^(https?|ftp)://\S+', caseSensitive: false);
+
+  for (final line in lines) {
+    // 选项行
+    if (line.startsWith(' ') || line.startsWith('\t')) {
+      if (current == null) continue;
+      final trimmed = line.trim();
+      if (trimmed.startsWith('out=')) {
+        current = QuickDownloadEntry(
+          current.url,
+          fileName: trimmed.substring(4),
+          checksum: current.checksum,
+        );
+      } else if (trimmed.startsWith('checksum=')) {
+        current = QuickDownloadEntry(
+          current.url,
+          fileName: current.fileName,
+          checksum: trimmed.substring(9),
+        );
+      }
+      continue;
+    }
+
+    final trimmed = line.trim();
+    if (trimmed.isEmpty) continue;
+    if (trimmed.startsWith('#')) continue;
+
+    if (current != null) {
+      entries.add(current);
+      current = null;
+    }
+
+    if (trimmed.toLowerCase().startsWith('magnet:?')) {
+      current = QuickDownloadEntry(trimmed);
+    } else {
+      final match = urlPattern.firstMatch(trimmed);
+      if (match != null) {
+        current = QuickDownloadEntry(match.group(0)!);
+      }
+    }
+  }
+  if (current != null) entries.add(current);
+  return entries;
 }
 
 /// 信息标签（文件大小 / MIME 类型）

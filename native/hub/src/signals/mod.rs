@@ -161,6 +161,9 @@ pub struct SegmentDetail {
 pub struct ExternalDownloadRequest {
     pub url: String,
     pub filename: String,
+    /// 请求指定的保存目录（aria2 `dir` 选项 / 接管请求 `saveDir`）。
+    /// 空 = 由 Dart 端按分类匹配 / 默认目录决定。
+    pub save_dir: String,
     pub referrer: String,
     pub file_size: i64,    // 0 = unknown
     pub mime_type: String, // empty = unknown

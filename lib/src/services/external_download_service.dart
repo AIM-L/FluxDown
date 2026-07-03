@@ -74,6 +74,67 @@ class ExternalDownloadService {
       'received request: url=${req.url}, filename=${req.filename}, size=${req.fileSize}',
     );
 
+    // 免打扰下载：不弹确认框、不抢前台，直接按默认设置创建任务。
+    // 优先 globalInstance（始终反映用户最新设置），fallback 到启动时实例。
+    final silentSettings = SettingsProvider.globalInstance ?? settingsProvider;
+    if (silentSettings.silentDownloadEnabled) {
+      // url 可能是换行连接的多条 URL（aria2 addUri 多 URI / 脚本接管批量），
+      // 与快速下载对话框共用同一解析器：单条走 ConfirmExternalDownload
+      // （保留 Rust 侧按 URL 缓存的请求上下文），多条走 BatchCreateTask。
+      final entries = parseQuickDownloadEntries(req.url);
+      // 请求方显式指定的目录（aria2 dir / 接管 saveDir）优先于分类匹配。
+      final requestedDir = req.saveDir.trim();
+      final saveDir = requestedDir.isNotEmpty
+          ? requestedDir
+          : _resolveSilentSaveDir(silentSettings, req.filename);
+      if (entries.isNotEmpty && saveDir.isNotEmpty) {
+        logInfo(
+          _tag,
+          'silent download enabled, creating ${entries.length} task(s) '
+          'directly: saveDir=$saveDir',
+        );
+        final segments = silentSettings.defaultSegments;
+        final queueId = silentSettings.defaultQueueId;
+        if (entries.length == 1) {
+          final entry = entries.first;
+          ConfirmExternalDownload(
+            url: entry.url,
+            saveDir: saveDir,
+            fileName: req.filename.isNotEmpty ? req.filename : entry.fileName,
+            segments: segments,
+            cookies: req.cookies,
+            referrer: req.referrer,
+            hintFileSize: req.fileSize,
+            proxyUrl: '',
+            userAgent: '',
+            queueId: queueId,
+          ).sendSignalToRust();
+        } else {
+          BatchCreateTask(
+            entries: entries
+                .map(
+                  (e) => UrlEntry(
+                    url: e.url,
+                    fileName: e.fileName,
+                    checksum: e.checksum,
+                  ),
+                )
+                .toList(),
+            saveDir: saveDir,
+            segments: segments,
+            proxyUrl: '',
+            userAgent: '',
+            queueId: queueId,
+            cookies: req.cookies,
+            referrer: req.referrer,
+          ).sendSignalToRust();
+        }
+        return;
+      }
+      // 无有效 URL 或无可用保存目录 — 降级为弹框，让用户处理。
+      logError(_tag, 'silent download: no entries or save dir, falling back');
+    }
+
     // 防止重复弹窗 — 检查标志并验证 Navigator 上是否仍有弹窗路由
     if (_dialogOpen) {
       bool stillOpen = false;
@@ -121,6 +182,7 @@ class ExternalDownloadService {
       // 不会收到用户在 UI 中修改设置后的变更通知，仅作为 fallback。
       final effectiveSettings =
           SettingsProvider.globalInstance ?? settingsProvider;
+      final requestedDir = req.saveDir.trim();
       showQuickDownloadDialog(
         context,
         url: req.url,
@@ -129,14 +191,42 @@ class ExternalDownloadService {
         mimeType: req.mimeType,
         cookies: req.cookies,
         referrer: req.referrer,
-        defaultSaveDir: effectiveSettings.effectiveDefaultSaveDir,
+        defaultSaveDir: requestedDir.isNotEmpty
+            ? requestedDir
+            : effectiveSettings.effectiveDefaultSaveDir,
         defaultQueueId: effectiveSettings.defaultQueueId,
+        saveDirFromRequest: requestedDir.isNotEmpty,
       );
       logInfo(_tag, 'dialog shown');
     } catch (e, stack) {
       logError(_tag, 'failed to show dialog', e, stack);
       _dialogOpen = false;
     }
+  }
+
+  /// 免打扰模式下解析保存目录，与快速下载对话框的分类匹配逻辑一致：
+  /// 普通分类（按 position 排序）→ other 分类 → 生效的默认目录。
+  String _resolveSilentSaveDir(SettingsProvider settings, String fileName) {
+    if (fileName.isNotEmpty) {
+      final categories = settings.customCategories
+          .where((c) => c.visible)
+          .toList()
+        ..sort((a, b) => a.position.compareTo(b.position));
+      final normals = categories
+          .where((c) => c.builtinType != 'all' && c.builtinType != 'other')
+          .toList();
+      for (final cat in normals) {
+        if (cat.saveDir.isNotEmpty && cat.matches(fileName)) {
+          return cat.saveDir;
+        }
+      }
+      for (final cat in categories) {
+        if (cat.builtinType != 'other' || cat.saveDir.isEmpty) continue;
+        if (!normals.any((c) => c.matches(fileName))) return cat.saveDir;
+        break;
+      }
+    }
+    return settings.effectiveDefaultSaveDir;
   }
 
   /// 强制将主窗口带到前台。

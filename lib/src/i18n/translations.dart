@@ -430,6 +430,11 @@ class S {
     '任务完成时弹出系统通知，关闭后所有任务完成将不再通知',
     'Show a system notification when a task completes. When disabled, no completion notifications will be shown',
   );
+  String get silentDownload => _t('免打扰下载', 'Silent Download');
+  String get silentDownloadDesc => _t(
+    '浏览器扩展等外部下载请求不再弹出确认框，直接按默认设置开始下载',
+    'Start external downloads (e.g. from the browser extension) immediately with default settings, without showing the confirmation dialog',
+  );
   String get keepAwakeWhileDownloading =>
       _t('下载时保持唤醒', 'Keep Awake While Downloading');
   String get keepAwakeWhileDownloadingDesc => _t(
@@ -1108,6 +1113,10 @@ class S {
     '通知,完成,提醒,弹窗,系统通知',
     'notification,complete,alert,popup,system,toast',
   ).split(',')..addAll(['notification', 'complete', 'toast']);
+  List<String> get searchKeywordsSilentDownload => _t(
+    '免打扰,静默,确认框,弹窗,扩展,自动下载',
+    'silent,quiet,confirm,dialog,extension,auto',
+  ).split(',')..addAll(['silent', 'confirm', 'dialog']);
   List<String> get searchKeywordsKeepAwake => _t(
     '唤醒,睡眠,息屏,锁屏,休眠,屏幕',
     'awake,sleep,screen,lock,display,wake,caffeinate',

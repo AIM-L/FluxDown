@@ -448,6 +448,7 @@ NMH 注册：
 | 行为 | `closeToTray` | 关闭到系统托盘 |
 | 行为 | `autoStartup` | 开机启动 |
 | 行为 | `autoCheckUpdate` | 自动检查更新 |
+| 行为 | `silentDownloadEnabled` | 免打扰下载：外部下载请求不弹确认框，直接按默认设置创建任务（默认关） |
 | BT | `btEnableDht` | 启用 DHT |
 | BT | `btEnableUpnp` | 启用 UPnP |
 | BT | `btPortStart/End` | 端口范围 |

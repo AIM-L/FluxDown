@@ -843,6 +843,10 @@
           "referrer": {
             "type": "string"
           },
+          "saveDir": {
+            "type": "string",
+            "description": "保存目录（aria2 `dir` 选项 / 接管请求 `saveDir` 字段）。\n空 = 由宿主按分类匹配 / 默认目录决定。"
+          },
           "url": {
             "type": "string"
           }

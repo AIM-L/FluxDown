@@ -12,8 +12,8 @@ use crate::types::DownloadRequest;
 /// 解析批量下载请求体。
 ///
 /// 支持两种形态：
-/// - `{ "urls": ["u1","u2"], "referrer": "", "cookies": "", "headers": {} }`
-/// - `{ "items": [ { ...DownloadRequest }, ... ] }`（取各项 url，共享首个非空 cookies/referrer）
+/// - `{ "urls": ["u1","u2"], "saveDir": "", "referrer": "", "cookies": "", "headers": {} }`
+/// - `{ "items": [ { ...DownloadRequest }, ... ] }`（取各项 url，共享首个非空 saveDir/cookies/referrer）
 ///
 /// 统一合并为**单个** [`DownloadRequest`]，`url` 以换行符连接 —— 与 Dart 快速下载
 /// 弹框「按换行拆分批量创建」的既有约定一致，用户只需确认一次。
@@ -43,6 +43,7 @@ pub(crate) fn parse_batch(body: &[u8]) -> Result<DownloadRequest, String> {
         return Ok(DownloadRequest {
             url: joined,
             filename: String::new(),
+            save_dir: str_field(&v, "saveDir"),
             referrer: str_field(&v, "referrer"),
             cookies: str_field(&v, "cookies"),
             headers,
@@ -82,12 +83,18 @@ pub(crate) fn parse_batch(body: &[u8]) -> Result<DownloadRequest, String> {
             .map(|d| d.referrer.clone())
             .find(|r| !r.is_empty())
             .unwrap_or_default();
+        let save_dir = parsed
+            .iter()
+            .map(|d| d.save_dir.clone())
+            .find(|s| !s.is_empty())
+            .unwrap_or_default();
         let headers = parsed
             .iter()
             .find_map(|d| d.headers.clone().filter(|h| !h.is_empty()));
         return Ok(DownloadRequest {
             url: joined,
             filename: String::new(),
+            save_dir,
             referrer,
             cookies,
             headers,
@@ -115,19 +122,21 @@ mod tests {
 
     #[test]
     fn parse_batch_urls_form_joins_and_carries_shared_fields() {
-        let body = br#"{"urls":["https://a.com/1.zip","https://b.com/2.zip"],"referrer":"https://p.com/","cookies":"s=1"}"#;
+        let body = br#"{"urls":["https://a.com/1.zip","https://b.com/2.zip"],"saveDir":"D:/dl","referrer":"https://p.com/","cookies":"s=1"}"#;
         let dl = parse_batch(body).unwrap();
         assert_eq!(dl.url, "https://a.com/1.zip\nhttps://b.com/2.zip");
+        assert_eq!(dl.save_dir, "D:/dl");
         assert_eq!(dl.referrer, "https://p.com/");
         assert_eq!(dl.cookies, "s=1");
     }
 
     #[test]
     fn parse_batch_items_form_uses_first_non_empty_cookies() {
-        let body = br#"{"items":[{"url":"https://a.com/1.zip","cookies":"s=1"},{"url":"https://b.com/2.zip"}]}"#;
+        let body = br#"{"items":[{"url":"https://a.com/1.zip","cookies":"s=1"},{"url":"https://b.com/2.zip","saveDir":"D:/dl"}]}"#;
         let dl = parse_batch(body).unwrap();
         assert_eq!(dl.url, "https://a.com/1.zip\nhttps://b.com/2.zip");
         assert_eq!(dl.cookies, "s=1");
+        assert_eq!(dl.save_dir, "D:/dl");
     }
 
     #[test]

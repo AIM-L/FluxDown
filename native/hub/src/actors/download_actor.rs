@@ -791,6 +791,7 @@ pub async fn run(db_dir: PathBuf) {
                 ExternalDownloadRequest {
                     url: req.url,
                     filename: req.filename,
+                    save_dir: req.save_dir,
                     referrer: req.referrer,
                     file_size: req.file_size.unwrap_or(0),
                     mime_type: req.mime_type.unwrap_or_default(),

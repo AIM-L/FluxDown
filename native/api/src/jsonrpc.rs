@@ -96,7 +96,7 @@ async fn dispatch_method(method: &str, params: &Value, id: &Value, host: &dyn Ap
                 let gid = pseudo_gid(&dl.url);
                 match host.submit_external(dl).await {
                     Ok(()) => rpc_ok(id, Value::String(gid)),
-                    Err(_) => rpc_err(id, 1, "app shutting down"),
+                    Err(e) => rpc_err(id, 1, &e.to_string()),
                 }
             }
             Err(e) => rpc_err(id, -32602, &e),
@@ -189,7 +189,7 @@ pub(crate) fn pseudo_gid(seed: &str) -> String {
 ///
 /// `params = [ "token:xxx"?, [uris...], { options }? ]`
 ///
-/// 支持的 options：`dir`（忽略，保存目录由弹框/全局决定）、`out`→filename、
+/// 支持的 options：`dir`→save_dir、`out`→filename、
 /// `referer`/`referrer`→referrer、`header`（字符串数组）→Cookie/Referer/其它头。
 pub(crate) fn aria2_add_uri_to_download_request(params: &Value) -> Result<DownloadRequest, String> {
     let arr = params.as_array().ok_or("params must be an array")?;
@@ -219,6 +219,7 @@ pub(crate) fn aria2_add_uri_to_download_request(params: &Value) -> Result<Downlo
     let options = arr.get(idx + 1).and_then(|v| v.as_object());
 
     let mut filename = String::new();
+    let mut save_dir = String::new();
     let mut referrer = String::new();
     let mut cookies = String::new();
     let mut extra_headers: HashMap<String, String> = HashMap::new();
@@ -226,6 +227,9 @@ pub(crate) fn aria2_add_uri_to_download_request(params: &Value) -> Result<Downlo
     if let Some(opts) = options {
         if let Some(out) = opts.get("out").and_then(|v| v.as_str()) {
             filename = out.to_string();
+        }
+        if let Some(dir) = opts.get("dir").and_then(|v| v.as_str()) {
+            save_dir = dir.to_string();
         }
         if let Some(r) = opts
             .get("referer")
@@ -259,6 +263,7 @@ pub(crate) fn aria2_add_uri_to_download_request(params: &Value) -> Result<Downlo
     Ok(DownloadRequest {
         url: joined,
         filename,
+        save_dir,
         referrer,
         cookies,
         headers: if extra_headers.is_empty() {
@@ -284,12 +289,14 @@ mod tests {
             ["https://example.com/file.zip"],
             {
                 "out": "renamed.zip",
+                "dir": "D:/Downloads/sub",
                 "header": ["Cookie: a=b", "Referer: https://example.com/", "User-Agent: UA/1.0"]
             }
         ]);
         let dl = aria2_add_uri_to_download_request(&params).unwrap();
         assert_eq!(dl.url, "https://example.com/file.zip");
         assert_eq!(dl.filename, "renamed.zip");
+        assert_eq!(dl.save_dir, "D:/Downloads/sub");
         assert_eq!(dl.cookies, "a=b");
         assert_eq!(dl.referrer, "https://example.com/");
         assert_eq!(dl.headers.unwrap().get("User-Agent").unwrap(), "UA/1.0");

@@ -228,6 +228,13 @@ List<SettingsSearchItem> get settingsSearchItems {
     ),
     SettingsSearchItem(
       category: SettingsCategory.download,
+      label: s.silentDownload,
+      description: s.silentDownloadDesc,
+      keywords: s.searchKeywordsSilentDownload,
+      icon: LucideIcons.bellOff,
+    ),
+    SettingsSearchItem(
+      category: SettingsCategory.download,
       label: s.defaultThreads,
       description: s.defaultThreadsDesc,
       keywords: s.searchKeywordsThreads,
@@ -2263,6 +2270,15 @@ class _DownloadContent extends StatelessWidget {
               child: ShadSwitch(
                 value: settingsProvider.rememberLastSaveDir,
                 onChanged: (v) => settingsProvider.setRememberLastSaveDir(v),
+              ),
+            ),
+            const SizedBox(height: 10),
+            _SettingCard(
+              label: s.silentDownload,
+              description: s.silentDownloadDesc,
+              child: ShadSwitch(
+                value: settingsProvider.silentDownloadEnabled,
+                onChanged: (v) => settingsProvider.setSilentDownloadEnabled(v),
               ),
             ),
             const SizedBox(height: 10),
