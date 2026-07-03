@@ -88,10 +88,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             user_agent: String::new(),
             // 显式指定数据目录,避免示例污染真实用户数据目录。
             data_dir_override: Some(work_dir.clone()),
+            database_url: None,
         },
         Arc::new(NoopSink),
         Arc::new(NoopSelection),
-    )?;
+    )
+    .await?;
 
     let mut done_rx = engine
         .manager

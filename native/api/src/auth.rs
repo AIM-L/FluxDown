@@ -20,12 +20,12 @@
 use axum::http::HeaderMap;
 
 /// 油猴脚本必须携带的来源标识头。
-pub(crate) const CLIENT_HEADER: &str = "x-fluxdown-client";
+pub const CLIENT_HEADER: &str = "x-fluxdown-client";
 /// 可选鉴权 token 头。
-pub(crate) const TOKEN_HEADER: &str = "x-fluxdown-token";
+pub const TOKEN_HEADER: &str = "x-fluxdown-token";
 
 /// 常量时间字符串比较，防 timing attack。
-pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -36,7 +36,7 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// `X-FluxDown-Token` 头是否与配置 token 匹配（token 为空 = 不鉴权，恒通过）。
-pub(crate) fn header_token_ok(headers: &HeaderMap, config_token: &str) -> bool {
+pub fn header_token_ok(headers: &HeaderMap, config_token: &str) -> bool {
     if config_token.is_empty() {
         return true;
     }
@@ -70,7 +70,7 @@ pub(crate) fn check_takeover_auth(
 
 /// 管理 API 门禁：token 为空 → 403（强制要求配置 token）；
 /// 非空 → 接受 `Authorization: Bearer <token>` 或 `X-FluxDown-Token`。
-pub(crate) fn check_management_auth(
+pub fn check_management_auth(
     headers: &HeaderMap,
     config_token: &str,
 ) -> Result<(), (u16, &'static str)> {

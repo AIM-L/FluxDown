@@ -57,6 +57,7 @@ use selection::{HostSelection, SelectionOutcome};
 ///     proxy_config: ProxyConfig::default(),
 ///     user_agent: String::new(),
 ///     data_dir_override: None,
+///     database_url: None,
 /// };
 /// assert_eq!(config.max_concurrent, 5);
 /// ```
@@ -71,6 +72,10 @@ pub struct EngineConfig {
     /// 显式指定数据目录(DB/日志等)。`None` 时回退平台自动探测
     /// (portable marker / `LOCALAPPDATA` / XDG / macOS Application Support)。
     pub data_dir_override: Option<PathBuf>,
+    /// 数据库连接 URL。`None` = 数据目录下的 SQLite 文件(桌面默认);
+    /// `Some("sqlite:…")` / `Some("postgres://…")` = 按 URL 连接
+    /// (headless 服务器用,见 [`db::Db::connect`](Db::connect))。
+    pub database_url: Option<String>,
 }
 
 /// [`Engine::new`] 可能失败的原因。透明转发底层三个子系统的错误类型。
@@ -110,8 +115,9 @@ pub enum EngineError {
 ///     proxy_config: ProxyConfig::default(),
 ///     user_agent: String::new(),
 ///     data_dir_override: None,
+///     database_url: None,
 /// };
-/// let mut engine = Engine::new(config, Arc::new(NoopSink), Arc::new(NoopSelection))?;
+/// let mut engine = Engine::new(config, Arc::new(NoopSink), Arc::new(NoopSelection)).await?;
 /// engine.manager.load_and_send_all_tasks().await;
 /// # Ok(())
 /// # }
@@ -137,13 +143,16 @@ impl Engine {
     ///
     /// 数据目录解析失败、数据库打开失败或 HTTP client 构建失败(代理配置
     /// 非法)时返回 [`EngineError`]。
-    pub fn new(
+    pub async fn new(
         config: EngineConfig,
         sink: Arc<dyn EventSink>,
         selector: Arc<dyn HostSelection>,
     ) -> Result<Self, EngineError> {
         let data_dir = data_dir::resolve_data_dir(config.data_dir_override.as_deref())?;
-        let db = Db::open(&data_dir)?;
+        let db = match &config.database_url {
+            Some(url) => Db::connect(url).await?,
+            None => Db::open(&data_dir).await?,
+        };
         let manager = DownloadManager::new(
             db.clone(),
             DownloadManagerConfig {

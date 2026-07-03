@@ -1,0 +1,805 @@
+//! 扩展路由：WS 实时推送 / 配置读写 / 队列 CRUD / 文件取回 / 目录列举 /
+//! 代理测试 / token 管理 / 运行状态 / 合并版 OpenAPI + Scalar 文档。
+//!
+//! 鉴权模型：
+//! - 常规扩展端点 → `route_layer` 统一套用管理 token 门禁
+//!   （复用 [`fluxdown_api::auth::check_management_auth`]）。
+//! - `GET /api/v1/ws`、`GET /api/v1/tasks/{id}/file` → 浏览器无法设自定义
+//!   header，改用 `?token=` 查询参数在 handler 内常量时间比较。
+//! - `openapi.json` / `docs` → 无鉴权（纯接口描述，不含数据）。
+
+use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post, put};
+use fluxdown_api::auth::{check_management_auth, constant_time_eq};
+use fluxdown_api::service::ApiError;
+use fluxdown_api::types::{QueueDto, TaskDto};
+use fluxdown_engine::db::Db;
+use fluxdown_engine::log_info;
+use fluxdown_engine::selection::HostSelection;
+use serde::Deserialize;
+use tokio::sync::mpsc;
+use tokio_util::io::ReaderStream;
+use utoipa::OpenApi;
+
+use crate::actor::ActorCmd;
+use crate::config::default_save_dir;
+use crate::wire::{
+    CreateQueueRequest, FsEntry, FsListResponse, MoveQueueRequest, ProxyTestRequest,
+    ProxyTestResponse, StatsResponse, TokenResponse, UpdateQueueRequest, WsClientMsg, WsServerMsg,
+};
+use crate::ws_hub::WsHub;
+
+/// 扩展路由共享状态。
+#[derive(Clone)]
+pub struct ServerState {
+    pub db: Db,
+    pub cmd_tx: mpsc::Sender<ActorCmd>,
+    pub hub: Arc<WsHub>,
+    pub selector: Arc<dyn HostSelection>,
+    /// 管理 token（启动时读定；`token/regenerate` 后重启生效）。
+    pub token: String,
+    pub version: String,
+    /// 演示模式：`Some(url)` 时仅允许下载该 URL（`FLUXDOWN_DEMO_URL`）。
+    pub demo_url: Option<String>,
+}
+
+impl ServerState {
+    /// 发送 actor 命令并等待回执；actor 断开 → 503。
+    async fn send_cmd<T>(
+        &self,
+        make: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> ActorCmd,
+    ) -> Result<T, ApiError> {
+        let (ack, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(make(ack))
+            .await
+            .map_err(|_| ApiError::Unavailable)?;
+        rx.await.map_err(|_| ApiError::Unavailable)
+    }
+
+    /// 当前默认保存目录（config 表实时值，回退平台默认）。
+    async fn current_save_dir(&self) -> String {
+        let dir = self
+            .db
+            .get_config("default_save_dir")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if dir.trim().is_empty() {
+            default_save_dir()
+        } else {
+            dir
+        }
+    }
+}
+
+/// 组装全部扩展路由（含鉴权中间件），与 `fluxdown_api::server::api_router`
+/// `merge` 后使用（两侧路径不重叠、同路径不同方法自动合并）。
+pub fn extra_router(state: ServerState) -> Router {
+    let protected = Router::new()
+        .route(paths::CONFIG, get(get_config).put(put_config))
+        .route(paths::QUEUES, post(create_queue))
+        .route(paths::QUEUE, put(update_queue).delete(delete_queue))
+        .route(paths::TASK_QUEUE, put(move_task_queue))
+        .route(paths::TASK_BOOST, put(boost_task))
+        .route(paths::FS_LIST, get(fs_list))
+        .route(paths::PROXY_TEST, post(proxy_test))
+        .route(paths::TOKEN_REGENERATE, post(token_regenerate))
+        .route(paths::STATS, get(stats))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    let open = Router::new()
+        .route(paths::WS, get(ws_handler))
+        .route(paths::TASK_FILE, get(task_file))
+        .route(paths::OPENAPI, get(openapi_spec))
+        .route(paths::DOCS, get(scalar_docs));
+
+    protected.merge(open).with_state(state)
+}
+
+/// 扩展端点路径常量（OpenAPI 注解与路由注册共用）。
+pub mod paths {
+    pub const WS: &str = "/api/v1/ws";
+    pub const CONFIG: &str = "/api/v1/config";
+    pub const QUEUES: &str = "/api/v1/queues";
+    pub const QUEUE: &str = "/api/v1/queues/{id}";
+    pub const TASK_QUEUE: &str = "/api/v1/tasks/{id}/queue";
+    pub const TASK_BOOST: &str = "/api/v1/tasks/{id}/boost";
+    pub const TASK_FILE: &str = "/api/v1/tasks/{id}/file";
+    pub const FS_LIST: &str = "/api/v1/fs/list";
+    pub const PROXY_TEST: &str = "/api/v1/proxy/test";
+    pub const TOKEN_REGENERATE: &str = "/api/v1/token/regenerate";
+    pub const STATS: &str = "/api/v1/stats";
+    pub const OPENAPI: &str = "/api/v1/openapi.json";
+    pub const DOCS: &str = "/api/v1/docs";
+}
+
+/// 统一 JSON 错误体（与 `fluxdown_api` 的 `ResultMessage` 形态一致）。
+fn error_response(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        axum::Json(serde_json::json!({ "success": false, "message": message })),
+    )
+        .into_response()
+}
+
+/// 管理 token 门禁中间件（除 `/ws`、`/file`、文档外的扩展端点）。
+async fn require_auth(
+    State(state): State<ServerState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if let Err((code, msg)) = check_management_auth(req.headers(), &state.token) {
+        return error_response(
+            StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED),
+            msg,
+        );
+    }
+    next.run(req).await
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenQuery {
+    #[serde(default)]
+    token: String,
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+
+/// 实时事件推送 + HLS/BT 选择往返。`?token=` 鉴权（浏览器 WS 无法设 header），
+/// 校验失败升级后立即以 1008 (Policy Violation) 关闭。
+#[utoipa::path(get, path = "/api/v1/ws", tag = "server",
+    params(("token" = String, Query, description = "管理 token")),
+    responses((status = 101, description = "升级为 WebSocket；服务端推送 WsServerMsg，接收 WsClientMsg"))
+)]
+async fn ws_handler(
+    State(state): State<ServerState>,
+    Query(q): Query<TokenQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let authorized = !state.token.is_empty() && constant_time_eq(&q.token, &state.token);
+    ws.on_upgrade(move |socket| handle_socket(socket, state, authorized))
+}
+
+async fn handle_socket(mut socket: WebSocket, state: ServerState, authorized: bool) {
+    if !authorized {
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: 1008,
+                reason: "invalid token".into(),
+            })))
+            .await;
+        return;
+    }
+
+    // 连接建立即发送全量快照，客户端无需先发起 REST 轮询。
+    if let Ok(tasks) = state.db.load_all_tasks().await {
+        let msg = WsServerMsg::TasksSnapshot {
+            tasks: tasks.into_iter().map(TaskDto::from).collect(),
+        };
+        if send_msg(&mut socket, &msg).await.is_err() {
+            return;
+        }
+    }
+    if let Ok(queues) = state.db.load_all_queues().await {
+        let msg = WsServerMsg::QueuesChanged {
+            queues: queues.into_iter().map(QueueDto::from).collect(),
+        };
+        if send_msg(&mut socket, &msg).await.is_err() {
+            return;
+        }
+    }
+
+    let mut events = state.hub.events.subscribe();
+    loop {
+        tokio::select! {
+            broadcast = events.recv() => {
+                match broadcast {
+                    Ok(json) => {
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    // 慢消费者滞后：跳过丢失的消息继续（进度类消息可容忍丢帧）。
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log_info!("[ws] client lagged, skipped {} messages", n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            incoming = socket.recv() => {
+                let Some(Ok(msg)) = incoming else { break };
+                let Message::Text(text) = msg else { continue };
+                match serde_json::from_str::<WsClientMsg>(&text) {
+                    Ok(WsClientMsg::Ping {}) => {
+                        if send_msg(&mut socket, &WsServerMsg::Pong {}).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(WsClientMsg::HlsSelection { task_id, selected_index }) => {
+                        state.selector.provide_hls_selection(&task_id, selected_index);
+                    }
+                    Ok(WsClientMsg::BtSelection { task_id, selected_indices }) => {
+                        state.selector.provide_bt_selection(&task_id, selected_indices);
+                    }
+                    Err(e) => log_info!("[ws] bad client message: {}", e),
+                }
+            }
+        }
+    }
+}
+
+async fn send_msg(socket: &mut WebSocket, msg: &WsServerMsg) -> Result<(), ()> {
+    let json = serde_json::to_string(msg).map_err(|_| ())?;
+    socket
+        .send(Message::Text(json.into()))
+        .await
+        .map_err(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// 配置
+// ---------------------------------------------------------------------------
+
+/// 读取全部配置键值。
+#[utoipa::path(get, path = "/api/v1/config", tag = "server",
+    responses((status = 200, body = HashMap<String, String>)),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn get_config(State(state): State<ServerState>) -> Result<Response, ApiError> {
+    let map = state
+        .db
+        .get_all_config()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(axum::Json(map).into_response())
+}
+
+/// 批量写入配置键值并 live-apply 到引擎（`local_server_*` 键重启生效）。
+#[utoipa::path(put, path = "/api/v1/config", tag = "server",
+    request_body = HashMap<String, String>,
+    responses((status = 200, description = "已持久化并应用")),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn put_config(
+    State(state): State<ServerState>,
+    axum::Json(entries): axum::Json<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let keys: Vec<String> = entries.keys().cloned().collect();
+    for (key, value) in &entries {
+        state
+            .db
+            .set_config(key, value)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+    state
+        .send_cmd(|ack| ActorCmd::ApplyConfig { keys, ack })
+        .await?;
+    Ok(axum::Json(serde_json::json!({ "success": true, "message": "applied" })).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// 队列 CRUD / 任务队列操作
+// ---------------------------------------------------------------------------
+
+/// 创建命名队列。
+#[utoipa::path(post, path = "/api/v1/queues", tag = "server",
+    request_body = CreateQueueRequest,
+    responses((status = 200, description = "已创建")),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn create_queue(
+    State(state): State<ServerState>,
+    axum::Json(req): axum::Json<CreateQueueRequest>,
+) -> Result<Response, ApiError> {
+    if req.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("queue name is required".into()));
+    }
+    state
+        .send_cmd(|ack| ActorCmd::CreateQueue {
+            name: req.name,
+            speed_limit_kbps: req.speed_limit_kbps,
+            max_concurrent: req.max_concurrent,
+            default_save_dir: req.default_save_dir,
+            default_segments: req.default_segments,
+            default_user_agent: req.default_user_agent,
+            ack,
+        })
+        .await?;
+    Ok(ok_response())
+}
+
+/// 更新命名队列。
+#[utoipa::path(put, path = "/api/v1/queues/{id}", tag = "server",
+    params(("id" = String, Path, description = "队列 ID")),
+    request_body = UpdateQueueRequest,
+    responses((status = 200, description = "已更新")),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn update_queue(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<UpdateQueueRequest>,
+) -> Result<Response, ApiError> {
+    state
+        .send_cmd(|ack| ActorCmd::UpdateQueue {
+            queue_id: id,
+            name: req.name,
+            speed_limit_kbps: req.speed_limit_kbps,
+            max_concurrent: req.max_concurrent,
+            default_save_dir: req.default_save_dir,
+            default_segments: req.default_segments,
+            default_user_agent: req.default_user_agent,
+            ack,
+        })
+        .await?;
+    Ok(ok_response())
+}
+
+/// 删除命名队列（队列内任务移入默认队列）。
+#[utoipa::path(delete, path = "/api/v1/queues/{id}", tag = "server",
+    params(("id" = String, Path, description = "队列 ID")),
+    responses((status = 200, description = "已删除")),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn delete_queue(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    state
+        .send_cmd(|ack| ActorCmd::DeleteQueue { queue_id: id, ack })
+        .await?;
+    Ok(ok_response())
+}
+
+/// 移动任务到指定队列（空 queueId = 默认队列）。
+#[utoipa::path(put, path = "/api/v1/tasks/{id}/queue", tag = "server",
+    params(("id" = String, Path, description = "任务 ID")),
+    request_body = MoveQueueRequest,
+    responses((status = 200, description = "已移动")),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn move_task_queue(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<MoveQueueRequest>,
+) -> Result<Response, ApiError> {
+    state
+        .send_cmd(|ack| ActorCmd::MoveToQueue {
+            task_id: id,
+            queue_id: req.queue_id,
+            ack,
+        })
+        .await?;
+    Ok(ok_response())
+}
+
+/// Boost 优先下载该任务（暂停其他任务以释放带宽）。
+#[utoipa::path(put, path = "/api/v1/tasks/{id}/boost", tag = "server",
+    params(("id" = String, Path, description = "任务 ID")),
+    responses((status = 200, description = "已 Boost")),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn boost_task(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    state
+        .send_cmd(|ack| ActorCmd::Boost { task_id: id, ack })
+        .await?;
+    Ok(ok_response())
+}
+
+fn ok_response() -> Response {
+    axum::Json(serde_json::json!({ "success": true, "message": "ok" })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// 已完成文件取回（浏览器「保存到本地」）
+// ---------------------------------------------------------------------------
+
+/// 流式取回已完成任务的文件。`?token=` 鉴权（浏览器导航下载无法设 header）。
+#[utoipa::path(get, path = "/api/v1/tasks/{id}/file", tag = "server",
+    params(
+        ("id" = String, Path, description = "任务 ID"),
+        ("token" = String, Query, description = "管理 token")
+    ),
+    responses(
+        (status = 200, description = "文件字节流（attachment）"),
+        (status = 400, description = "任务未完成"),
+        (status = 404, description = "任务或文件不存在")
+    )
+)]
+async fn task_file(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    if state.token.is_empty() || !constant_time_eq(&q.token, &state.token) {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid or missing token");
+    }
+    let task = match state.db.load_task_by_id(&id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "task not found"),
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if task.status != 3 {
+        return error_response(StatusCode::BAD_REQUEST, "task is not completed");
+    }
+    let path = PathBuf::from(&task.save_dir).join(&task.file_name);
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => return error_response(StatusCode::NOT_FOUND, "file not found on disk"),
+    };
+    let len = file.metadata().await.ok().map(|m| m.len());
+    let stream = ReaderStream::new(file);
+    let mut response = Response::new(Body::from_stream(stream));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Some(len) = len
+        && let Ok(v) = header::HeaderValue::from_str(&len.to_string())
+    {
+        headers.insert(header::CONTENT_LENGTH, v);
+    }
+    if let Ok(v) = header::HeaderValue::from_str(&content_disposition(&task.file_name)) {
+        headers.insert(header::CONTENT_DISPOSITION, v);
+    }
+    response
+}
+
+/// 构造 `Content-Disposition: attachment`。非 ASCII 文件名走 RFC 5987
+/// `filename*`（UTF-8 百分号编码），另给纯 ASCII 兜底 `filename`。
+fn content_disposition(file_name: &str) -> String {
+    let ascii_fallback: String = file_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && c != '"' && c != '\\' && !c.is_ascii_control() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let encoded = percent_encode_rfc5987(file_name);
+    format!("attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}")
+}
+
+/// RFC 5987 attr-char 之外的字节全部百分号编码。
+fn percent_encode_rfc5987(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.as_bytes() {
+        let c = *b as char;
+        if c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '!' | '#' | '$' | '&' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~'
+            )
+        {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 目录列举（服务器端保存目录选择器）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct FsQuery {
+    #[serde(default)]
+    path: String,
+}
+
+/// 列举服务器上某目录的子目录（仅目录，不含文件）。空 path = 默认保存目录。
+#[utoipa::path(get, path = "/api/v1/fs/list", tag = "server",
+    params(("path" = Option<String>, Query, description = "要列举的目录；空 = 默认保存目录")),
+    responses((status = 200, body = FsListResponse)),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn fs_list(
+    State(state): State<ServerState>,
+    Query(q): Query<FsQuery>,
+) -> Result<Response, ApiError> {
+    let base = if q.path.trim().is_empty() {
+        state.current_save_dir().await
+    } else {
+        q.path
+    };
+    let base_path = FsPath::new(&base);
+    let mut dirs = Vec::new();
+    let mut rd = tokio::fs::read_dir(base_path)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("cannot read directory: {e}")))?;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let Ok(ft) = entry.file_type().await else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // 隐藏目录（.git 等）不进选择器。
+        if name.starts_with('.') {
+            continue;
+        }
+        dirs.push(FsEntry {
+            path: entry.path().to_string_lossy().into_owned(),
+            name,
+        });
+    }
+    dirs.sort_by_key(|a| a.name.to_lowercase());
+    let parent = base_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_string_lossy().into_owned());
+    Ok(axum::Json(FsListResponse {
+        path: base,
+        parent,
+        dirs,
+    })
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// 代理测试 / token / 运行状态
+// ---------------------------------------------------------------------------
+
+/// 测试代理连通性，返回延迟（毫秒）。
+#[utoipa::path(post, path = "/api/v1/proxy/test", tag = "server",
+    request_body = ProxyTestRequest,
+    responses(
+        (status = 200, body = ProxyTestResponse),
+        (status = 400, description = "连接失败，message 带原因")
+    ),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn proxy_test(
+    State(state): State<ServerState>,
+    axum::Json(req): axum::Json<ProxyTestRequest>,
+) -> Result<Response, ApiError> {
+    let result = state
+        .send_cmd(|ack| ActorCmd::TestProxy {
+            proxy_type: req.proxy_type,
+            host: req.host,
+            port: req.port,
+            username: req.username,
+            password: req.password,
+            ack,
+        })
+        .await?;
+    match result {
+        Ok(latency_ms) => Ok(axum::Json(ProxyTestResponse { latency_ms }).into_response()),
+        Err(e) => Err(ApiError::BadRequest(e)),
+    }
+}
+
+/// 重新生成管理 token 并持久化。**重启服务器后生效**（当前会话沿用旧 token）。
+#[utoipa::path(post, path = "/api/v1/token/regenerate", tag = "server",
+    responses((status = 200, body = TokenResponse)),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn token_regenerate(State(state): State<ServerState>) -> Result<Response, ApiError> {
+    let token = format!("fxd_{}", uuid::Uuid::new_v4().simple());
+    state
+        .db
+        .set_config("local_server_token", &token)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(axum::Json(TokenResponse {
+        token,
+        note: "restart the server for the new token to take effect".into(),
+    })
+    .into_response())
+}
+
+/// 服务器运行状态（磁盘剩余 / WS 连接数 / 版本 / 演示模式）。
+#[utoipa::path(get, path = "/api/v1/stats", tag = "server",
+    responses((status = 200, body = StatsResponse)),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn stats(State(state): State<ServerState>) -> Result<Response, ApiError> {
+    let save_dir = state.current_save_dir().await;
+    let disk_free_bytes = fs2::available_space(FsPath::new(&save_dir)).ok();
+    Ok(axum::Json(StatsResponse {
+        disk_free_bytes,
+        save_dir,
+        server_version: state.version.clone(),
+        ws_clients: state.hub.events.receiver_count(),
+        demo_mode: state.demo_url.is_some(),
+        demo_url: state.demo_url.clone().unwrap_or_default(),
+    })
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI（核心 + 扩展合并）与 Scalar 文档
+// ---------------------------------------------------------------------------
+
+/// 本 crate 扩展端点的 OpenAPI 文档（与 `fluxdown_api::openapi::ApiDoc` 合并）。
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "FluxDown Server API",
+        description = "FluxDown headless 服务器 HTTP API：核心任务管理（复用桌面 API 契约）\
+            + 服务器扩展（WebSocket 实时推送 / 配置 / 队列 CRUD / 文件取回 / 目录列举 / 代理测试）。",
+        version = env!("CARGO_PKG_VERSION"),
+    ),
+    paths(
+        ws_handler,
+        get_config,
+        put_config,
+        create_queue,
+        update_queue,
+        delete_queue,
+        move_task_queue,
+        boost_task,
+        task_file,
+        fs_list,
+        proxy_test,
+        token_regenerate,
+        stats,
+    ),
+    components(schemas(
+        crate::wire::WsServerMsg,
+        crate::wire::WsClientMsg,
+        crate::wire::SegmentDetailDto,
+        crate::wire::QueuePositionDto,
+        crate::wire::HlsQualityOptionDto,
+        crate::wire::BtFileDto,
+        crate::wire::CreateQueueRequest,
+        crate::wire::MoveQueueRequest,
+        crate::wire::ProxyTestRequest,
+        crate::wire::ProxyTestResponse,
+        crate::wire::FsEntry,
+        crate::wire::FsListResponse,
+        crate::wire::StatsResponse,
+        crate::wire::TokenResponse,
+    )),
+    tags((name = "server", description = "headless 服务器扩展端点"))
+)]
+struct ServerApiDoc;
+
+/// 合并版规范 JSON（`OnceLock` 缓存；self 冲突时胜，当前两侧路径不相交）。
+fn merged_openapi_json() -> &'static str {
+    static SPEC: OnceLock<String> = OnceLock::new();
+    SPEC.get_or_init(|| {
+        let merged = ServerApiDoc::openapi().merge_from(fluxdown_api::openapi::ApiDoc::openapi());
+        merged
+            .to_pretty_json()
+            .unwrap_or_else(|e| format!("{{\"error\":\"openapi serialize failed: {e}\"}}"))
+    })
+}
+
+/// OpenAPI 3.1 规范（合并核心 + 扩展）。无鉴权：纯接口描述。
+async fn openapi_spec() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        merged_openapi_json(),
+    )
+        .into_response()
+}
+
+/// Scalar API 文档页（CDN 加载，渲染 `/api/v1/openapi.json`）。
+async fn scalar_docs() -> Html<&'static str> {
+    Html(SCALAR_HTML)
+}
+
+/// 镜像 `website/src/pages/api-docs.astro` 的 Scalar 嵌入片段。
+const SCALAR_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FluxDown Server API Docs</title>
+    <style>html, body, #app { height: 100%; margin: 0; }</style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+    <script>
+      Scalar.createApiReference('#app', {
+        url: '/api/v1/openapi.json',
+        theme: 'none',
+        layout: 'modern',
+      });
+    </script>
+  </body>
+</html>
+"#;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_disposition_ascii_filename_is_not_percent_encoded() {
+        let header = content_disposition("report-final_v2.pdf");
+        assert_eq!(
+            header,
+            "attachment; filename=\"report-final_v2.pdf\"; filename*=UTF-8''report-final_v2.pdf"
+        );
+    }
+
+    #[test]
+    fn content_disposition_non_ascii_filename_encodes_filename_star_and_ascii_fallback() {
+        let header = content_disposition("测试文件.mp4");
+        // ASCII fallback: every non-ASCII char replaced 1:1 with '_', ASCII
+        // suffix kept verbatim -- browsers without RFC 5987 support still
+        // get a syntactically valid (if illegible) filename.
+        assert!(
+            header.contains("filename=\"____.mp4\""),
+            "unexpected ascii fallback in {header:?}"
+        );
+        // filename* carries the real UTF-8 bytes, percent-encoded.
+        let expected_star = format!(
+            "filename*=UTF-8''{}.mp4",
+            "测试文件"
+                .bytes()
+                .map(|b| format!("%{b:02X}"))
+                .collect::<String>()
+        );
+        assert!(
+            header.contains(&expected_star),
+            "expected {expected_star:?} in {header:?}"
+        );
+    }
+
+    #[test]
+    fn content_disposition_quote_and_backslash_do_not_break_header_syntax() {
+        let header = content_disposition("weird\"na\\me.txt");
+        // The whole header must never contain a raw backslash: percent-
+        // encoding in filename* and the ASCII-fallback substitution both
+        // avoid it, so any raw '\\' means one leaked through unescaped.
+        assert!(
+            !header.contains('\\'),
+            "raw backslash leaked into header: {header:?}"
+        );
+        // The `filename="..."` quoted-string token must have exactly its
+        // two delimiting quotes -- a leaked raw quote from the original
+        // name would prematurely terminate the token and corrupt every
+        // header field that follows it.
+        assert_eq!(
+            header.matches('"').count(),
+            2,
+            "raw quote leaked into header, corrupting quoted-string syntax: {header:?}"
+        );
+        // The RFC 5987 filename* form percent-encodes both characters
+        // instead of leaving them raw.
+        assert!(
+            header.contains("%22"),
+            "quote must be percent-encoded: {header:?}"
+        );
+        assert!(
+            header.contains("%5C"),
+            "backslash must be percent-encoded: {header:?}"
+        );
+    }
+
+    #[test]
+    fn percent_encode_rfc5987_keeps_unreserved_chars_and_encodes_the_rest() {
+        assert_eq!(percent_encode_rfc5987("abcXYZ019"), "abcXYZ019");
+        assert_eq!(percent_encode_rfc5987("a b"), "a%20b");
+        assert_eq!(percent_encode_rfc5987("100%"), "100%25");
+    }
+}

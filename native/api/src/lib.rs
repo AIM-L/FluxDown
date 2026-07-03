@@ -49,7 +49,7 @@
 //! # }
 //! ```
 
-mod auth;
+pub mod auth;
 mod jsonrpc;
 pub mod openapi;
 pub mod routes;

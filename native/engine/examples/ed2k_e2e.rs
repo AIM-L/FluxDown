@@ -42,10 +42,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             proxy_config: ProxyConfig::default(),
             user_agent: String::new(),
             data_dir_override: Some(work_dir.clone()),
+            database_url: None,
         },
         Arc::new(NoopSink),
         Arc::new(NoopSelection),
-    )?;
+    )
+    .await?;
 
     // 注入 ed2k 运行配置（生产中由 hub 写入 DB config）。
     engine.db.set_config("ed2k_server_list", SERVERS).await?;

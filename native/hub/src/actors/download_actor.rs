@@ -239,7 +239,7 @@ async fn load_initial_config(db: &Db) -> (usize, u64, String, BtConfig, ProxyCon
 }
 
 pub async fn run(db_dir: PathBuf) {
-    let db = match Db::open(&db_dir) {
+    let db = match Db::open(&db_dir).await {
         Ok(db) => db,
         Err(e) => {
             log_info!("Failed to open database: {}", e);
@@ -308,10 +308,13 @@ pub async fn run(db_dir: PathBuf) {
             // 此处显式传入,使 `Engine::new` 内部的解析成为等价的直通,
             // 保持与 `Db::open(&db_dir)`(上面已单独执行一次)完全一致的路径。
             data_dir_override: Some(db_dir.clone()),
+            database_url: None,
         },
         sink.clone(),
         selector.clone(),
-    ) {
+    )
+    .await
+    {
         Ok(e) => e,
         Err(e) => {
             log_info!("Failed to create engine: {}", e);

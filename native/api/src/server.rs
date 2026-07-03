@@ -198,8 +198,11 @@ pub(crate) struct AppState {
     config: Arc<ApiServerConfig>,
 }
 
-/// 按配置组装路由。关闭的路由组不注册（对应端点回 404，与旧行为一致）。
-fn build_router(state: AppState) -> Router {
+/// 核心路由集（按配置开关注册）：探活 / 脚本接管 / aria2 兼容 / 管理 CRUD。
+/// **不含** `API_OPENAPI` 路由与 fallback —— 由调用方决定（桌面
+/// `build_router` 补齐两者；headless 服务器自带合并版 openapi 与 SPA
+/// fallback，见 [`api_router`]）。
+fn register_core(state: AppState) -> Router<AppState> {
     let mut router = Router::new().route(routes::PING, get(ping));
 
     if state.config.takeover_enabled {
@@ -221,13 +224,39 @@ fn build_router(state: AppState) -> Router {
             .route(routes::API_TASK, get(api_get_task).delete(api_delete_task))
             .route(routes::API_TASK_PAUSE, put(api_pause_task))
             .route(routes::API_TASK_CONTINUE, put(api_continue_task))
-            .route(routes::API_QUEUES, get(api_list_queues))
-            // OpenAPI 规范文档（无鉴权——纯接口描述，不含任何用户数据）。
-            .route(routes::API_OPENAPI, get(openapi_spec));
+            .route(routes::API_QUEUES, get(api_list_queues));
     }
 
     router
+}
+
+/// 按配置组装桌面 App 完整路由：核心路由 + OpenAPI 规范 + 404 fallback。
+/// 关闭的路由组不注册（对应端点回 404，与旧行为一致）。
+fn build_router(state: AppState) -> Router {
+    let mut router = register_core(state.clone());
+    if state.config.management_enabled {
+        // OpenAPI 规范文档（无鉴权——纯接口描述，不含任何用户数据）。
+        router = router.route(routes::API_OPENAPI, get(openapi_spec));
+    }
+    router
         .fallback(unknown_endpoint)
+        .layer(middleware::from_fn(options_preflight))
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .with_state(state)
+}
+
+/// 供其他宿主（headless 服务器）复用的核心路由集。
+///
+/// 与桌面 [`spawn_api_server`] 的差异：**不含** `/api/v1/openapi.json`
+/// 与 404 fallback，调用方 `merge` 自己的扩展路由、提供合并版 OpenAPI
+/// 与 SPA fallback，不会与本函数产生路由冲突。已附带 OPTIONS 预检拒绝
+/// 与请求体大小限制两层中间件（与桌面行为一致）。
+pub fn api_router(host: Arc<dyn ApiHost>, config: ApiServerConfig) -> Router {
+    let state = AppState {
+        host,
+        config: Arc::new(config),
+    };
+    register_core(state.clone())
         .layer(middleware::from_fn(options_preflight))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)

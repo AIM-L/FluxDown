@@ -512,7 +512,7 @@ async fn run_coord(
 ) {
     let dest = work_dir.join(format!("{task_id}.bin"));
     let client = test_client();
-    let db = Db::open(work_dir).expect("Db::open");
+    let db = Db::open(work_dir).await.expect("Db::open");
     db.insert_task(
         task_id,
         url,
@@ -811,7 +811,7 @@ async fn resume_after_cancel_is_byte_exact() {
     let task_id = "resume-task";
     let dest = work_dir.join(format!("{task_id}.bin"));
     let client = test_client();
-    let db = Db::open(&work_dir).expect("db");
+    let db = Db::open(&work_dir).await.expect("db");
     db.insert_task(
         task_id,
         &url,
@@ -1173,7 +1173,7 @@ async fn gzip_single_stream_should_succeed() {
     let server = start_server(st).await;
     let url = server.url("/file");
 
-    let db = Db::open(&work_dir).expect("db");
+    let db = Db::open(&work_dir).await.expect("db");
     insert_simple_task(&db, &work_dir, "gz", &url, "out.bin", 0, 0).await;
     let cancel = CancellationToken::new();
     let (status, dest) = run_full(
@@ -1222,7 +1222,7 @@ async fn layered_content_encoding_must_error_not_corrupt() {
     let server = start_server(st).await;
     let url = server.url("/file");
 
-    let db = Db::open(&work_dir).expect("db");
+    let db = Db::open(&work_dir).await.expect("db");
     insert_simple_task(&db, &work_dir, "ly", &url, "out.bin", 0, 0).await;
     let cancel = CancellationToken::new();
     let (status, dest) = run_full(
@@ -1260,7 +1260,7 @@ async fn no_content_length_truncation_must_not_be_accepted() {
     let server = start_server(st).await;
     let url = server.url("/file");
 
-    let db = Db::open(&work_dir).expect("db");
+    let db = Db::open(&work_dir).await.expect("db");
     // 走 probe 路径（hint=0）：HEAD 报告可信的完整大小 N；下载响应却无 CL 且只
     // 收到 K<N 字节。可信大小 + 截断 + 无 CL → 必须判失败而非把截断文件当完成。
     insert_simple_task(&db, &work_dir, "nc", &url, "out.bin", 0, 0).await;
@@ -1321,7 +1321,7 @@ async fn single_stream_resume_must_not_splice_changed_file() {
     let server = start_server(st.clone()).await;
     let url = server.url("/file");
 
-    let db = Db::open(&work_dir).expect("db");
+    let db = Db::open(&work_dir).await.expect("db");
     insert_simple_task(&db, &work_dir, "sp", &url, "out.bin", 1, size as i64).await;
 
     // 第一程：segment_count=1 强制单流；hint=0 走 probe（probe 看到支持 range）

@@ -152,7 +152,9 @@ async fn run_one_real_download(
         .map_err(|e| format!("build_client: {e}"))?;
 
     // 创建独立 SQLite（每次迭代用独立 db 避免脏状态）
-    let db = Db::open(work_dir).map_err(|e| format!("Db::open: {e:?}"))?;
+    let db = Db::open(work_dir)
+        .await
+        .map_err(|e| format!("Db::open: {e:?}"))?;
 
     // 必须先 insert_task 才能 insert_segments（外键约束）
     db.insert_task(

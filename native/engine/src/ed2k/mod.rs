@@ -875,9 +875,9 @@ mod tests {
     }
 
     /// 开一个全新的测试 DB（独立临时目录）。
-    fn open_it_db(tag: &str) -> (Db, PathBuf) {
+    async fn open_it_db(tag: &str) -> (Db, PathBuf) {
         let dir = it_scratch_dir(tag);
-        let db = match Db::open(&dir) {
+        let db = match Db::open(&dir).await {
             Ok(db) => db,
             Err(e) => panic!("open db failed: {e}"),
         };
@@ -1405,7 +1405,7 @@ mod tests {
             Err(e) => panic!("parse generated ed2k link failed: {e:?}"),
         };
 
-        let (db, dir) = open_it_db("fin12");
+        let (db, dir) = open_it_db("fin12").await;
         let task_id = "fin12-task";
         insert_it_task(&db, task_id, total).await;
         if let Err(e) = db.init_ed2k_blocks(task_id, part_count).await {
@@ -1457,7 +1457,7 @@ mod tests {
             Err(e) => panic!("parse generated ed2k link failed: {e:?}"),
         };
 
-        let (db, dir) = open_it_db("fin13");
+        let (db, dir) = open_it_db("fin13").await;
         let task_id = "fin13-task";
         insert_it_task(&db, task_id, total).await;
         if let Err(e) = db.init_ed2k_blocks(task_id, part_count).await {
@@ -1534,7 +1534,7 @@ mod tests {
             Err(e) => panic!("parse generated ed2k link failed: {e:?}"),
         };
 
-        let (db, dir) = open_it_db("fin14");
+        let (db, dir) = open_it_db("fin14").await;
         let task_id = "fin14-task";
         insert_it_task(&db, task_id, total).await;
         if let Err(e) = db.init_ed2k_blocks(task_id, part_count).await {
@@ -1581,7 +1581,7 @@ mod tests {
             Err(e) => panic!("parse generated ed2k link failed: {e:?}"),
         };
 
-        let (db, dir) = open_it_db("fin15");
+        let (db, dir) = open_it_db("fin15").await;
         let task_id = "fin15-task";
         insert_it_task(&db, task_id, total).await;
         if let Err(e) = db.init_ed2k_blocks(task_id, 1).await {

@@ -1,0 +1,564 @@
+//! WebSocket 与扩展 REST 端点的 wire JSON 契约（camelCase）。
+//!
+//! 与 `fluxdown_api::types` 同理：**不直接序列化** `EngineEvent` /
+//! `engine::model::*` —— WS 协议一经发布即为对外稳定契约，引擎内部模型
+//! 重构不得破坏线上 JSON 格式。转换集中在本模块的 `From` 实现。
+
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use fluxdown_api::types::{QueueDto, TaskDto};
+use fluxdown_engine::model::{BtFileEntry, HlsQualityOption, QueuePosition, SegmentDetail};
+
+// ---------------------------------------------------------------------------
+// WS 服务端 → 客户端
+// ---------------------------------------------------------------------------
+
+/// 分段字节范围与进度（`segmentProgress` 载荷）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentDetailDto {
+    pub index: i32,
+    pub start_byte: i64,
+    pub end_byte: i64,
+    pub downloaded_bytes: i64,
+}
+
+impl From<SegmentDetail> for SegmentDetailDto {
+    fn from(s: SegmentDetail) -> Self {
+        Self {
+            index: s.index,
+            start_byte: s.start_byte,
+            end_byte: s.end_byte,
+            downloaded_bytes: s.downloaded_bytes,
+        }
+    }
+}
+
+/// 任务在队列中的位置（`queuePositionsChanged` 载荷）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuePositionDto {
+    pub task_id: String,
+    /// 1-based，0 = 不在队列中。
+    pub position: i32,
+}
+
+impl From<QueuePosition> for QueuePositionDto {
+    fn from(p: QueuePosition) -> Self {
+        Self {
+            task_id: p.task_id,
+            position: p.position,
+        }
+    }
+}
+
+/// HLS 可选码率变体（`hlsSelectionRequest` 载荷）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HlsQualityOptionDto {
+    pub index: i32,
+    pub bandwidth: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+impl From<HlsQualityOption> for HlsQualityOptionDto {
+    fn from(o: HlsQualityOption) -> Self {
+        Self {
+            index: o.index,
+            bandwidth: o.bandwidth,
+            width: o.width,
+            height: o.height,
+        }
+    }
+}
+
+/// 种子内单个文件条目（`btSelectionRequest` 载荷）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BtFileDto {
+    pub index: i32,
+    pub path: String,
+    pub size: i64,
+}
+
+impl From<BtFileEntry> for BtFileDto {
+    fn from(f: BtFileEntry) -> Self {
+        Self {
+            index: f.index,
+            path: f.path,
+            size: f.size,
+        }
+    }
+}
+
+/// 服务端经 `/api/v1/ws` 推送的实时消息。
+///
+/// JSON 形态：`{"type":"taskProgress","taskId":"…",…}`（`type` 判别 + 扁平
+/// camelCase 字段）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WsServerMsg {
+    /// 任务进度（下载中周期推送；含 live speed —— REST `TaskDto` 无此字段）。
+    TaskProgress {
+        task_id: String,
+        /// 0=pending, 1=downloading, 2=paused, 3=completed, 4=error, 5=preparing
+        status: i32,
+        downloaded_bytes: i64,
+        total_bytes: i64,
+        /// 字节/秒。
+        speed: i64,
+        file_name: String,
+        save_dir: String,
+        url: String,
+        error_message: String,
+    },
+    /// 全部任务快照（连接建立时 + 引擎主动广播）。
+    TasksSnapshot { tasks: Vec<TaskDto> },
+    /// 分段级进度（详情面板分段可视化）。
+    SegmentProgress {
+        task_id: String,
+        total_bytes: i64,
+        segment_count: i32,
+        segments: Vec<SegmentDetailDto>,
+    },
+    /// 动态分段拆分事件（驱动拆分动画）。
+    SegmentSplit {
+        task_id: String,
+        parent_index: i32,
+        parent_new_end: i64,
+        child_index: i32,
+        child_start: i64,
+        child_end: i64,
+        is_proactive: bool,
+        total_segments: i32,
+    },
+    /// 任务元数据探测完成（文件名/大小确定）。
+    TaskMetaProbed {
+        task_id: String,
+        file_name: String,
+        total_bytes: i64,
+    },
+    /// 命名队列列表变化。
+    QueuesChanged { queues: Vec<QueueDto> },
+    /// 队列内位置批量更新。
+    QueuePositionsChanged { positions: Vec<QueuePositionDto> },
+    /// Boost 优先任务变化。
+    PriorityTaskChanged {
+        priority_task_id: String,
+        auto_paused_count: i32,
+    },
+    /// 请求客户端选择 HLS 画质（超时自动选最高带宽）。
+    HlsSelectionRequest {
+        task_id: String,
+        options: Vec<HlsQualityOptionDto>,
+    },
+    /// 请求客户端选择 BT 文件（超时默认全部下载）。
+    BtSelectionRequest {
+        task_id: String,
+        files: Vec<BtFileDto>,
+    },
+    /// `ping` 应答（RTT 测量）。
+    Pong {},
+}
+
+// ---------------------------------------------------------------------------
+// WS 客户端 → 服务端
+// ---------------------------------------------------------------------------
+
+/// 客户端经 `/api/v1/ws` 发来的入站消息。
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WsClientMsg {
+    /// 应答 `hlsSelectionRequest`。
+    HlsSelection {
+        task_id: String,
+        selected_index: i32,
+    },
+    /// 应答 `btSelectionRequest`（空数组 = 全部文件）。
+    BtSelection {
+        task_id: String,
+        selected_indices: Vec<i32>,
+    },
+    /// RTT 测量，服务端回 `pong`。
+    Ping {},
+}
+
+// ---------------------------------------------------------------------------
+// 扩展 REST 端点请求/响应体
+// ---------------------------------------------------------------------------
+
+/// 代理连通性测试请求（`POST /api/v1/proxy/test`）。
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestRequest {
+    /// `http` / `https` / `socks4` / `socks5`。
+    pub proxy_type: String,
+    pub host: String,
+    pub port: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// 代理连通性测试响应。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestResponse {
+    pub latency_ms: i64,
+}
+
+/// 创建命名队列请求（`POST /api/v1/queues`）。
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateQueueRequest {
+    pub name: String,
+    #[serde(default)]
+    pub speed_limit_kbps: i64,
+    #[serde(default)]
+    pub max_concurrent: i32,
+    #[serde(default)]
+    pub default_save_dir: String,
+    #[serde(default)]
+    pub default_segments: i32,
+    #[serde(default)]
+    pub default_user_agent: String,
+}
+
+/// 更新命名队列请求（`PUT /api/v1/queues/{id}`），字段同创建。
+pub type UpdateQueueRequest = CreateQueueRequest;
+
+/// 移动任务到队列请求（`PUT /api/v1/tasks/{id}/queue`）。
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveQueueRequest {
+    /// 空 = 默认队列。
+    #[serde(default)]
+    pub queue_id: String,
+}
+
+/// 目录项（`FsListResponse.dirs` 元素）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsEntry {
+    pub name: String,
+    pub path: String,
+}
+
+/// 目录列举响应（`GET /api/v1/fs/list`，服务器端保存目录选择器用）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsListResponse {
+    /// 实际列举的目录（绝对路径）。
+    pub path: String,
+    /// 上级目录（根目录时为 None）。
+    pub parent: Option<String>,
+    /// 子目录列表（不含文件）。
+    pub dirs: Vec<FsEntry>,
+}
+
+/// 服务器运行状态（`GET /api/v1/stats`，前端状态栏用）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsResponse {
+    /// 默认保存目录所在磁盘的剩余字节；探测失败为 None。
+    pub disk_free_bytes: Option<u64>,
+    pub save_dir: String,
+    pub server_version: String,
+    /// 当前 WS 连接数。
+    pub ws_clients: usize,
+    /// 演示模式开关（服务器以 `FLUXDOWN_DEMO_URL` 启动时为 true）。
+    pub demo_mode: bool,
+    /// 演示模式下唯一允许下载的 URL；非演示模式为空串。
+    pub demo_url: String,
+}
+
+/// token 重新生成响应（`POST /api/v1/token/regenerate`）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenResponse {
+    pub token: String,
+    /// 生效说明（新 token 需重启服务器后生效）。
+    pub note: String,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_server_msg_uses_type_tag_and_camel_case() {
+        let msg = WsServerMsg::TaskProgress {
+            task_id: "t1".into(),
+            status: 1,
+            downloaded_bytes: 10,
+            total_bytes: 100,
+            speed: 5,
+            file_name: "f.bin".into(),
+            save_dir: "/tmp".into(),
+            url: "http://x".into(),
+            error_message: String::new(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"taskProgress\""));
+        assert!(json.contains("\"taskId\":\"t1\""));
+        assert!(json.contains("\"downloadedBytes\":10"));
+    }
+
+    #[test]
+    fn ws_client_msg_roundtrip() {
+        let msg: WsClientMsg =
+            serde_json::from_str(r#"{"type":"hlsSelection","taskId":"t1","selectedIndex":2}"#)
+                .unwrap();
+        match msg {
+            WsClientMsg::HlsSelection {
+                task_id,
+                selected_index,
+            } => {
+                assert_eq!(task_id, "t1");
+                assert_eq!(selected_index, 2);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let ping: WsClientMsg = serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
+        assert!(matches!(ping, WsClientMsg::Ping {}));
+    }
+
+    #[test]
+    fn ws_client_msg_bt_selection_roundtrip_with_indices() {
+        let msg: WsClientMsg = serde_json::from_str(
+            r#"{"type":"btSelection","taskId":"t2","selectedIndices":[0,2,5]}"#,
+        )
+        .unwrap();
+        match msg {
+            WsClientMsg::BtSelection {
+                task_id,
+                selected_indices,
+            } => {
+                assert_eq!(task_id, "t2");
+                assert_eq!(selected_indices, vec![0, 2, 5]);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ws_client_msg_bt_selection_empty_array_means_download_all() {
+        // Per the `BtSelection` doc comment, an empty array is the wire
+        // encoding for "download all files" -- it must deserialize to an
+        // empty (not missing/defaulted) `Vec`, distinct from the field
+        // being absent from the payload entirely.
+        let msg: WsClientMsg =
+            serde_json::from_str(r#"{"type":"btSelection","taskId":"t3","selectedIndices":[]}"#)
+                .unwrap();
+        match msg {
+            WsClientMsg::BtSelection {
+                task_id,
+                selected_indices,
+            } => {
+                assert_eq!(task_id, "t3");
+                assert!(selected_indices.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    fn sample_task_dto(id: &str) -> TaskDto {
+        TaskDto {
+            task_id: id.to_string(),
+            url: "http://example.com/file".into(),
+            file_name: "video.mp4".into(),
+            save_dir: "/downloads".into(),
+            status: 1,
+            downloaded_bytes: 10,
+            total_bytes: 100,
+            error_message: String::new(),
+            created_at: "1700000000".into(),
+            proxy_url: String::new(),
+            queue_id: "q1".into(),
+            checksum: String::new(),
+        }
+    }
+
+    fn sample_queue_dto(id: &str) -> QueueDto {
+        QueueDto {
+            queue_id: id.to_string(),
+            name: "工作队列".into(),
+            speed_limit_kbps: 512,
+            max_concurrent: 3,
+            default_save_dir: "/downloads/work".into(),
+            position: 1,
+            default_segments: 4,
+            default_user_agent: "FluxDown/1.0".into(),
+        }
+    }
+
+    #[test]
+    fn ws_server_msg_tasks_snapshot_variant() {
+        let msg = WsServerMsg::TasksSnapshot {
+            tasks: vec![sample_task_dto("task-1")],
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "tasksSnapshot");
+        assert_eq!(v["tasks"][0]["taskId"], "task-1");
+        assert_eq!(v["tasks"][0]["fileName"], "video.mp4");
+        assert_eq!(v["tasks"][0]["downloadedBytes"], 10);
+        assert_eq!(v["tasks"][0]["queueId"], "q1");
+    }
+
+    #[test]
+    fn ws_server_msg_segment_progress_variant() {
+        let msg = WsServerMsg::SegmentProgress {
+            task_id: "t1".into(),
+            total_bytes: 1000,
+            segment_count: 2,
+            segments: vec![
+                SegmentDetailDto {
+                    index: 0,
+                    start_byte: 0,
+                    end_byte: 500,
+                    downloaded_bytes: 250,
+                },
+                SegmentDetailDto {
+                    index: 1,
+                    start_byte: 500,
+                    end_byte: 1000,
+                    downloaded_bytes: 100,
+                },
+            ],
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "segmentProgress");
+        assert_eq!(v["taskId"], "t1");
+        assert_eq!(v["totalBytes"], 1000);
+        assert_eq!(v["segmentCount"], 2);
+        assert_eq!(v["segments"][0]["startByte"], 0);
+        assert_eq!(v["segments"][0]["endByte"], 500);
+        assert_eq!(v["segments"][1]["downloadedBytes"], 100);
+    }
+
+    #[test]
+    fn ws_server_msg_segment_split_variant() {
+        let msg = WsServerMsg::SegmentSplit {
+            task_id: "t1".into(),
+            parent_index: 0,
+            parent_new_end: 400,
+            child_index: 2,
+            child_start: 400,
+            child_end: 800,
+            is_proactive: true,
+            total_segments: 3,
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "segmentSplit");
+        assert_eq!(v["parentIndex"], 0);
+        assert_eq!(v["parentNewEnd"], 400);
+        assert_eq!(v["childIndex"], 2);
+        assert_eq!(v["childStart"], 400);
+        assert_eq!(v["childEnd"], 800);
+        assert_eq!(v["isProactive"], true);
+        assert_eq!(v["totalSegments"], 3);
+    }
+
+    #[test]
+    fn ws_server_msg_task_meta_probed_variant() {
+        let msg = WsServerMsg::TaskMetaProbed {
+            task_id: "t1".into(),
+            file_name: "movie.mkv".into(),
+            total_bytes: 123_456,
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "taskMetaProbed");
+        assert_eq!(v["fileName"], "movie.mkv");
+        assert_eq!(v["totalBytes"], 123_456);
+    }
+
+    #[test]
+    fn ws_server_msg_queues_changed_variant() {
+        let msg = WsServerMsg::QueuesChanged {
+            queues: vec![sample_queue_dto("q1")],
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "queuesChanged");
+        assert_eq!(v["queues"][0]["queueId"], "q1");
+        assert_eq!(v["queues"][0]["speedLimitKbps"], 512);
+        assert_eq!(v["queues"][0]["defaultSaveDir"], "/downloads/work");
+    }
+
+    #[test]
+    fn ws_server_msg_queue_positions_changed_variant() {
+        let msg = WsServerMsg::QueuePositionsChanged {
+            positions: vec![QueuePositionDto {
+                task_id: "t1".into(),
+                position: 3,
+            }],
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "queuePositionsChanged");
+        assert_eq!(v["positions"][0]["taskId"], "t1");
+        assert_eq!(v["positions"][0]["position"], 3);
+    }
+
+    #[test]
+    fn ws_server_msg_priority_task_changed_variant() {
+        let msg = WsServerMsg::PriorityTaskChanged {
+            priority_task_id: "t9".into(),
+            auto_paused_count: 4,
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "priorityTaskChanged");
+        assert_eq!(v["priorityTaskId"], "t9");
+        assert_eq!(v["autoPausedCount"], 4);
+    }
+
+    #[test]
+    fn ws_server_msg_hls_selection_request_variant() {
+        let msg = WsServerMsg::HlsSelectionRequest {
+            task_id: "t1".into(),
+            options: vec![HlsQualityOptionDto {
+                index: 0,
+                bandwidth: 5_000_000,
+                width: 1920,
+                height: 1080,
+            }],
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "hlsSelectionRequest");
+        assert_eq!(v["taskId"], "t1");
+        assert_eq!(v["options"][0]["bandwidth"], 5_000_000);
+        assert_eq!(v["options"][0]["height"], 1080);
+    }
+
+    #[test]
+    fn ws_server_msg_bt_selection_request_variant() {
+        let msg = WsServerMsg::BtSelectionRequest {
+            task_id: "t1".into(),
+            files: vec![BtFileDto {
+                index: 1,
+                path: "folder/video.mp4".into(),
+                size: 999,
+            }],
+        };
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "btSelectionRequest");
+        assert_eq!(v["files"][0]["path"], "folder/video.mp4");
+        assert_eq!(v["files"][0]["size"], 999);
+    }
+
+    #[test]
+    fn ws_server_msg_pong_variant_has_no_extra_fields() {
+        let v: serde_json::Value = serde_json::to_value(&WsServerMsg::Pong {}).unwrap();
+        assert_eq!(v, serde_json::json!({ "type": "pong" }));
+    }
+}

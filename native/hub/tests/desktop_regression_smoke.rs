@@ -409,10 +409,12 @@ async fn desktop_regression_smoke() {
             proxy_config: ProxyConfig::default(),
             user_agent: String::new(),
             data_dir_override: Some(work_dir.clone()),
+            database_url: None,
         },
         sink.clone(),
         Arc::new(NoopSelection),
     )
+    .await
     .expect("Engine::new");
 
     // 与 `download_actor.rs::run` 完全一致的接线方式：`take_progress_rx` 独立
