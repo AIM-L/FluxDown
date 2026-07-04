@@ -12,6 +12,7 @@ import DocsSidebar from "../../../components/docs/DocsSidebar.astro";
 import DocsPageNav from "../../../components/docs/DocsPageNav.astro";
 import DocsToc from "../../../components/docs/DocsToc";
 import DocsFeedbackForm from "../../../components/docs/DocsFeedbackForm";
+import DocsSearch from "../../../components/docs/DocsSearch";
 import { buildDocsNav, type DocsLang } from "../../../lib/docs-nav";
 import { getFallbackSlugs } from "../../../lib/docs-fallback";
 import { docsSourceHash } from "../../../lib/docs-hash";
@@ -122,6 +123,7 @@ const sectionLabel = groups.find((g) => g.id === entry.data.section)?.label;
       <!-- 桌面侧边栏(≥lg) -->
       <aside class="hidden lg:block lg:border-r lg:border-dark-border/50">
         <div class="sticky top-24 max-h-[calc(100vh-7rem)] overflow-y-auto pr-5">
+          <DocsSearch client:idle lang={lang} />
           <DocsSidebar groups={groups} currentPath={Astro.url.pathname} lang={lang} />
         </div>
       </aside>
@@ -135,6 +137,7 @@ const sectionLabel = groups.find((g) => g.id === entry.data.section)?.label;
             {zh ? "文档目录" : "Docs menu"}
           </summary>
           <div class="border-t border-dark-border p-4">
+            <DocsSearch client:idle lang={lang} />
             <DocsSidebar groups={groups} currentPath={Astro.url.pathname} lang={lang} />
           </div>
         </details>

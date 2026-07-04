@@ -9,6 +9,7 @@ import Layout from "../../../layouts/Layout.astro";
 import { FloatingNavbar } from "../../../components/ui/floating-navbar";
 import Footer from "../../../components/Footer";
 import { buildDocsNav, type SectionId } from "../../../lib/docs-nav";
+import DocsSearch from "../../../components/docs/DocsSearch";
 
 export const prerender = true;
 
@@ -126,6 +127,11 @@ const SECTION_META: Record<
             {zh ? "在 GitHub 上贡献" : "Contribute on GitHub"}
           </a>
         </div>
+      </div>
+
+      <!-- 文档搜索(模糊 + 全文,⌘/Ctrl+K 亦可唤起) -->
+      <div class="mt-8 max-w-md">
+        <DocsSearch client:idle lang={lang} />
       </div>
 
       <!-- Bento 分区拼贴 -->
