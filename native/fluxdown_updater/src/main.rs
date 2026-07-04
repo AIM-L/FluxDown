@@ -303,7 +303,7 @@ fn do_portable_zip(zip: &Path, dir: &Path, exe: &str) -> Result<(), UpdaterError
                  \"Program Files\", or a file was locked by another program).\n\n\
                  The new version has been extracted to:\n{}\n\n\
                  Please copy its contents over your FluxDown folder manually, \
-                 or download the latest version from https://fluxdown.app",
+                 or download the latest version from https://fluxdown.zerx.dev",
                 src.display()
             ),
         );
@@ -421,7 +421,7 @@ fn do_tarball(tarball: &Path, dir: &Path, exe: &str) -> Result<(), UpdaterError>
                      (the folder may be read-only or in a protected location).\n\n\
                      The new version has been extracted to:\n{}\n\n\
                      Please copy its contents over your FluxDown folder manually, \
-                     or download the latest version from https://fluxdown.app",
+                     or download the latest version from https://fluxdown.zerx.dev",
                     src.display()
                 ),
             );

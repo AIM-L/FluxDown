@@ -22,7 +22,7 @@ All pull requests require a signed CLA before they can be merged.
 
 ## 反馈问题 / Reporting Issues
 
-请通过 [GitHub Issues](https://github.com/zerx-lab/FluxDown/issues) 或官网 [反馈页面](https://fluxdown.app/feedback) 提交问题。
+请通过 [GitHub Issues](https://github.com/zerx-lab/FluxDown/issues) 或官网 [反馈页面](https://fluxdown.zerx.dev/feedback) 提交问题。
 
 ## 文档贡献 / Documentation Contributions
 

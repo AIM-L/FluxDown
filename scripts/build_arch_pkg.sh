@@ -61,7 +61,7 @@ cat > "$PKG_DIR/.PKGINFO" << EOF
 pkgname = fluxdown
 pkgver = ${VERSION}-${PKGREL}
 pkgdesc = Free IDM-alternative download manager
-url = https://fluxdown.app
+url = https://fluxdown.zerx.dev
 builddate = $(date +%s)
 packager = FluxDown CI <ci@fluxdown.app>
 size = ${INSTALLED_SIZE}

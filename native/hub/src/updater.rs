@@ -862,7 +862,7 @@ fn ensure_install_dir_writable() -> Result<(), UpdateError> {
              happens when FluxDown is in a protected location such as \
              \"Program Files\" or on a read-only drive. Move FluxDown to a \
              normal folder (e.g. your user directory) and try again, or download \
-             the latest version from https://fluxdown.app\n\n({e})",
+             the latest version from https://fluxdown.zerx.dev\n\n({e})",
             dir.display()
         ))),
     }
@@ -1105,7 +1105,7 @@ fn bootstrap_updater_from_zip(zip_path: &str) -> Result<PathBuf, UpdateError> {
     Err(UpdateError::Other(format!(
         "{HELPER_NAME} was not found inside the downloaded archive. \
          The package may be from an older release. \
-         Please download and extract the new version manually from https://fluxdown.app"
+         Please download and extract the new version manually from https://fluxdown.zerx.dev"
     )))
 }
 

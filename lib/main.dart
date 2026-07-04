@@ -473,7 +473,7 @@ class _FluxDownAppState extends State<FluxDownApp>
         ),
         actions: [
           ShadButton.outline(
-            onPressed: () => launchUrl(Uri.parse('https://fluxdown.app')),
+            onPressed: () => launchUrl(Uri.parse('https://fluxdown.zerx.dev')),
             child: Text(s.updateFailedOpenSite),
           ),
           ShadButton(
