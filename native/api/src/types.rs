@@ -127,7 +127,7 @@ pub struct DownloadRequest {
 /// let json = serde_json::to_string(&dto).unwrap();
 /// assert!(json.contains("\"taskId\":\"t1\""));
 /// ```
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDto {
     pub task_id: String,
@@ -189,7 +189,7 @@ impl From<fluxdown_engine::model::TaskInfo> for TaskDto {
 /// let dto = QueueDto::from(q);
 /// assert_eq!(dto.queue_id, "q1");
 /// ```
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueDto {
     pub queue_id: String,
@@ -235,7 +235,7 @@ impl From<fluxdown_engine::model::QueueInfo> for QueueDto {
 /// assert_eq!(req.segments, 8);
 /// assert!(req.save_dir.is_empty()); // 空 = 使用全局默认保存目录
 /// ```
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskRequest {
     pub url: String,
@@ -270,14 +270,14 @@ pub struct CreateTaskRequest {
 }
 
 /// 创建任务响应（`POST /api/v1/tasks`）。
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreatedTask {
     pub task_id: String,
 }
 
 /// 应用信息（`GET /api/v1/info` 响应）。
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiInfo {
     pub name: String,

@@ -28,6 +28,7 @@ use utoipa::{Modify, OpenApi};
         crate::server::takeover_download,
         crate::server::takeover_download_batch,
         crate::server::jsonrpc,
+        crate::server::mcp,
         crate::server::api_info,
         crate::server::api_list_tasks,
         crate::server::api_create_task,
@@ -43,6 +44,7 @@ use utoipa::{Modify, OpenApi};
         (name = "system", description = "探活与基础信息"),
         (name = "takeover", description = "浏览器脚本接管（Tampermonkey / Violentmonkey）"),
         (name = "aria2", description = "aria2 JSON-RPC 兼容"),
+        (name = "mcp", description = "MCP（Model Context Protocol）—— AI 客户端工具调用"),
         (name = "management", description = "管理 API（强制 token）"),
     ),
     modifiers(&SecurityAddon)
@@ -101,6 +103,7 @@ mod tests {
             routes::DOWNLOAD,
             routes::DOWNLOAD_BATCH,
             routes::JSONRPC,
+            routes::MCP,
             routes::API_INFO,
             routes::API_TASKS,
             routes::API_TASK,

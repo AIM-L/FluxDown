@@ -20,6 +20,7 @@ Both share the same underlying route constants, request/response JSON contracts,
 | Script takeover | `POST /download`, `POST /download/batch` | `local_server_takeover_enabled` (default on) | `X-FluxDown-Client` header required, plus an optional token |
 | aria2-compatible RPC | `POST /jsonrpc` (`aria2.addUri`, `aria2.getVersion`, `aria2.getGlobalStat`, `system.multicall`, `system.listMethods`) | `local_server_jsonrpc_enabled` (default on) | optional token |
 | Management API | `GET /api/v1/info`, `GET/POST /api/v1/tasks`, `GET/DELETE /api/v1/tasks/{id}`, `PUT /api/v1/tasks/{id}/pause\|continue`, `PUT /api/v1/tasks/pause\|continue`, `GET /api/v1/queues` | `local_server_api_enabled` (default off on desktop, always on for the headless server) | **required** token |
+| MCP | `POST /mcp` (`initialize`, `tools/list`, `tools/call`, `ping`) | `local_server_mcp_enabled` (default off on desktop, always on for the headless server) | **required** token (shared with the management API) |
 
 `GET /api/v1/openapi.json` (no auth — it's a pure interface description with no data) is available whenever the management group is enabled.
 
@@ -78,7 +79,57 @@ curl -X POST http://<host>:17800/jsonrpc \
   }'
 ```
 
-`CreateTaskRequest` accepts `url` (required), and optional `fileName`, `saveDir`, `segments`, `cookies`, `referrer`, `proxyUrl`, `userAgent`, `queueId`, `checksum` (`algo=hexhash`), and `headers` — all camelCase in the JSON body. The full schema is in the OpenAPI document below.
+`CreateTaskRequest` accepts `url` (required), and optional `fileName`, `saveDir`, `segments`, `cookies`, `referrer`, `proxyUrl`, `userAgent`, `queueId`, `checksum` (`algo=hexhash`), and `headers` — all camelCase in the JSON body. A supplied `fileName` is sanitized (path separators and `..` stripped) so the download always stays inside its save directory. The full schema is in the OpenAPI document below.
+
+## MCP (Model Context Protocol)
+
+FluxDown speaks [MCP](https://modelcontextprotocol.io) over HTTP, so AI clients (Claude Desktop, Cursor, Cline, and any MCP-capable agent) can drive downloads in natural language. It's a single endpoint, `POST /mcp`, protected by the same token as the management API.
+
+MCP is JSON-RPC 2.0 over one HTTP endpoint (not REST) — every operation is one POST to `/mcp`, distinguished by the `method` in the body, using the stateless subset of the Streamable HTTP transport: requests get an `application/json` response, notifications get `202 Accepted`, and no session id is tracked. Authenticate with `Authorization: Bearer <token>` (or `X-FluxDown-Token`); the spec permits a static bearer token for internal deployments in place of OAuth 2.1.
+
+### Tools
+
+A client calls `tools/list` to discover these at runtime (each ships a full JSON Schema for its arguments), then `tools/call` to invoke one:
+
+| Tool | What it does | Arguments |
+|---|---|---|
+| `download_add` | Create a download task (HTTP/HTTPS/FTP/magnet/BitTorrent). Returns the new task id. | `url` (required); optional `fileName`, `saveDir`, `segments`, `proxyUrl`, `cookies`, `referrer`, `userAgent`, `queueId`, `checksum` |
+| `download_list` | List tasks, optionally filtered by status. | `status` (optional: `all`/`pending`/`downloading`/`paused`/`completed`/`error`/`preparing`) |
+| `download_get` | Get one task's full detail by id. | `taskId` (required) |
+| `download_pause` | Pause a task. | `taskId` (required) |
+| `download_resume` | Resume a paused task. | `taskId` (required) |
+| `download_pause_all` | Pause all active tasks (pending / downloading / preparing). | none |
+| `download_resume_all` | Resume all paused tasks. | none |
+| `download_remove` | Delete a task, optionally removing the file on disk. | `taskId` (required); optional `deleteFiles` (bool) |
+| `queue_list` | List all named queues and their config. | none |
+
+All nine map straight onto the management API's host capabilities, so an MCP client and a REST client see exactly the same tasks and queues.
+
+### Connecting a client
+
+Point your MCP client at the endpoint with a bearer token, e.g. in an `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "fluxdown": {
+      "url": "http://<host>:17800/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+Or exercise it directly with curl — initialize, then call a tool:
+
+```bash
+curl -X POST http://<host>:17800/mcp \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"download_add",
+                 "arguments":{"url":"https://example.com/file.zip","segments":8}}}'
+```
 
 ## Interactive documentation
 

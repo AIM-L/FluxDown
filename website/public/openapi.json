@@ -677,6 +677,51 @@
         ]
       }
     },
+    "/mcp": {
+      "post": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "MCP（Model Context Protocol）端点。强制 token 鉴权（Bearer /\nX-FluxDown-Token，复用管理 API 门禁）。请求返回 `200 application/json`\nJSON-RPC 响应；通知（无 `id`）返回 `202 Accepted` 空体。",
+        "operationId": "mcp",
+        "responses": {
+          "200": {
+            "description": "JSON-RPC 响应（initialize / tools/list / tools/call / ping）"
+          },
+          "202": {
+            "description": "通知已接受（无响应体）"
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "服务端未配置 token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
     "/ping": {
       "get": {
         "tags": [
@@ -1077,6 +1122,10 @@
     {
       "name": "aria2",
       "description": "aria2 JSON-RPC 兼容"
+    },
+    {
+      "name": "mcp",
+      "description": "MCP（Model Context Protocol）—— AI 客户端工具调用"
     },
     {
       "name": "management",

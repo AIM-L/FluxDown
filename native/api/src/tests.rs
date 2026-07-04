@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::routes;
 use crate::server::{self, ApiServerConfig};
-use crate::service::{ApiError, ApiHost};
+use crate::service::{ApiError, ApiHost, UNKNOWN_ENDPOINT_MESSAGE};
 use crate::types::{CreateTaskRequest, DownloadRequest, QueueDto, TaskDto};
 
 // ---------------------------------------------------------------------------
@@ -823,6 +823,9 @@ async fn management_disabled_returns_404_for_tasks() {
         .send(&request("GET", routes::API_TASKS, &[], ""))
         .await;
     assert_eq!(resp.status, 404);
+    // fallback message 是 CLI 区分「管理 API 未启用」与「资源不存在」的依据
+    // （CLI 据此给出可操作提示）。锁定该契约，改动 fallback message 会跑挂此测试。
+    assert_eq!(resp.json()["message"], UNKNOWN_ENDPOINT_MESSAGE);
 }
 
 // ---------------------------------------------------------------------------

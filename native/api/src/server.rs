@@ -34,7 +34,7 @@ use crate::auth::{check_management_auth, check_takeover_auth, header_token_ok};
 use crate::jsonrpc::handle_jsonrpc;
 use crate::mcp::handle_mcp;
 use crate::routes;
-use crate::service::{ApiError, ApiHost};
+use crate::service::{ApiError, ApiHost, UNKNOWN_ENDPOINT_MESSAGE};
 use crate::takeover::parse_batch;
 use crate::types::{CreateTaskRequest, CreatedTask, DownloadRequest};
 
@@ -284,7 +284,7 @@ async fn options_preflight(req: axum::extract::Request, next: Next) -> Response 
 }
 
 async fn unknown_endpoint() -> Response {
-    result_response(StatusCode::NOT_FOUND, false, "unknown endpoint")
+    result_response(StatusCode::NOT_FOUND, false, UNKNOWN_ENDPOINT_MESSAGE)
 }
 
 /// `{"success":bool,"message":...}` 形态响应（接管端点与错误统一格式）。

@@ -10,6 +10,12 @@ use async_trait::async_trait;
 
 use crate::types::{CreateTaskRequest, DownloadRequest, QueueDto, TaskDto};
 
+/// 404 fallback 响应的 message —— 请求命中了未注册的路由（例如管理 API 分组
+/// 未启用时访问 `/api/v1/*`）。server 侧 fallback 与 CLI/客户端共用此常量，
+/// 使「路由未注册」与「资源不存在（[`ApiError::NotFound`]，message `"not found"`）」
+/// 两种 404 可被客户端区分，避免跨 crate 硬编码字符串漂移。
+pub const UNKNOWN_ENDPOINT_MESSAGE: &str = "unknown endpoint";
+
 /// API 操作错误。由 HTTP 层映射为响应状态码。
 ///
 /// # Examples

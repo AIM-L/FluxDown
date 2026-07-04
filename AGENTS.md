@@ -35,6 +35,7 @@ cargo test -p fluxdown_engine        # 运行下载引擎全部单元测试（na
 cargo test -p hub                    # 运行 hub 适配层全部单元测试（native/hub，Rinf FFI/信号桥接）
 cargo test -p fluxdown_api           # 运行本机 API 服务全部测试（native/api，axum HTTP API/aria2 兼容）
 cargo test -p fluxdown_server        # 运行 headless 服务器全部测试（native/server，WS/actor/扩展路由）
+cargo test -p fluxdown_cli           # 运行命令行客户端测试（native/cli，格式化/退出码/尺寸解析 doctest）
 cargo test -p fluxdown_engine -- segment_advisor # 运行特定 Rust 测试模块
 cargo test -p fluxdown_engine -- test_name       # 运行单个 Rust 测试函数
 PG_TEST_URL=postgres://postgres:pw@localhost/postgres cargo test -p fluxdown_engine -- --ignored pg_smoke  # Postgres 后端冒烟（需本地 pg）
@@ -42,6 +43,11 @@ cargo run -p fluxdown_api --example gen_openapi > website/public/openapi.json  #
 
 # Web 服务器（headless，native/server）
 cargo run -p fluxdown_server         # 启动服务器（默认 0.0.0.0:17800；环境变量：FLUXDOWN_BIND / FLUXDOWN_DATA_DIR / FLUXDOWN_DATABASE_URL / FLUXDOWN_WEBROOT）
+
+# 命令行客户端（native/cli，二进制名 fluxdown）
+cargo build -p fluxdown_cli          # 构建 CLI（target/debug/fluxdown）
+cargo run -p fluxdown_cli -- ping    # 探活；子命令 add/list/status/pause/resume/rm/pause-all/resume-all/queue/watch/info
+# 环境变量：FLUXDOWN_URL（默认 http://127.0.0.1:17800）/ FLUXDOWN_TOKEN（管理 API token）
 # Web 前端（web/ 目录下，React 19 + TanStack + Tailwind v4，包管理器 bun）
 bun run dev                          # 开发服务器 localhost:5173（/api 代理到 localhost:17800）
 bun run build                        # 构建到 web/dist（FLUXDOWN_WEBROOT=web/dist 由服务器托管）
@@ -418,12 +424,24 @@ MCP server 等 Rust 客户端直接 import `types` + `routes`。
 直接映射 `ApiHost` 方法。桌面 App 与 headless server 经同一 `register_core` 自动获得 `/mcp`；
 AI 客户端（Claude Desktop/Cursor/Cline）配置 `{"url":".../mcp","headers":{"Authorization":"Bearer <token>"}}` 即可接入。
 
-**CLI 方案（规划中，未实现）**：`fluxdown_cli`（拟 `native/cli`）双模式——(A) 控制面复用
-`fluxdown_api` 的 `routes`+`types` 做 typed HTTP client 提交给运行中的 App/server；
-(B) App 未运行时直接内嵌 `fluxdown_engine::Engine`（参照 `examples/headless_download.rs`）
-本地下载。命令集对齐 aria2 能力：`get`/`add`/`list`/`status`/`pause`/`resume`/`rm`/`boost`/
-`queue`/`config`/`stats`/`watch`/`ping`；抄 aria2 的 exit code 表 + `K/M` 单位后缀 + `-i` 输入文件；
-token 经 `FLUXDOWN_TOKEN` 环境变量。放弃 Metalink/XML-RPC/saveSession（SQLite 已覆盖）。
+## 命令行客户端（native/cli，`fluxdown_cli` crate）
+
+aria2c 风格 CLI，二进制名 `fluxdown`。**A 模式（typed HTTP client）已实现**：复用
+`fluxdown_api` 的 `routes`（路径常量）+ `types`（`TaskDto`/`CreateTaskRequest`/…，为客户端补齐
+了 serde 双向 derive）+ `auth::TOKEN_HEADER`，与运行中的 App / headless server 通信，地址/JSON
+永不漂移。B 模式（App 未运行时内嵌 `fluxdown_engine::Engine` 本地下载，参照
+`examples/headless_download.rs`）暂缓。
+
+**命令集**：`ping`（无鉴权探活）/ `info` / `add`(别名 `get`) / `list`(别名 `ls`) /
+`status`(别名 `stat`) / `pause` / `resume` / `rm`(`--delete-files`) / `pause-all` / `resume-all` /
+`queue` / `watch`（ANSI 清屏轮询进度直至终态）。
+
+**约定**：token 经 `--token` 或 `FLUXDOWN_TOKEN`，服务地址经 `--url` 或 `FLUXDOWN_URL`
+（默认 `http://127.0.0.1:17800`）；`--json` 输出脚本友好 JSON；`add` 支持多 URL + `-i`
+输入文件（每行一 URL，`#` 注释，`-` 读 stdin）+ `-d/-o/-s/--proxy/-U/--referrer/--cookies/--queue/--checksum`。
+aria2 风格退出码：0 成功 / 1 未知 / 2 超时 / 3 未找到 / 5 网络 / 24 鉴权 / 32 参数非法。
+`K/M/G/T` 尺寸后缀按 1024 进制解析（`format::parse_size`）。HTTP client `.no_proxy()` 直连本地
+回环，不受系统代理干扰。放弃 Metalink/XML-RPC/saveSession（SQLite 已覆盖）。
 
 ## 浏览器扩展（fluxDown/）
 
