@@ -2,7 +2,6 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
-import 'package:shadcn_ui/shadcn_ui.dart';
 
 import '../../i18n/locale_provider.dart';
 import '../../services/log_service.dart';
@@ -88,29 +87,15 @@ Future<String?> pickMobileDownloadDirectory(BuildContext context) async {
       logInfo(_tag, 'hasAllFilesAccess failed: ${e.message}');
     }
     if (!granted && context.mounted) {
-      await showShadDialog<void>(
-        context: context,
-        builder: (dialogCtx) => ShadDialog.alert(
-          title: Text(s.mobileAllFilesTitle),
-          description: Padding(
-            padding: const EdgeInsets.only(top: 8),
-            child: Text(s.mobileAllFilesDesc),
-          ),
-          actions: [
-            ShadButton.outline(
-              onPressed: () => Navigator.of(dialogCtx).pop(),
-              child: Text(s.cancel),
-            ),
-            ShadButton(
-              onPressed: () {
-                Navigator.of(dialogCtx).pop();
-                MobileStorageService.requestAllFilesAccess();
-              },
-              child: Text(s.mobileGoGrant),
-            ),
-          ],
-        ),
-      );
+      await showMobileConfirm(
+        context,
+        title: s.mobileAllFilesTitle,
+        message: s.mobileAllFilesDesc,
+        confirmLabel: s.mobileGoGrant,
+        cancelLabel: s.cancel,
+      ).then((ok) {
+        if (ok == true) MobileStorageService.requestAllFilesAccess();
+      });
     }
   }
   return path;

@@ -9,6 +9,7 @@ import '../theme/theme_provider.dart';
 import 'mobile_ui.dart';
 import 'screens/mobile_settings_screen.dart';
 import 'services/mobile_storage_service.dart';
+import '../services/foreground_service.dart';
 import 'screens/mobile_tasks_screen.dart';
 
 /// 移动端根壳：任务列表 / 设置 两屏切换 + 悬浮玻璃 Dock
@@ -36,6 +37,16 @@ class _MobileShellState extends State<MobileShell> {
     super.initState();
     _settings.requestConfig();
     _ensureAndroidSaveDir();
+    // 前台服务：切换应用时保活进程、持续下载，任务栏常驻进度通知（仅移动端生效）
+    ForegroundServiceManager.instance.start(
+      _controller,
+      widget.localeNotifier.s,
+    );
+    widget.localeNotifier.addListener(_onLocaleChanged);
+  }
+
+  void _onLocaleChanged() {
+    ForegroundServiceManager.instance.updateStrings(widget.localeNotifier.s);
   }
 
   /// Android：让 framework 创建应用专属外部下载目录
@@ -53,6 +64,8 @@ class _MobileShellState extends State<MobileShell> {
 
   @override
   void dispose() {
+    widget.localeNotifier.removeListener(_onLocaleChanged);
+    ForegroundServiceManager.instance.stop();
     _controller.dispose();
     _settings.dispose();
     super.dispose();

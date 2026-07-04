@@ -125,6 +125,7 @@ class MobileChip extends StatelessWidget {
     return GestureDetector(
       onTap: onTap,
       child: Container(
+        alignment: Alignment.center,
         padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
         decoration: BoxDecoration(
           color: selected ? c.accent.withValues(alpha: 0.10) : c.surface1,
@@ -135,12 +136,79 @@ class MobileChip extends StatelessWidget {
         ),
         child: Text(
           label,
+          textAlign: TextAlign.center,
           style: TextStyle(
             fontSize: 12.5,
+            height: 1.0,
             fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
             color: selected ? c.accent : c.textSecondary,
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 单行分段选择器（iOS Segmented Control 风格）：所有选项等分一行，
+/// 紧凑不换行。用于线程数等固定枚举选择。
+class MobileSegmentedRow extends StatelessWidget {
+  final List<String> options;
+  final List<String> labels;
+  final String selected;
+  final ValueChanged<String> onSelect;
+
+  const MobileSegmentedRow({
+    super.key,
+    required this.options,
+    required this.labels,
+    required this.selected,
+    required this.onSelect,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: c.surface1,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: c.border),
+      ),
+      child: Row(
+        children: [
+          for (var i = 0; i < options.length; i++)
+            Expanded(
+              child: GestureDetector(
+                onTap: () => onSelect(options[i]),
+                behavior: HitTestBehavior.opaque,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 150),
+                  curve: Curves.easeOut,
+                  height: 32,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: selected == options[i]
+                        ? c.accent
+                        : const Color(0x00000000),
+                    borderRadius: BorderRadius.circular(9),
+                  ),
+                  child: Text(
+                    labels[i],
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: selected == options[i]
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                      color: selected == options[i]
+                          ? c.accentForeground
+                          : c.textSecondary,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -393,6 +461,76 @@ class MobileFieldLabel extends StatelessWidget {
   }
 }
 
+/// 统一样式文本输入框：玻璃填充 + 描边 + 圆角，避免与背景融合。
+/// [suffix] 叠加在右下角（如粘贴按钮）。
+class MobileTextField extends StatelessWidget {
+  final TextEditingController controller;
+  final String? placeholder;
+  final int maxLines;
+  final bool dense;
+  final FocusNode? focusNode;
+  final ValueChanged<String>? onChanged;
+  final Widget? suffix;
+
+  const MobileTextField({
+    super.key,
+    required this.controller,
+    this.placeholder,
+    this.maxLines = 1,
+    this.dense = false,
+    this.focusNode,
+    this.onChanged,
+    this.suffix,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final single = maxLines == 1;
+    final input = ShadInput(
+      controller: controller,
+      focusNode: focusNode,
+      maxLines: maxLines,
+      onChanged: onChanged,
+      alignment: single ? Alignment.centerLeft : Alignment.topLeft,
+      placeholderAlignment: single ? Alignment.centerLeft : Alignment.topLeft,
+      padding: single
+          ? const EdgeInsets.symmetric(horizontal: 12)
+          : const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      constraints: single ? const BoxConstraints() : null,
+      decoration: ShadDecoration.none,
+      style: TextStyle(fontSize: 13, height: 1.2, color: c.textPrimary),
+      placeholder: placeholder != null
+          ? Text(
+              placeholder!,
+              style: TextStyle(color: c.textMuted, fontSize: 13, height: 1.2),
+            )
+          : null,
+    );
+    final Widget field = single
+        ? SizedBox(
+            height: dense ? 38 : 44,
+            child: Align(alignment: Alignment.centerLeft, child: input),
+          )
+        : input;
+    return Container(
+      decoration: BoxDecoration(
+        color: c.surface1,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: c.border),
+      ),
+      child: suffix == null
+          ? field
+          : Stack(
+              children: [
+                field,
+                Positioned(right: 8, bottom: 8, child: suffix!),
+              ],
+            ),
+    );
+  }
+}
+
 /// 主按钮（胶囊，accent 填充）
 class MobilePrimaryButton extends StatelessWidget {
   final String label;
@@ -416,10 +554,14 @@ class MobilePrimaryButton extends StatelessWidget {
     final Color fg;
     final Color bgColor;
     final Color borderColor;
-    if (destructive) {
+    if (destructive && filled) {
+      fg = c.accentForeground;
+      bgColor = c.statusError;
+      borderColor = c.statusError;
+    } else if (destructive) {
       fg = c.statusError;
       bgColor = const Color(0x00000000);
-      borderColor = c.statusError.withValues(alpha: 0.3);
+      borderColor = c.statusError.withValues(alpha: 0.5);
     } else if (filled) {
       fg = c.accentForeground;
       bgColor = c.accent;
@@ -432,11 +574,11 @@ class MobilePrimaryButton extends StatelessWidget {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        height: 40,
+        height: 46,
         alignment: Alignment.center,
         decoration: BoxDecoration(
           color: bgColor,
-          borderRadius: BorderRadius.circular(999),
+          borderRadius: BorderRadius.circular(14),
           border: Border.all(color: borderColor),
         ),
         child: Row(
@@ -449,8 +591,8 @@ class MobilePrimaryButton extends StatelessWidget {
             Text(
               label,
               style: TextStyle(
-                fontSize: 13.5,
-                fontWeight: FontWeight.w600,
+                fontSize: 14.5,
+                fontWeight: FontWeight.w700,
                 color: fg,
               ),
             ),
@@ -459,4 +601,57 @@ class MobilePrimaryButton extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 通用二次确认底部弹层（Liquid Glass 风格）。
+///
+/// 返回 `true` 表示用户点击了确认按钮；取消 / 划走 / 点遮罩返回 `null`。
+/// [destructive] 为 true 时确认按钮渲染为红色危险样式。
+Future<bool?> showMobileConfirm(
+  BuildContext context, {
+  required String title,
+  required String message,
+  required String confirmLabel,
+  required String cancelLabel,
+  IconData? confirmIcon,
+  bool destructive = false,
+}) {
+  return showMobileSheet<bool>(
+    context,
+    builder: (ctx) {
+      final c = AppColors.of(ctx);
+      return MobileSheetContainer(
+        title: title,
+        footer: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            MobilePrimaryButton(
+              icon: confirmIcon,
+              label: confirmLabel,
+              destructive: destructive,
+              filled: true,
+              onTap: () => Navigator.of(ctx).pop(true),
+            ),
+            const SizedBox(height: 10),
+            MobilePrimaryButton(
+              label: cancelLabel,
+              filled: false,
+              onTap: () => Navigator.of(ctx).pop(),
+            ),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.only(top: 2, bottom: 4),
+          child: Text(
+            message,
+            style: TextStyle(
+              fontSize: 13,
+              height: 1.5,
+              color: c.textMuted,
+            ),
+          ),
+        ),
+      );
+    },
+  );
 }

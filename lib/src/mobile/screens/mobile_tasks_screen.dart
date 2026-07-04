@@ -204,10 +204,11 @@ class MobileTasksScreenState extends State<MobileTasksScreen> {
         child: Row(
           children: [
             Expanded(
-              child: ShadInput(
+              child: MobileTextField(
                 controller: _searchController,
                 focusNode: _searchFocus,
-                placeholder: Text(s.mobileSearchHint),
+                placeholder: s.mobileSearchHint,
+                dense: true,
                 onChanged: (v) =>
                     setState(() => _query = v.trim().toLowerCase()),
               ),
@@ -323,11 +324,13 @@ class MobileTasksScreenState extends State<MobileTasksScreen> {
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
           children: [
             for (final tab in StatusTab.values) ...[
-              MobileChip(
-                label:
-                    '${label(tab)} ${dc.filteredCountForStatus(tab)}',
-                selected: dc.statusTab == tab,
-                onTap: () => dc.setStatusTab(tab),
+              Center(
+                child: MobileChip(
+                  label:
+                      '${label(tab)} ${dc.filteredCountForStatus(tab)}',
+                  selected: dc.statusTab == tab,
+                  onTap: () => dc.setStatusTab(tab),
+                ),
               ),
               const SizedBox(width: 6),
             ],

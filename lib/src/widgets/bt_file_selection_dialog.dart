@@ -1,8 +1,11 @@
+import 'dart:io';
+
 import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
 import '../bindings/bindings.dart';
 import '../i18n/locale_provider.dart';
+import '../mobile/sheets/mobile_bt_file_sheet.dart';
 import '../theme/app_colors.dart';
 import 'bt_file_list_widget.dart';
 
@@ -13,6 +16,15 @@ void showBtFileSelectionDialog(
   required List<BtFileEntry> files,
   VoidCallback? onClosed,
 }) {
+  if (Platform.isAndroid || Platform.isIOS) {
+    showMobileBtFileSheet(
+      context,
+      taskId: taskId,
+      files: files,
+      onClosed: onClosed,
+    );
+    return;
+  }
   showShadDialog(
     context: context,
     barrierColor: AppColors.of(context).dialogBarrier,

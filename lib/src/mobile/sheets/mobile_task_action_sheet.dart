@@ -225,25 +225,14 @@ Future<void> confirmMobileDeleteTask(
   required bool deleteFiles,
 }) async {
   final s = LocaleScope.of(context);
-  final confirmed = await showShadDialog<bool>(
-    context: context,
-    builder: (dialogCtx) => ShadDialog.alert(
-      title: Text(s.deleteConfirmTitle(deleteFiles)),
-      description: Padding(
-        padding: const EdgeInsets.only(top: 8),
-        child: Text(s.deleteConfirmDesc(task.fileName, deleteFiles)),
-      ),
-      actions: [
-        ShadButton.outline(
-          onPressed: () => Navigator.of(dialogCtx).pop(false),
-          child: Text(s.cancel),
-        ),
-        ShadButton.destructive(
-          onPressed: () => Navigator.of(dialogCtx).pop(true),
-          child: Text(s.confirm),
-        ),
-      ],
-    ),
+  final confirmed = await showMobileConfirm(
+    context,
+    title: s.deleteConfirmTitle(deleteFiles),
+    message: s.deleteConfirmDesc(task.fileName, deleteFiles),
+    confirmLabel: s.confirm,
+    cancelLabel: s.cancel,
+    confirmIcon: LucideIcons.trash2,
+    destructive: true,
   );
   if (confirmed != true) return;
   controller.deleteTask(task.id, deleteFiles: deleteFiles);

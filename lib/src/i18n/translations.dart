@@ -1330,4 +1330,22 @@ class S {
     'Saving to public folders (e.g. Download) requires the "All files access" permission. Tap "Grant" to enable it in system settings.',
   );
   String get mobileGoGrant => _t('去授权', 'Grant');
+
+  // ─────────────────────────────────────────────
+  // 前台服务（移动端后台下载通知）
+  // ─────────────────────────────────────────────
+
+  String get fgServiceChannelName => _t('后台下载', 'Background Download');
+  String get fgServiceChannelDesc => _t(
+    '应用切换到后台时保持下载继续运行。',
+    'Keeps downloads running while the app is in the background.',
+  );
+  String fgServiceActiveTitle(int count) {
+    final unit = count == 1 ? 'task' : 'tasks';
+    return _t('正在下载 $count 个任务', 'Downloading $count $unit');
+  }
+
+  String fgServiceActiveText(String speed) => _t('速度 $speed', 'Speed $speed');
+  String get fgServiceIdleTitle => _t('FluxDown 正在运行', 'FluxDown is running');
+  String get fgServiceIdleText => _t('后台待命中', 'Standing by in the background');
 }

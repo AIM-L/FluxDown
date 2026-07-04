@@ -15,8 +15,9 @@ jobs:
   # 规则：
   #   fluxDown/**            → 浏览器扩展（extension）
   #   web/**、native/server/** → headless 服务器（server，Docker 镜像 + 多平台二进制）
-  #   native/engine/**       → 桌面客户端 + 服务器（共享下载引擎）
+  #   native/engine/**       → 桌面客户端 + 服务器 + 移动端（共享下载引擎）
   #   docker/**              → 服务器（部署文件变更需重发镜像）
+  #   android/**、lib/src/mobile/** → 移动端资产（Android APK）
   #   website/**             → 官网（独立走 deploy-website.yml 部署，不发 release）
   #   docs/**、*.md          → 纯文档，不触发任何构建
   #   其余任何路径            → 桌面客户端（app）
@@ -28,6 +29,7 @@ jobs:
       app: ${{ steps.detect.outputs.app }}
       extension: ${{ steps.detect.outputs.extension }}
       server: ${{ steps.detect.outputs.server }}
+      mobile: ${{ steps.detect.outputs.mobile }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -44,10 +46,10 @@ jobs:
           # 自动忽略 release 流程创建的 extension-v* / website-v* 组件 tag）
           PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)
 
-          APP=false; EXTENSION=false; SERVER=false
+          APP=false; EXTENSION=false; SERVER=false; MOBILE=false
           if [ -z "$PREV" ]; then
             echo "No previous version tag found — building everything"
-            APP=true; EXTENSION=true; SERVER=true
+            APP=true; EXTENSION=true; SERVER=true; MOBILE=true
           else
             echo "Diff range: ${PREV}..${TAG}"
             CHANGED=$(git diff --name-only "${PREV}" "${TAG}")
@@ -56,11 +58,16 @@ jobs:
             while IFS= read -r f; do
               [ -z "$f" ] && continue
               case "$f" in
-                fluxDown/*)      EXTENSION=true ;;
-                web/*)           SERVER=true ;;
-                native/server/*) SERVER=true ;;
-                native/engine/*) APP=true; SERVER=true ;;
-                docker/*)        SERVER=true ;;
+                fluxDown/*)          EXTENSION=true ;;
+                web/*)               SERVER=true ;;
+                native/server/*)     SERVER=true ;;
+                native/engine/*)     APP=true; SERVER=true; MOBILE=true ;;
+                docker/*)            SERVER=true ;;
+                android/*)           MOBILE=true ;;
+                lib/src/mobile/*)    MOBILE=true ;;
+                # 其余共享 Dart 代码（models/i18n/theme/bindings…）同时影响桌面端与移动端
+                lib/*)               APP=true; MOBILE=true ;;
+                pubspec.yaml|pubspec.lock) APP=true; MOBILE=true ;;
                 website/*)  ;;
                 docs/*|*.md) ;;
                 *)          APP=true ;;
@@ -72,8 +79,9 @@ jobs:
             echo "app=$APP"
             echo "extension=$EXTENSION"
             echo "server=$SERVER"
+            echo "mobile=$MOBILE"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::Components changed in ${PREV:-<none>}..${TAG}: app=$APP extension=$EXTENSION server=$SERVER"
+          echo "::notice::Components changed in ${PREV:-<none>}..${TAG}: app=$APP extension=$EXTENSION server=$SERVER mobile=$MOBILE"
 
   # ── 并行 Job 1: 构建 Windows 安装包（x64 + ARM64）──
   build-windows:
@@ -942,6 +950,143 @@ jobs:
           path: build/installer/FluxDown-*-macos-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
+  # ── 并行 Job 4b: 构建 Android APK（覆盖常用硬件 ABI + 通用包）──
+  # 触发条件：下载引擎（native/engine）或移动端代码（android/**、lib/src/mobile/**、
+  # 共享 Dart 代码）变更。Rinf 经 cargokit 在 flutter build apk 期间为各 ABI 编译 Rust cdylib。
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # ── JDK 17（Android Gradle Plugin 要求）──
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ── Android SDK / NDK（Flutter 构建时需要）──
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ── Rust toolchain + Android 目标三元组（cargokit 编译各 ABI 的 cdylib）──
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Cache Rinf CLI
+        id: cache-rinf
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/rinf
+          key: rinf-cli-${{ runner.os }}-x64-8.9.0
+
+      # ── Flutter SDK ──
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version info
+        run: flutter --version
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      # ── Rinf code generation ──
+      - name: Install Rinf CLI
+        if: steps.cache-rinf.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          CARGO_HTTP_MULTIPLEXING: "false"
+          CARGO_NET_RETRY: "10"
+        run: |
+          for i in 1 2 3; do
+            cargo install rinf_cli@8.9.0 && exit 0
+            echo "cargo install failed (attempt $i), retrying in 15s..."
+            sleep 15
+          done
+          exit 1
+
+      - name: Generate Rinf bindings
+        run: rinf gen
+
+      # ── Release 签名密钥（可选）──
+      # 提供 ANDROID_KEYSTORE_BASE64 等 secrets 时生成正式签名 key.properties，
+      # 否则 android/app/build.gradle.kts 自动回退 debug 签名，构建不中断。
+      - name: Configure release signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          # secrets 不能用于 step 级 if，改为运行时判空：无密钥则跳过，gradle 回退 debug 签名。
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 未配置 — 使用 debug 签名构建 APK（仅供测试，不可上架）"
+            exit 0
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks
+          cat > android/key.properties <<EOF
+          storeFile=upload-keystore.jks
+          keyAlias=${ANDROID_KEY_ALIAS}
+          keyPassword=${ANDROID_KEY_PASSWORD}
+          storePassword=${ANDROID_STORE_PASSWORD}
+          EOF
+          echo "Release signing configured"
+
+      # ── Build：按 ABI 拆分（arm64-v8a / armeabi-v7a / x86_64）+ 通用包 ──
+      # split-per-abi 产出各硬件专属小体积包；universal 供未知 ABI/手动分发兜底。
+      - name: Build split-per-ABI APKs
+        run: |
+          flutter build apk --release --split-per-abi \
+            --build-name=${{ steps.version.outputs.VERSION }} --build-number=1 \
+            --dart-define=APP_VERSION=${{ steps.version.outputs.VERSION }}
+
+      - name: Build universal APK
+        run: |
+          flutter build apk --release \
+            --build-name=${{ steps.version.outputs.VERSION }} --build-number=1 \
+            --dart-define=APP_VERSION=${{ steps.version.outputs.VERSION }}
+
+      # ── 收集并统一命名（Flutter 输出到 build/app/outputs/flutter-apk/）──
+      - name: Collect and rename APKs
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          SRC="build/app/outputs/flutter-apk"
+          mkdir -p build/android
+          cp "$SRC/app-arm64-v8a-release.apk"   "build/android/FluxDown-${VERSION}-android-arm64-v8a.apk"
+          cp "$SRC/app-armeabi-v7a-release.apk" "build/android/FluxDown-${VERSION}-android-armeabi-v7a.apk"
+          cp "$SRC/app-x86_64-release.apk"      "build/android/FluxDown-${VERSION}-android-x86_64.apk"
+          cp "$SRC/app-release.apk"             "build/android/FluxDown-${VERSION}-android-universal.apk"
+          ls -la build/android/
+
+      - name: Upload Android APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: build/android/FluxDown-*.apk
+          if-no-files-found: error
+
   # ── 并行 Job 5a: 构建服务器 Web SPA（一次构建，供所有平台二进制包复用）──
   build-web:
     name: Build Server Web SPA
@@ -1500,6 +1645,118 @@ jobs:
           draft: false
           make_latest: "false"
 
+  # ── Release Job 4: 移动端（独立 tag mobile-v*，不抢占 latest）──
+  release-mobile:
+    name: Release Mobile
+    runs-on: ubuntu-latest
+    needs: build-android
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # 只收集移动端相关目录的 commit 作为 release notes
+      - name: Generate release notes with git-cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: --latest --strip header --include-path "native/engine/**" --include-path "android/**" --include-path "lib/src/mobile/**"
+        env:
+          OUTPUT: RELEASE_NOTES.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      # 兜底 + 备份原始 notes 供翻译失败时回退
+      - name: Finalize release notes
+        id: finalize
+        shell: bash
+        run: |
+          HAS_NOTES=true
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Mobile Release v${{ steps.version.outputs.VERSION }}" > RELEASE_NOTES.md
+            HAS_NOTES=false
+          fi
+          cp RELEASE_NOTES.md RELEASE_NOTES.orig.md
+          echo "has_notes=$HAS_NOTES" >> "$GITHUB_OUTPUT"
+          echo "── Release notes (git-cliff) ──"
+          cat RELEASE_NOTES.md
+
+      # ── 将混合语言的 cliff 输出翻译为中英双语（与 release-app 同一套规则，直接调用 CLI）──
+      - name: Translate release notes (bilingual)
+        if: steps.finalize.outputs.has_notes == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          TRANSLATE_PROMPT: |
+            RELEASE_NOTES.md 是 git-cliff 从 Conventional Commits 生成的更新日志，条目语言混杂（部分中文、部分英文）。
+            请将其改写为中英双语版本，并覆盖写回 RELEASE_NOTES.md。
+
+            输出文件格式（严格遵守，无代码块围栏、无任何额外说明文字）：
+
+            <!-- fluxdown:lang:zh -->
+            （完整中文版）
+
+            <!-- fluxdown:lang:en -->
+            （完整英文版）
+
+            规则：
+            - 两个区块的结构与原文件一一对应：保留 "## [x.y.z] - 日期" 版本标题、"### <emoji> 分组" 标题、"- *(scope)* 描述" 条目格式与条目顺序，emoji 原样保留
+            - 中文区块：分组标题与所有条目描述均为中文（如 "### 🚀 新功能"、"### 🐛 问题修复"）
+            - 英文区块：分组标题与所有条目描述均为英文（如 "### 🚀 Features"、"### 🐛 Bug Fixes"）
+            - *(scope)* 括号内的 scope 名、反引号内的代码、issue/PR 编号（#123）、专有名词（HLS、DASH、aria2、Rinf、BT tracker 等）原样保留，不翻译
+            - 只修改 RELEASE_NOTES.md，不改动其他任何文件
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude -p "$TRANSLATE_PROMPT" --allowedTools "Read,Write,Edit"
+
+      # 校验翻译结果：缺少双语标记则回退到原始 git-cliff 输出
+      - name: Validate translated notes
+        if: steps.finalize.outputs.has_notes == 'true'
+        shell: bash
+        run: |
+          if grep -q '<!-- fluxdown:lang:zh -->' RELEASE_NOTES.md \
+            && grep -q '<!-- fluxdown:lang:en -->' RELEASE_NOTES.md; then
+            echo "Bilingual translation OK"
+          else
+            echo "::warning::Translated notes missing language markers — falling back to original git-cliff output"
+            cp RELEASE_NOTES.orig.md RELEASE_NOTES.md
+          fi
+          rm -f RELEASE_NOTES.orig.md
+          echo "── Final release notes ──"
+          cat RELEASE_NOTES.md
+
+      - name: Download Android APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: android-apk
+          path: release-assets/
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: List release assets
+        run: ls -la release-assets/
+
+      # make_latest=false：组件 release 不抢占 GitHub /releases/latest
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mobile-v${{ steps.version.outputs.VERSION }}
+          name: FluxDown Mobile v${{ steps.version.outputs.VERSION }}
+          files: release-assets/*
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
+          draft: false
+          make_latest: "false"
+
   # ── 最终 Job: 清理 GitHub Actions Artifact，仅保留当前 tag 这一组 ──
   # 原因：Free 账号 artifact 配额仅 500MB，每次 release 会上传 ~400MB
   # Release 资产已独立存储在 GitHub Release，artifact 只是 CI 中间产物可安全清理
@@ -1507,7 +1764,7 @@ jobs:
   cleanup-artifacts:
     name: Cleanup CI Artifacts
     runs-on: ubuntu-latest
-    needs: [release-app, release-extension, release-server]
+    needs: [release-app, release-extension, release-server, release-mobile]
     if: ${{ always() && !cancelled() }}
 
     steps:

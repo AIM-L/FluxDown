@@ -10,6 +10,15 @@
         android:maxSdkVersion="29"/>
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32"/>
+    <!-- 前台服务：后台持续下载（切换应用不中断），任务栏常驻通知 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!-- API 33+ 通知权限（前台服务通知/下载完成通知） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- 保持 CPU/WiFi 唤醒，防止后台下载被系统休眠中断 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- 请求忽略电池优化，提升后台存活率（用户可拒绝） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <application
         android:label="FluxDown"
         android:name="${applicationName}"
@@ -42,6 +51,11 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- flutter_foreground_task 前台服务（勿改 service name） -->
+        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

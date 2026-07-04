@@ -519,6 +519,16 @@ impl SharedBtSession {
                 let opts = SessionOptions {
                     disable_dht: !enable_dht,
                     disable_dht_persistence: !enable_dht,
+                    // Pin the DHT routing-table file inside our app-private data
+                    // directory. librqbit's default resolves a system config/cache
+                    // dir (via `directories`), which FAILS on Android (no XDG dirs)
+                    // and surfaces as "BT session init failed: error initializing
+                    // persistent DHT". Providing an explicit path makes it work on
+                    // every platform and keeps DHT state next to session.json.
+                    dht_config: Some(librqbit::dht::PersistentDhtConfig {
+                        config_filename: Some(persistence_folder.join("dht.json")),
+                        ..Default::default()
+                    }),
                     listen_port_range: Some(port_start..port_end.saturating_add(1)),
                     enable_upnp_port_forwarding: enable_upnp,
                     trackers,

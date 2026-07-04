@@ -186,72 +186,55 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           MobileFieldLabel(s.mobileUrlHint),
-          Stack(
-            children: [
-              ShadInput(
-                controller: _urlController,
-                maxLines: 3,
-                placeholder: const Text('https://\nmagnet:?xt=urn:btih:…'),
-              ),
-              Positioned(
-                right: 8,
-                bottom: 8,
-                child: GestureDetector(
-                  onTap: _pasteFromClipboard,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 5,
+          MobileTextField(
+            controller: _urlController,
+            maxLines: 3,
+            placeholder: 'https://\nmagnet:?xt=urn:btih:…',
+            suffix: GestureDetector(
+              onTap: _pasteFromClipboard,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: c.bg.withValues(alpha: 0.9),
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(color: c.border),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      LucideIcons.clipboard,
+                      size: 12,
+                      color: c.textSecondary,
                     ),
-                    decoration: BoxDecoration(
-                      color: c.surface1,
-                      borderRadius: BorderRadius.circular(999),
-                      border: Border.all(color: c.border),
+                    const SizedBox(width: 5),
+                    Text(
+                      s.mobilePaste,
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                        color: c.textSecondary,
+                      ),
                     ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          LucideIcons.clipboard,
-                          size: 12,
-                          color: c.textSecondary,
-                        ),
-                        const SizedBox(width: 5),
-                        Text(
-                          s.mobilePaste,
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w600,
-                            color: c.textSecondary,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                  ],
                 ),
               ),
-            ],
+            ),
           ),
           MobileFieldLabel(s.mobileSaveTo),
           if (MobileStorageService.supported)
             _DirPickRow(path: _dirController.text, onTap: _pickSaveDir)
           else
-            ShadInput(
+            MobileTextField(
               controller: _dirController,
-              placeholder: Text(s.selectSaveDir),
+              placeholder: s.selectSaveDir,
             ),
           MobileFieldLabel(s.threads),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final t in const ['auto', '4', '8', '16', '32'])
-                MobileChip(
-                  label: t == 'auto' ? s.auto : t,
-                  selected: _threads == t,
-                  onTap: () => setState(() => _threads = t),
-                ),
-            ],
+          MobileSegmentedRow(
+            options: const ['auto', '4', '8', '16', '32'],
+            labels: [s.auto, '4', '8', '16', '32'],
+            selected: _threads,
+            onSelect: (t) => setState(() => _threads = t),
           ),
           MobileFieldLabel(s.taskQueueLabel),
           Wrap(
@@ -325,15 +308,15 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
               ],
             ),
             MobileFieldLabel(s.taskCookie),
-            ShadInput(
+            MobileTextField(
               controller: _cookieController,
               maxLines: 2,
-              placeholder: Text(s.taskCookiePlaceholder),
+              placeholder: s.taskCookiePlaceholder,
             ),
             MobileFieldLabel(s.taskChecksum),
-            ShadInput(
+            MobileTextField(
               controller: _checksumController,
-              placeholder: const Text('sha256=e3b0c44298fc1c…'),
+              placeholder: 'sha256=e3b0c44298fc1c…',
             ),
           ],
         ],

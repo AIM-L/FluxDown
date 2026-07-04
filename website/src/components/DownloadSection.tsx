@@ -205,7 +205,8 @@ export default function DownloadSection() {
     arch: string;
     available: boolean;
     primary: boolean;
-    badge: string;
+    /** 独立图标背景样式（覆盖 primary/非 primary 默认背景），如 Docker/Web 版品牌色 */
+    iconBg?: string;
     /** 平台独立版本号（如 FluxDown Server），缺省时用桌面客户端版本 */
     version?: string;
     setup: ReleaseAsset | null;
@@ -323,6 +324,7 @@ export default function DownloadSection() {
       arch: t("dl.dockerArch"),
       available: true,
       primary: false,
+      iconBg: "bg-gradient-to-br from-[#2496ED] to-[#0db7ed]",
       badge: t("dl.availableNow"),
       setup: null,
       portable: null,
@@ -335,6 +337,7 @@ export default function DownloadSection() {
       available: hasServerAssets,
       primary: false,
       badge: hasServerAssets ? t("dl.availableNow") : t("dl.comingSoon"),
+      iconBg: "bg-gradient-to-br from-brand-sky to-brand-cyan",
       version: release?.server?.version,
       setup: serverAssets?.windows_x64 ?? null,
       setupLabel: "Windows x64",
@@ -446,14 +449,16 @@ export default function DownloadSection() {
                   )}
                   <div
                     className={`w-14 h-14 rounded-xl flex items-center justify-center mx-auto mb-4 transition-all duration-300 ${
-                      p.primary
-                        ? "bg-gradient-to-br from-brand-sky to-brand-cyan"
-                        : "bg-dark-surface2 border border-dark-border/50 group-hover:border-brand-blue/20 group-hover:bg-gradient-to-br group-hover:from-brand-blue/10 group-hover:to-brand-cyan/5"
+                      p.iconBg
+                        ? p.iconBg
+                        : p.primary
+                          ? "bg-gradient-to-br from-brand-sky to-brand-cyan"
+                          : "bg-dark-surface2 border border-dark-border/50 group-hover:border-brand-blue/20 group-hover:bg-gradient-to-br group-hover:from-brand-blue/10 group-hover:to-brand-cyan/5"
                     }`}
                   >
                     <Icon
                       className={`w-7 h-7 transition-colors duration-300 ${
-                        p.primary
+                        p.iconBg || p.primary
                           ? "text-white"
                           : "text-dark-text-muted group-hover:text-brand-blue/70"
                       }`}

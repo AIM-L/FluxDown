@@ -26,6 +26,7 @@ import 'src/services/bt_file_selection_service.dart';
 import 'src/services/app_icon_service.dart';
 import 'src/services/log_service.dart';
 import 'src/services/notification_service.dart';
+import 'src/services/foreground_service.dart';
 import 'src/services/power_service.dart';
 import 'src/services/tray_service.dart';
 import 'src/i18n/locale_provider.dart';
@@ -99,6 +100,8 @@ Future<void> main(List<String> args) async {
   // ===== 移动端启动流程 =====
   // Android / iOS 走精简初始化：无窗口管理、托盘、开机启动等桌面服务。
   if (Platform.isAndroid || Platform.isIOS) {
+    // 前台服务 ↔ 主 isolate 通信端口（必须在 runApp 之前）
+    ForegroundServiceManager.initCommunicationPort();
     logInfo('main', 'initializing Rust runtime (mobile)...');
     await initializeRust(assignRustSignal);
     logInfo('main', 'starting mobile shell');

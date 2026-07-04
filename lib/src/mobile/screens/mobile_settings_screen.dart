@@ -500,10 +500,10 @@ Future<void> _showInputSheet(
         ),
         child: Padding(
           padding: const EdgeInsets.only(top: 8),
-          child: ShadInput(
+          child: MobileTextField(
             controller: controller,
             maxLines: maxLines,
-            placeholder: placeholder != null ? Text(placeholder) : null,
+            placeholder: placeholder,
           ),
         ),
       );

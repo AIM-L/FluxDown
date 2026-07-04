@@ -1,8 +1,11 @@
+import 'dart:io';
+
 import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
 import '../bindings/bindings.dart';
 import '../i18n/locale_provider.dart';
+import '../mobile/sheets/mobile_hls_quality_sheet.dart';
 import '../theme/app_colors.dart';
 
 void showHlsQualityDialog(
@@ -10,6 +13,10 @@ void showHlsQualityDialog(
   required String taskId,
   required List<HlsQualityOption> options,
 }) {
+  if (Platform.isAndroid || Platform.isIOS) {
+    showMobileHlsQualitySheet(context, taskId: taskId, options: options);
+    return;
+  }
   showShadDialog(
     context: context,
     barrierColor: AppColors.of(context).dialogBarrier,
