@@ -14,6 +14,7 @@ library;
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -202,6 +203,10 @@ class FloatingBallService {
   void _teardown() {
     _heartbeat?.cancel();
     _heartbeat = null;
+    _waveTicker?.cancel();
+    _waveTicker = null;
+    _displayLevel = 0;
+    _downloadWasActive = false;
     AppIconService.instance.removeListener(_onAppIconChanged);
     _controller?.removeListener(_onDataChanged);
     _controller?.dispose();
@@ -249,6 +254,10 @@ class FloatingBallService {
   // ===========================================================================
   void _onDataChanged() {
     if (!_enabled) return;
+    // 下载活跃上升沿：水位归零，波浪自底上浮
+    final active = _controller?.state.isActive ?? false;
+    if (active && !_downloadWasActive) _displayLevel = 0;
+    _downloadWasActive = active;
     _applyActiveOnlyVisibility();
     if (!_nativeVisible) return; // 隐藏态无需渲染
     unawaited(_renderAndPush());
@@ -330,8 +339,18 @@ class FloatingBallService {
   bool _renderInFlight = false;
   bool _renderQueued = false;
 
+  // 迅雷风格波浪进度动画状态（active 态由计时器持续驱动重推位图）
+  Timer? _waveTicker;
+  double _wavePhase = 0;
+  double _displayLevel = 0;
+  bool _downloadWasActive = false;
+  static const Duration _waveFramePeriod = Duration(milliseconds: 55);
+  static const double _wavePhaseStep = 0.30;
+  static const double _levelEase = 0.16;
+
   /// 渲染当前状态一帧并推送（串行化：进行中则排队一次）。
   Future<void> _renderAndPush() async {
+    _syncWaveTicker();
     if (_renderInFlight) {
       _renderQueued = true;
       return;
@@ -345,6 +364,38 @@ class FloatingBallService {
     } finally {
       _renderInFlight = false;
     }
+  }
+
+  /// 启停波浪动画计时器（幂等）：active + 可见 + 非拖放态时运行。
+  void _syncWaveTicker() {
+    final shouldAnimate = _enabled &&
+        _nativeVisible &&
+        !_dragHover &&
+        (_controller?.state.isActive ?? false);
+    if (shouldAnimate) {
+      _waveTicker ??= Timer.periodic(_waveFramePeriod, (_) => _onWaveTick());
+    } else {
+      _waveTicker?.cancel();
+      _waveTicker = null;
+    }
+  }
+
+  /// 波浪帧：推进相位、缓动水位向目标进度靠拢，重推一帧。
+  void _onWaveTick() {
+    if (!_enabled ||
+        !_nativeVisible ||
+        _dragHover ||
+        !(_controller?.state.isActive ?? false)) {
+      _waveTicker?.cancel();
+      _waveTicker = null;
+      return;
+    }
+    _wavePhase += _wavePhaseStep;
+    final progress = _controller?.state.activeSpec?.aggregateProgress;
+    // 进度未知：水位在中位缓慢起伏，表达“进行中”
+    final target = progress ?? (0.5 + 0.14 * math.sin(_wavePhase * 0.45));
+    _displayLevel += (target - _displayLevel) * _levelEase;
+    unawaited(_renderAndPush());
   }
 
   Future<void> _renderOnce() async {
@@ -376,6 +427,8 @@ class FloatingBallService {
         tokens: tokens,
         scale: scale,
         activeSpec: st.activeSpec,
+        wavePhase: _wavePhase,
+        waveLevel: _displayLevel,
       );
     } else {
       image = await _staticVariant(

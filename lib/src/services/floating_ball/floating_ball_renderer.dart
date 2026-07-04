@@ -152,13 +152,21 @@ Future<BallImage> renderBallImage({
   required FluxThemeTokens tokens,
   required double scale,
   BallActiveSpec? activeSpec,
+  double wavePhase = 0,
+  double waveLevel = 0,
 }) async {
   assert(
     variant != BallVariant.active || activeSpec != null,
     'active variant requires activeSpec',
   );
   final (w, h, rgba) = await rasterizeWidgetRgba(
-    _BallWidget(variant: variant, tokens: tokens, activeSpec: activeSpec),
+    _BallWidget(
+      variant: variant,
+      tokens: tokens,
+      activeSpec: activeSpec,
+      wavePhase: wavePhase,
+      waveLevel: waveLevel,
+    ),
     logicalSize: const Size(kBallWindowSize, kBallWindowSize),
     scale: scale,
   );
@@ -173,11 +181,15 @@ class _BallWidget extends StatelessWidget {
   final BallVariant variant;
   final FluxThemeTokens tokens;
   final BallActiveSpec? activeSpec;
+  final double wavePhase;
+  final double waveLevel;
 
   const _BallWidget({
     required this.variant,
     required this.tokens,
     this.activeSpec,
+    this.wavePhase = 0,
+    this.waveLevel = 0,
   });
 
   @override
@@ -222,28 +234,14 @@ class _BallWidget extends StatelessWidget {
                   ),
                 ],
               ),
-              child: logoFillsBall
-                  ? ClipOval(
-                      child: RawImage(
-                        image: logo,
-                        width: kBallDiameter,
-                        height: kBallDiameter,
-                        fit: BoxFit.cover,
-                        filterQuality: FilterQuality.medium,
-                      ),
-                    )
-                  : _buildContent(isDragTarget, accent),
-            ),
-            // ── 进度环（active 态）──
-            if (variant == BallVariant.active)
-              Positioned.fill(
-                child: CustomPaint(
-                  painter: _ProgressRingPainter(
-                    progress: spec?.aggregateProgress,
-                    color: accent,
-                  ),
-                ),
+              child: _ballBody(
+                logoFillsBall: logoFillsBall,
+                logo: logo,
+                isDragTarget: isDragTarget,
+                accent: accent,
+                spec: spec,
               ),
+            ),
             // ── 活跃数角标 ──
             if (variant == BallVariant.active && (spec?.activeCount ?? 0) > 0)
               Positioned(
@@ -277,6 +275,45 @@ class _BallWidget extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  /// 球体主体内容：idle=铺满 logo；active=波浪进度 + 速度文本；其余=图标。
+  Widget _ballBody({
+    required bool logoFillsBall,
+    required ui.Image? logo,
+    required bool isDragTarget,
+    required Color accent,
+    required BallActiveSpec? spec,
+  }) {
+    if (logoFillsBall) {
+      return ClipOval(
+        child: RawImage(
+          image: logo,
+          width: kBallDiameter,
+          height: kBallDiameter,
+          fit: BoxFit.cover,
+          filterQuality: FilterQuality.medium,
+        ),
+      );
+    }
+    if (variant == BallVariant.active && spec != null) {
+      return ClipOval(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            CustomPaint(
+              painter: _WaveProgressPainter(
+                level: waveLevel,
+                phase: wavePhase,
+                color: accent,
+              ),
+            ),
+            _buildContent(isDragTarget, accent),
+          ],
+        ),
+      );
+    }
+    return _buildContent(isDragTarget, accent);
   }
 
   Widget _buildContent(bool isDragTarget, Color accent) {
@@ -328,38 +365,62 @@ class _BallWidget extends StatelessWidget {
       c.computeLuminance() > 0.5 ? const Color(0xFF18181B) : Colors.white;
 }
 
-/// 环形进度画笔 — progress==null 时画 3/4 圆弧表示不确定态
-class _ProgressRingPainter extends CustomPainter {
-  final double? progress;
+/// 迅雷风格波浪进度画笔 — 水位随进度自底上浮，双层正弦波持续波动。
+///
+/// 画布为球体外接方形，由父级 [ClipOval] 裁成圆形；[level] 0..1 为水位高度，
+/// [phase] 为动画相位（弧度，由服务层计时器持续推进）。
+class _WaveProgressPainter extends CustomPainter {
+  final double level;
+  final double phase;
   final Color color;
 
-  _ProgressRingPainter({required this.progress, required this.color});
+  _WaveProgressPainter({
+    required this.level,
+    required this.phase,
+    required this.color,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
-    final radius = kBallDiameter / 2 - 1.25;
-    final paint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.5
-      ..strokeCap = StrokeCap.round
-      ..color = color;
-
-    final p = progress;
-    final sweep = p == null
-        ? math.pi * 1.5 // 不确定态：3/4 弧
-        : (p.clamp(0.0, 1.0)) * math.pi * 2;
-    if (sweep <= 0) return;
-    canvas.drawArc(
-      Rect.fromCircle(center: center, radius: radius),
-      -math.pi / 2,
-      sweep,
-      false,
-      paint,
+    final w = size.width;
+    final h = size.height;
+    final lv = level.clamp(0.0, 1.0);
+    final baseY = h * (1 - lv);
+    // 振幅在满/空两端收窄，避免越界抖动
+    final amp = 2.4 * math.sin(math.pi * lv) + 0.6;
+    _paintWave(
+      canvas, w, h, baseY, amp, phase, 1.1,
+      color.withValues(alpha: 0.36),
+    );
+    _paintWave(
+      canvas, w, h, baseY - 1.0, amp * 0.78, phase + math.pi * 0.85, 1.6,
+      color.withValues(alpha: 0.60),
     );
   }
 
+  void _paintWave(
+    Canvas canvas,
+    double w,
+    double h,
+    double baseY,
+    double amp,
+    double phase,
+    double freq,
+    Color c,
+  ) {
+    final k = 2 * math.pi * freq / w;
+    final path = Path()..moveTo(0, baseY + amp * math.sin(phase));
+    for (var x = 1.5; x <= w; x += 1.5) {
+      path.lineTo(x, baseY + amp * math.sin(k * x + phase));
+    }
+    path
+      ..lineTo(w, h)
+      ..lineTo(0, h)
+      ..close();
+    canvas.drawPath(path, Paint()..color = c);
+  }
+
   @override
-  bool shouldRepaint(_ProgressRingPainter old) =>
-      old.progress != progress || old.color != color;
+  bool shouldRepaint(_WaveProgressPainter old) =>
+      old.level != level || old.phase != phase || old.color != color;
 }
