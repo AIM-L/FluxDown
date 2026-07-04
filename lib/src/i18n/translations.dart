@@ -879,6 +879,12 @@ class S {
     'HTTP API for querying and controlling tasks, for MCP servers and automation scripts (authentication required)',
   );
 
+  String get apiServiceMcp => _t('MCP 端点', 'MCP Endpoint');
+  String get apiServiceMcpDesc => _t(
+    '暴露 Model Context Protocol 端点，供 Claude Desktop、Cursor、Cline 等 AI 客户端接入（与管理 API 共用令牌，强制鉴权）',
+    'Exposes a Model Context Protocol endpoint for AI clients like Claude Desktop, Cursor, and Cline (shares the Management API token, authentication required)',
+  );
+
   String get apiServiceAddress => _t('地址', 'Address');
 
   List<String> get searchKeywordsApiService => _t(

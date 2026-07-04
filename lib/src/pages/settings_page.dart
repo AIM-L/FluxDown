@@ -4096,6 +4096,15 @@ class _ApiServiceContentState extends State<_ApiServiceContent> {
               onChanged: (v) => sp.setLocalServerApiEnabled(v),
               address: 'http://127.0.0.1:$livePort/api/v1',
             ),
+            const SizedBox(height: 10),
+            _ApiSubFeatureCard(
+              masterEnabled: enabled,
+              label: s.apiServiceMcp,
+              description: s.apiServiceMcpDesc,
+              value: sp.localServerMcpEnabled,
+              onChanged: (v) => sp.setLocalServerMcpEnabled(v),
+              address: 'http://127.0.0.1:$livePort/mcp',
+            ),
           ],
         );
       },

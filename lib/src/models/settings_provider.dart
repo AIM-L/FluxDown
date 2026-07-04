@@ -108,6 +108,7 @@ class SettingsProvider extends ChangeNotifier {
   bool _localServerTakeoverEnabled = true;
   bool _localServerJsonrpcEnabled = true;
   bool _localServerApiEnabled = false;
+  bool _localServerMcpEnabled = false;
 
   // UA 设置
   String _globalUserAgent = ''; // 空字符串 = 使用内置 Chrome UA
@@ -292,6 +293,7 @@ class SettingsProvider extends ChangeNotifier {
   bool get localServerTakeoverEnabled => _localServerTakeoverEnabled;
   bool get localServerJsonrpcEnabled => _localServerJsonrpcEnabled;
   bool get localServerApiEnabled => _localServerApiEnabled;
+  bool get localServerMcpEnabled => _localServerMcpEnabled;
 
   // UA 设置 Getter
   String get globalUserAgent => _globalUserAgent;
@@ -816,15 +818,23 @@ class SettingsProvider extends ChangeNotifier {
     _saveToRust('local_server_token', value);
   }
 
-  /// 清空访问令牌。若管理 API 正依赖此令牌（已启用），则一并关闭管理 API，
+  /// 清空访问令牌。若管理 API / MCP 正依赖此令牌（已启用），则一并关闭它们，
   /// 避免出现「已启用但无 token」的非法状态。
   void clearLocalServerToken() {
-    if (_localServerToken.isEmpty && !_localServerApiEnabled) return;
+    if (_localServerToken.isEmpty &&
+        !_localServerApiEnabled &&
+        !_localServerMcpEnabled) {
+      return;
+    }
     _localServerToken = '';
     _saveToRust('local_server_token', '');
     if (_localServerApiEnabled) {
       _localServerApiEnabled = false;
       _saveToRust('local_server_api_enabled', 'false');
+    }
+    if (_localServerMcpEnabled) {
+      _localServerMcpEnabled = false;
+      _saveToRust('local_server_mcp_enabled', 'false');
     }
     notifyListeners();
   }
@@ -853,6 +863,18 @@ class SettingsProvider extends ChangeNotifier {
     }
     notifyListeners();
     _saveToRust('local_server_api_enabled', value.toString());
+  }
+
+  /// MCP 端点强制鉴权（与管理 API 共用 token）：从关到开且当前 token 为空时，自动生成并保存
+  void setLocalServerMcpEnabled(bool value) {
+    if (_localServerMcpEnabled == value) return;
+    _localServerMcpEnabled = value;
+    if (value && _localServerToken.isEmpty) {
+      _localServerToken = _generateHexToken();
+      _saveToRust('local_server_token', _localServerToken);
+    }
+    notifyListeners();
+    _saveToRust('local_server_mcp_enabled', value.toString());
   }
 
   /// 生成 32 位随机 hex token（管理 API 自动鉴权 / UI 手动重新生成共用）
@@ -1150,6 +1172,8 @@ class SettingsProvider extends ChangeNotifier {
           _localServerJsonrpcEnabled = entry.value == 'true';
         case 'local_server_api_enabled':
           _localServerApiEnabled = entry.value == 'true';
+        case 'local_server_mcp_enabled':
+          _localServerMcpEnabled = entry.value == 'true';
         case 'global_user_agent':
           _globalUserAgent = entry.value;
         case 'default_queue_id':
