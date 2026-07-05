@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<Profile>
+  <Author>zerx-lab</Author>
+  <Project>https://github.com/zerx-lab/FluxDown</Project>
+  <Support>https://github.com/zerx-lab/FluxDown/issues</Support>
+  <Icon>https://cdn.jsdelivr.net/gh/zerx-lab/FluxDown@main/assets/logo/fluxdown_logo.svg</Icon>
+  <Description>FluxDown — Rust-powered multi-protocol download manager. Downloads, Supercharged.</Description>
+</Profile>
