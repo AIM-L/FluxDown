@@ -10,14 +10,32 @@
  *  右侧停靠 = left: calc(100% - Npx)
  */
 
-import type { DetectedResource, ResourceType, ConfidenceLevel } from '@/utils/resource-types';
-import { formatFileSize, getResourceTypeIcon } from '@/utils/resource-types';
+import type { DetectedResource, ResourceType, ConfidenceLevel, TrackPairGroup } from '@/utils/resource-types';
+import { formatFileSize, getResourceTypeIcon, groupTrackPairs } from '@/utils/resource-types';
+import type { DashManifest } from '@/utils/dash-manifest';
 import type { MessageKey } from '@/utils/locales/zh-CN';
 import { initI18n, setLocale, t } from '@/utils/i18n';
 import './style.css';
 
 /* ===== 常量 ===== */
 interface TabDef { key: 'all' | ResourceType; i18nKey: MessageKey }
+
+/**
+ * 选轨小窗展示用的清晰度选项（UI 视图模型，脱离 DetectedResource 的必填字段约束，
+ * 因为权威 manifest 轨道来自解析而非嗅探，没有 confidence/tabId 等资源存储专属字段）。
+ */
+interface QualityOption {
+  quality: string;
+  videoUrl: string;
+  audioUrl?: string;
+  /** 预格式化的大小/码率文本；真实大小用 formatFileSize，未知大小时显示码率，绝不伪造 */
+  sizeLabel: string;
+  /** 轨道构成标注，如 "视频轨" / "视频轨 + 音频轨" */
+  kindLabel: string;
+  filename: string;
+  mimeType?: string;
+  fileSize?: number;
+}
 const TABS: TabDef[] = [
   { key: 'all', i18nKey: 'panel.tabAll' },
   { key: 'video', i18nKey: 'panel.tabVideo' },
@@ -72,6 +90,12 @@ export default defineContentScript({
     let batchBtnEl: HTMLButtonElement;
     let selectAllText: Text;
     let floatBtnEl: HTMLElement;
+    let qualityPickerEl: HTMLElement;
+    let pendingQualityOptions: QualityOption[] = [];
+    let previewEl: HTMLElement;
+    let previewHideTimer: ReturnType<typeof setTimeout> | null = null;
+    /** 页面拦到的权威 DASH manifest（video[]/audio[] 轨道 + 真实清晰度）；未嗅探到时为 null。 */
+    let dashManifest: DashManifest | null = null;
 
     /* ========== Shadow UI ========== */
     const ui = await createShadowRootUi(ctx, {
@@ -82,6 +106,8 @@ export default defineContentScript({
         buildDot(container);
         buildPanel(container);
         buildFloatButton(container);
+        buildQualityPicker(container);
+        buildPreview(container);
         restoreDotPosition();
       },
     });
@@ -95,6 +121,9 @@ export default defineContentScript({
       }
       if (msg.action === 'toggleResourcePanel') {
         togglePanel();
+      }
+      if (msg.action === 'dashManifestUpdated' && msg.manifest) {
+        dashManifest = msg.manifest;
       }
     });
 
@@ -120,21 +149,35 @@ export default defineContentScript({
         resources = resp.resources;
         render();
       }
+      if (resp?.dashManifest) {
+        dashManifest = resp.dashManifest;
+      }
     } catch { /* */ }
 
     /* ========== 视频 hover ========== */
     let floatTimer: ReturnType<typeof setTimeout> | null = null;
     let hoverVideo: HTMLVideoElement | null = null;
 
+    // 从事件路径中查找 video 元素：B站/迅雷等播放器在 video 上覆盖弹幕/控件层，
+    // e.target 往往是覆盖层而非 video 本身，composedPath 可穿透覆盖层与 shadow DOM。
+    function videoInPath(e: Event): HTMLVideoElement | null {
+      const path = e.composedPath ? e.composedPath() : [];
+      for (const node of path) {
+        if (node instanceof HTMLVideoElement) return node;
+      }
+      return e.target instanceof HTMLVideoElement ? e.target : null;
+    }
+
     document.addEventListener('mouseover', (e) => {
-      if (!(e.target instanceof HTMLVideoElement)) return;
-      hoverVideo = e.target;
+      const video = videoInPath(e);
+      if (!video) return;
+      hoverVideo = video;
       if (floatTimer) { clearTimeout(floatTimer); floatTimer = null; }
-      showFloat(e.target);
+      showFloat(video);
     }, true);
 
     document.addEventListener('mouseout', (e) => {
-      if (!(e.target instanceof HTMLVideoElement)) return;
+      if (!videoInPath(e)) return;
       floatTimer = setTimeout(hideFloat, 400);
     }, true);
 
@@ -361,10 +404,44 @@ export default defineContentScript({
       floatBtnEl.addEventListener('click', () => {
         if (!hoverVideo) return;
         const src = hoverVideo.currentSrc || hoverVideo.src;
-        if (src && !src.startsWith('blob:') && !src.startsWith('data:')) {
+        const isBlob = !src || src.startsWith('blob:') || src.startsWith('data:');
+
+        // 直链视频 → 直接下载。
+        if (!isBlob && src) {
           browser.runtime.sendMessage({
             action: 'downloadResource', url: src, referrer: location.href,
           }).catch(() => {});
+          hideFloat();
+          return;
+        }
+
+        // blob/MSE 视频（B站/迅雷等）无直链 → 优先用页面拦到的权威 DASH manifest
+        // 构造真清晰度档（height/bandwidth 来自 manifest，可信）；manifest 缺失时
+        // 回退到嗅探碎片的 groupTrackPairs（分片无法可靠区分清晰度，仅保底）。
+        // 存在音视频轨对或多档清晰度 → 弹出清晰度选择小窗；只有一条无音频的单轨
+        // → 直接下载；两者都拿不到（未嗅探到媒体）→ 回退打开资源面板。
+        const media = mediaResources();
+        const options =
+          dashManifest && dashManifest.video.length > 0
+            ? qualityOptionsFromManifest(dashManifest)
+            : qualityOptionsFromTrackGroups(groupTrackPairs(media));
+        const needsPicker =
+          options.length > 1 || options.some((o) => o.audioUrl);
+        if (needsPicker) {
+          const rect = floatBtnEl.getBoundingClientRect();
+          hideFloat();
+          showQualityPicker(options, rect);
+          return;
+        }
+        if (options.length === 1) {
+          downloadQualityOption(options[0]);
+          hideFloat();
+          return;
+        }
+        if (media.length > 0) {
+          activeTab = media.some((r) => r.type === 'video') ? 'video' : 'all';
+          if (!panelOpen) togglePanel();
+          else render();
         }
         hideFloat();
       });
@@ -563,11 +640,22 @@ export default defineContentScript({
       }
     }
 
+    /** m4s/分片等 stream 类资源的轨道标注：mimeType video/ → 视频轨，audio/ → 音频轨，缺失不标注。 */
+    function trackKindLabel(r: DetectedResource): { text: string; cls: string } | null {
+      if (r.type !== 'stream') return null;
+      const mime = r.mimeType?.toLowerCase();
+      if (mime?.startsWith('video/')) return { text: t('panel.trackVideo'), cls: 'video' };
+      if (mime?.startsWith('audio/')) return { text: t('panel.trackAudio'), cls: 'audio' };
+      return null;
+    }
+
     function buildResourceRow(r: DetectedResource): HTMLElement {
       const row = h('div', `resource-row conf-${r.confidence}`);
       const icon = getResourceTypeIcon(r.type);
       const sizeStr = r.size > 0 ? formatFileSize(r.size) : '';
       const quality = r.quality ? `<span class="quality-tag">${r.quality}</span>` : '';
+      const track = trackKindLabel(r);
+      const trackTag = track ? `<span class="track-tag ${track.cls}">${esc(track.text)}</span>` : '';
       const name = r.filename || tryDecodeUrl(r.url) || r.url;
       const confBadge = r.confidence === 'high'
         ? '<span class="conf-badge high">★</span>'
@@ -579,6 +667,7 @@ export default defineContentScript({
         <div class="info">
           <div class="filename" title="${esc(r.url)}">${confBadge}${esc(name)}</div>
           <div class="meta">
+            ${trackTag}
             ${quality}
             ${sizeStr ? `<span class="size">${sizeStr}</span>` : ''}
             ${r.mimeType ? `<span>${esc(r.mimeType)}</span>` : ''}
@@ -594,6 +683,11 @@ export default defineContentScript({
         updateSelectAll();
       });
 
+      // 直链视频行 hover 缩略预览；blob/MSE 无法预览独立分片，诚实跳过。
+      if (r.type === 'video' && !r.url.startsWith('blob:') && !r.url.startsWith('data:')) {
+        row.addEventListener('mouseenter', () => showPreview(r.url, row.getBoundingClientRect()));
+        row.addEventListener('mouseleave', hidePreview);
+      }
       const dl = row.querySelector('.dl-btn') as HTMLButtonElement;
       dl.addEventListener('click', () => {
         browser.runtime.sendMessage({
@@ -637,16 +731,35 @@ export default defineContentScript({
      *  视频浮动按钮
      * ================================================================ */
 
+    /** 该 tab 已嗅探到的媒体类资源（video/audio/stream），供浮标关联 blob/MSE 视频。 */
+    function mediaResources(): DetectedResource[] {
+      return resources.filter(
+        (r) => r.type === 'video' || r.type === 'audio' || r.type === 'stream',
+      );
+    }
+
     function showFloat(video: HTMLVideoElement): void {
       if (!floatBtnEl) return;
-      const src = video.currentSrc || video.src;
-      if (!src || src.startsWith('blob:') || src.startsWith('data:')) return;
       const rect = video.getBoundingClientRect();
       if (rect.width < 120 || rect.height < 80) return;
+
+      const src = video.currentSrc || video.src;
+      const isBlob = !src || src.startsWith('blob:') || src.startsWith('data:');
+      const media = mediaResources();
+
+      // 直链视频 → 可直接下载 + 可预览缩略帧；blob/MSE 视频 → 依赖嗅探到的媒体
+      // 资源，无法预览独立分片（诚实跳过，不假装能预览）。两者皆无 → 不显示浮标。
+      if (isBlob && media.length === 0) return;
+      if (!isBlob && src) {
+        showPreview(src, rect);
+      } else {
+        hidePreview();
+      }
 
       floatBtnEl.style.top = `${rect.top + 8}px`;
       floatBtnEl.style.left = `${rect.right - 110}px`;
 
+      // 分辨率标签优先取播放器实际高度；取不到时回退到嗅探资源数量提示。
       const height = video.videoHeight;
       let label = t('panel.floatDL');
       if (height >= 2160) label = '4K';
@@ -654,6 +767,7 @@ export default defineContentScript({
       else if (height >= 720) label = '720p';
       else if (height >= 480) label = '480p';
       else if (height > 0) label = `${height}p`;
+      else if (isBlob && media.length > 0) label = String(media.length);
 
       const lbl = floatBtnEl.querySelector('.label');
       if (lbl) lbl.textContent = label;
@@ -663,6 +777,173 @@ export default defineContentScript({
     function hideFloat(): void {
       if (floatBtnEl) floatBtnEl.classList.remove('visible');
       hoverVideo = null;
+      hidePreview();
+    }
+
+    /* ================================================================
+     *  清晰度选择小窗（离散音视频轨对下载）
+     * ================================================================ */
+
+    function shortCodec(codecs?: string): string {
+      return codecs ? codecs.split('.')[0] : '';
+    }
+
+    /** 由权威 DASH manifest 构造清晰度选项：真清晰度（height/bandwidth），配对码率最高的音频轨。 */
+    function qualityOptionsFromManifest(manifest: DashManifest): QualityOption[] {
+      const bestAudio = manifest.audio.length > 0
+        ? manifest.audio.reduce((best, cur) => ((cur.bandwidth ?? 0) > (best.bandwidth ?? 0) ? cur : best))
+        : undefined;
+      const kindLabel = bestAudio
+        ? `${t('panel.trackVideo')} + ${t('panel.trackAudio')}`
+        : t('panel.trackVideo');
+
+      return manifest.video.map((v) => {
+        let quality: string;
+        if (v.height) quality = `${v.height}P`;
+        else if (v.bandwidth) quality = `${Math.round(v.bandwidth / 1000)}kbps`;
+        else quality = t('panel.qualityUnknown');
+        const codec = shortCodec(v.codecs);
+
+        return {
+          quality: codec ? `${quality} · ${codec}` : quality,
+          videoUrl: v.url,
+          audioUrl: bestAudio?.url,
+          // manifest 不含时长信息，无法估出真实文件大小，诚实显示码率而非伪造大小。
+          sizeLabel: v.bandwidth ? `${Math.round(v.bandwidth / 1000)} kbps` : '',
+          kindLabel,
+          filename: tryDecodeUrl(v.url) || 'video.mp4',
+          mimeType: v.mimeType,
+          fileSize: undefined,
+        };
+      });
+    }
+
+    /** 由嗅探碎片的 groupTrackPairs 结果构造清晰度选项（manifest 缺失时的保底，清晰度可能不准）。 */
+    function qualityOptionsFromTrackGroups(groups: TrackPairGroup[]): QualityOption[] {
+      return groups.map((g) => ({
+        quality: g.quality,
+        videoUrl: g.videoUrl,
+        audioUrl: g.audioUrl,
+        sizeLabel: g.videoRes.size > 0 ? formatFileSize(g.videoRes.size) : '',
+        kindLabel: g.audioUrl
+          ? `${t('panel.trackVideo')} + ${t('panel.trackAudio')}`
+          : t('panel.trackVideo'),
+        filename: g.videoRes.filename,
+        mimeType: g.videoRes.mimeType,
+        fileSize: g.videoRes.size > 0 ? g.videoRes.size : undefined,
+      }));
+    }
+
+    function buildQualityPicker(root: HTMLElement): void {
+      qualityPickerEl = h('div', 'fluxdown-quality-picker');
+      root.appendChild(qualityPickerEl);
+    }
+
+    function hideQualityPicker(): void {
+      if (qualityPickerEl) qualityPickerEl.classList.remove('visible');
+      pendingQualityOptions = [];
+    }
+
+    /** 弹出清晰度选择小窗：列出各档真清晰度 + 大小/码率 + 轨道构成，选中后下载。 */
+    function showQualityPicker(options: QualityOption[], anchorRect: DOMRect): void {
+      if (!qualityPickerEl) return;
+      pendingQualityOptions = options;
+
+      const items = options.map((o, idx) => `<div class="qp-item" data-idx="${idx}">
+          <div class="qp-main">
+            <span class="qp-quality">${esc(o.quality)}</span>
+            <span class="qp-size">${esc(o.sizeLabel)}</span>
+          </div>
+          <span class="qp-kind">${esc(o.kindLabel)}</span>
+        </div>`).join('');
+
+      qualityPickerEl.innerHTML = `
+        <div class="qp-header">
+          <span class="qp-title">${esc(t('panel.qualityPickerTitle'))}</span>
+          <button type="button" class="qp-close">${svg(SVG_CLOSE)}</button>
+        </div>
+        <div class="qp-list">${items}</div>
+      `;
+
+      qualityPickerEl.querySelector('.qp-close')?.addEventListener('click', hideQualityPicker);
+      qualityPickerEl.querySelectorAll<HTMLElement>('.qp-item').forEach((el) => {
+        el.addEventListener('click', () => {
+          const idx = Number(el.dataset.idx);
+          const option = pendingQualityOptions[idx];
+          if (option) downloadQualityOption(option);
+          hideQualityPicker();
+        });
+      });
+
+      // 定位到浮标附近，越界时回夹到视口内
+      const width = 220;
+      let left = anchorRect.right - width;
+      left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
+      let top = anchorRect.top;
+      top = Math.max(8, Math.min(top, window.innerHeight - 40));
+      qualityPickerEl.style.left = `${left}px`;
+      qualityPickerEl.style.top = `${top}px`;
+      qualityPickerEl.classList.add('visible');
+    }
+
+    /** 发送单条轨道（或音视频轨对）下载请求给 background。 */
+    function downloadQualityOption(option: QualityOption): void {
+      browser.runtime.sendMessage({
+        action: 'downloadResource',
+        url: option.videoUrl,
+        audioUrl: option.audioUrl,
+        referrer: location.href,
+        filename: option.filename,
+        fileSize: option.fileSize,
+        mimeType: option.mimeType,
+      }).catch(() => {});
+    }
+
+    /* ================================================================
+     *  视频缩略预览（仅直链视频；MSE/blob 无法预览独立分片，诚实跳过）
+     * ================================================================ */
+
+    function buildPreview(root: HTMLElement): void {
+      previewEl = h('div', 'fluxdown-preview');
+      previewEl.innerHTML = '<video muted playsinline preload="metadata"></video>';
+      const videoEl = previewEl.querySelector('video') as HTMLVideoElement;
+      videoEl.addEventListener('loadedmetadata', () => {
+        try {
+          videoEl.currentTime = Math.min(1, (videoEl.duration || 2) * 0.1);
+        } catch {
+          /* 部分站点禁止跳转，保留首帧 */
+        }
+      });
+      videoEl.addEventListener('error', hidePreview);
+      root.appendChild(previewEl);
+    }
+
+    /** 显示直链视频缩略预览（复用一个隐藏 video 元素抓帧展示，绝不对 blob/MSE 视频调用）。 */
+    function showPreview(url: string, anchorRect: DOMRect): void {
+      if (!previewEl) return;
+      if (previewHideTimer) { clearTimeout(previewHideTimer); previewHideTimer = null; }
+      const videoEl = previewEl.querySelector('video') as HTMLVideoElement;
+      if (videoEl.src !== url) {
+        videoEl.src = url;
+      }
+
+      const width = 200;
+      let left = anchorRect.right - width;
+      left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
+      // 优先显示在锚点上方；空间不足时改显示在下方
+      const height = 112;
+      let top = anchorRect.top - height - 8;
+      if (top < 8) top = anchorRect.bottom + 8;
+      previewEl.style.left = `${left}px`;
+      previewEl.style.top = `${top}px`;
+      previewEl.classList.add('visible');
+    }
+
+    function hidePreview(): void {
+      if (previewHideTimer) clearTimeout(previewHideTimer);
+      previewHideTimer = setTimeout(() => {
+        if (previewEl) previewEl.classList.remove('visible');
+      }, 150);
     }
 
     /* ================================================================

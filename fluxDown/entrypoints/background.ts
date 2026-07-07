@@ -43,12 +43,12 @@ import { loadSettings, shouldIntercept } from "@/utils/settings";
 import type { DownloadItemInfo } from "@/utils/settings";
 import { initI18n, t } from "@/utils/i18n";
 import {
-  isSniffableContentType,
-  isSniffableExtension,
+  matchSniffRule,
   classifyResource,
   extractFilenameFromUrl,
 } from "@/utils/resource-types";
 import type { ResourceMessagePayload } from "@/utils/resource-types";
+import type { DashManifest } from "@/utils/dash-manifest";
 import {
   addResources,
   addSniffedResource,
@@ -204,6 +204,19 @@ export default defineBackground(() => {
 
   // 初始化 tab 生命周期监听器（自动清理关闭/导航的 tab 资源）
   initTabLifecycleListeners();
+
+  // ===== DASH manifest tab 级存储（权威清晰度 + 轨道 URL，仿 resource-store）=====
+  // 每 tab 只保留最新一份：manifest 是页面当前播放内容的完整清晰度列表，
+  // 旧的一份在新 manifest 到达后已无参考价值（不同分片会话失效）。
+  const tabDashManifests = new Map<number, DashManifest>();
+  browser.tabs.onRemoved.addListener((tabId) => {
+    tabDashManifests.delete(tabId);
+  });
+  browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status === "loading" && changeInfo.url) {
+      tabDashManifests.delete(tabId);
+    }
+  });
 
   // ===== 右键菜单：即使关闭自动拦截也可以手动发送链接到 FluxDown 下载 =====
 
@@ -738,13 +751,19 @@ export default defineBackground(() => {
         }
 
         // 判断是否是有价值的资源
-        const isSniffable = isSniffableContentType(contentType);
         const isAttachment = contentDisposition
           .toLowerCase()
           .startsWith("attachment");
+        const ruleMatch = matchSniffRule(
+          details.url,
+          contentType,
+          contentLength,
+        );
 
-        if (!isSniffable && !isAttachment && !isSniffableExtension(details.url))
-          return;
+        // 规则显式拦截（禁用/黑名单/小于最小大小）→ 丢弃
+        if (ruleMatch.blocked) return;
+        // 既非规则命中、又非附件 → 丢弃
+        if (!ruleMatch.hit && !isAttachment) return;
 
         // 提取文件名
         let filename = "";
@@ -803,6 +822,22 @@ export default defineBackground(() => {
       await browser.tabs.sendMessage(tabId, {
         action: "resourcesUpdated",
         resources,
+      });
+    } catch {
+      // Content script 可能还未注入
+    }
+  }
+
+  /**
+   * 向指定 tab 的 Content Script 推送最新 DASH manifest（权威清晰度 + 轨道 URL）
+   */
+  async function notifyDashManifest(tabId: number): Promise<void> {
+    const manifest = tabDashManifests.get(tabId);
+    if (!manifest) return;
+    try {
+      await browser.tabs.sendMessage(tabId, {
+        action: "dashManifestUpdated",
+        manifest,
       });
     } catch {
       // Content script 可能还未注入
@@ -1958,6 +1993,9 @@ export default defineBackground(() => {
     originalUrl?: string,
     storedCookies?: string,
     storedHeaders?: Record<string, string>,
+    // 离散音视频轨对的音频轨 URL（通用语义）。非空 = 视频轨 + 音频轨配对，
+    // 引擎收到后分别下载 + mux 合并。追加为末位可选参数，不影响既有调用方。
+    audioUrl?: string,
   ): Promise<boolean> {
     // === 预热 NMH 链路（fire-and-forget） ===
     // App 冷启动 ~0.7-1s，下方 cookie/认证收集最多 ~500ms。先发 warmup
@@ -2068,6 +2106,7 @@ export default defineBackground(() => {
       mimeType,
       method: reqRecord.method,
       body: reqRecord.body,
+      audioUrl: audioUrl || undefined,
     };
 
     console.log("[FluxDown] Sending to FluxDown app:", request);
@@ -2248,11 +2287,27 @@ export default defineBackground(() => {
         return { success: true, added };
       }
 
-      // --- Content Script UI: 请求当前 tab 的资源列表 ---
+      // --- Content Script: DASH manifest 检测上报（权威清晰度 + 轨道 URL）---
+      case "dashManifestDetected": {
+        const tabId = sender.tab?.id;
+        if (!tabId || tabId < 0) return { success: false };
+        const manifest = message.manifest as DashManifest | undefined;
+        if (!manifest || (!manifest.video?.length && !manifest.audio?.length)) {
+          return { success: false };
+        }
+        tabDashManifests.set(tabId, manifest);
+        await notifyDashManifest(tabId);
+        return { success: true };
+      }
+
+      // --- Content Script UI: 请求当前 tab 的资源列表（含权威 DASH manifest，若已嗅探到）---
       case "getResources": {
         const tabId = sender.tab?.id;
-        if (!tabId || tabId < 0) return { resources: [] };
-        return { resources: getResourcesForTab(tabId) };
+        if (!tabId || tabId < 0) return { resources: [], dashManifest: null };
+        return {
+          resources: getResourcesForTab(tabId),
+          dashManifest: tabDashManifests.get(tabId) ?? null,
+        };
       }
 
       // --- Content Script UI / Popup: 触发单个资源下载 ---
@@ -2294,6 +2349,8 @@ export default defineBackground(() => {
           undefined,
           resCookies,
           resHeaders,
+          // 离散音视频轨对：内容脚本清晰度选择小窗传来的音频轨 URL（可选）。
+          message.audioUrl as string | undefined,
         );
         return { success: true };
       }

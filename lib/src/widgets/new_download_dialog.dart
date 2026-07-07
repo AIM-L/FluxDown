@@ -986,6 +986,7 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                 url: e.url,
                 fileName: e.fileName,
                 checksum: e.checksum,
+                audioUrl: '',
               ),
             )
             .toList(),

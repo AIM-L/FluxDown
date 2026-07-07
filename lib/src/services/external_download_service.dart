@@ -80,6 +80,40 @@ class ExternalDownloadService {
       'received request: url=${req.url}, filename=${req.filename}, size=${req.fileSize}',
     );
 
+    // 音视频轨对（浏览器扩展嗅探到离散 video/audio 轨，通用语义，非站点
+    // 特判）：browser 侧已完成清晰度确认，宿主直接建任务，不再弹二次确认框，
+    // 且保守起见不按换行拆分为多任务 —— 始终走单任务 ConfirmExternalDownload
+    // 路径，把 audioUrl 原样传给 Rust（引擎据此走离散轨道下载 + mux 旁路）。
+    if (req.audioUrl.isNotEmpty) {
+      final trackSettings = SettingsProvider.globalInstance ?? settingsProvider;
+      final requestedDir = req.saveDir.trim();
+      final matchedDir = trackSettings.resolveCategorySaveDir(req.filename);
+      final saveDir = requestedDir.isNotEmpty
+          ? requestedDir
+          : (matchedDir.isNotEmpty
+                ? matchedDir
+                : trackSettings.effectiveDefaultSaveDir);
+      logInfo(
+        _tag,
+        'track-pair request, creating task directly: '
+        'url=${req.url}, audioUrl=${req.audioUrl}, saveDir=$saveDir',
+      );
+      ConfirmExternalDownload(
+        url: req.url,
+        saveDir: saveDir,
+        fileName: req.filename,
+        segments: trackSettings.defaultSegments,
+        cookies: req.cookies,
+        referrer: req.referrer,
+        hintFileSize: req.fileSize,
+        proxyUrl: '',
+        userAgent: '',
+        queueId: trackSettings.defaultQueueId,
+        audioUrl: req.audioUrl,
+      ).sendSignalToRust();
+      return;
+    }
+
     // 免打扰下载：不弹确认框、不抢前台，直接按默认设置创建任务。
     // 优先 globalInstance（始终反映用户最新设置），fallback 到启动时实例。
     final silentSettings = SettingsProvider.globalInstance ?? settingsProvider;
@@ -117,6 +151,7 @@ class ExternalDownloadService {
             proxyUrl: '',
             userAgent: '',
             queueId: queueId,
+            audioUrl: entry.audioUrl,
           ).sendSignalToRust();
         } else {
           BatchCreateTask(
@@ -126,6 +161,7 @@ class ExternalDownloadService {
                     url: e.url,
                     fileName: e.fileName,
                     checksum: e.checksum,
+                    audioUrl: e.audioUrl,
                   ),
                 )
                 .toList(),

@@ -46,7 +46,17 @@ class QuickDownloadEntry {
   final String url;
   final String fileName;
   final String checksum;
-  const QuickDownloadEntry(this.url, {this.fileName = '', this.checksum = ''});
+  /// 音频轨 URL（通用「视频轨+音频轨」离散下载对语义，按 MIME video/*
+  /// vs audio/* 分轨判定）。空 = 普通单 URL；非空 = url 是视频轨，
+  /// 本字段是音频轨。仅由外部下载请求（ExternalDownloadRequest.audioUrl）
+  /// 转入；纯文本 URL 列表解析（一行一条）不产生轨对语义。
+  final String audioUrl;
+  const QuickDownloadEntry(
+    this.url, {
+    this.fileName = '',
+    this.checksum = '',
+    this.audioUrl = '',
+  });
 }
 
 /// 解析 aria2 风格的下载条目（URL + 可选 out=/checksum= 选项行）。
@@ -69,12 +79,14 @@ List<QuickDownloadEntry> parseQuickDownloadEntries(String text) {
           current.url,
           fileName: trimmed.substring(4),
           checksum: current.checksum,
+          audioUrl: current.audioUrl,
         );
       } else if (trimmed.startsWith('checksum=')) {
         current = QuickDownloadEntry(
           current.url,
           fileName: current.fileName,
           checksum: trimmed.substring(9),
+          audioUrl: current.audioUrl,
         );
       }
       continue;

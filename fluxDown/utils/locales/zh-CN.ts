@@ -94,6 +94,10 @@ const zhCN = {
   "panel.tabSubtitle": "字幕",
   "panel.tabMagnet": "磁力",
   "panel.tabOther": "其他",
+  "panel.qualityPickerTitle": "选择清晰度",
+  "panel.trackVideo": "视频轨",
+  "panel.trackAudio": "音频轨",
+  "panel.qualityUnknown": "未知画质",
 
   // Shortcut toggle
   "shortcut.toggleTitle": "拦截切换",

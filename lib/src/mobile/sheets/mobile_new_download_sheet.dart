@@ -157,7 +157,7 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
       widget.controller.batchCreateTask(
         entries: [
           for (final url in urls)
-            UrlEntry(url: url, fileName: '', checksum: ''),
+            UrlEntry(url: url, fileName: '', checksum: '', audioUrl: ''),
         ],
         saveDir: saveDir,
         segments: segments,

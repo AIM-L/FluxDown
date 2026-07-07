@@ -102,6 +102,10 @@ const en: Record<MessageKey, string> = {
   "panel.tabSubtitle": "Subtitle",
   "panel.tabMagnet": "Magnet",
   "panel.tabOther": "Other",
+  "panel.qualityPickerTitle": "Select Quality",
+  "panel.trackVideo": "Video Track",
+  "panel.trackAudio": "Audio Track",
+  "panel.qualityUnknown": "Unknown Quality",
 
   // Shortcut toggle
   "shortcut.toggleTitle": "Intercept Toggle",

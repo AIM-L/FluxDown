@@ -313,9 +313,24 @@
   scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
 }
 
-.panel-list::-webkit-scrollbar { width: 4px; }
-.panel-list::-webkit-scrollbar-track { background: transparent; }
-.panel-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+/* 细滚动条：宽 6px、圆角、半透明 thumb，hover 加深，track 透明（暗色主题） */
+.panel-list::-webkit-scrollbar,
+.fluxdown-quality-picker::-webkit-scrollbar {
+  width: 6px;
+}
+.panel-list::-webkit-scrollbar-track,
+.fluxdown-quality-picker::-webkit-scrollbar-track {
+  background: transparent;
+}
+.panel-list::-webkit-scrollbar-thumb,
+.fluxdown-quality-picker::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 3px;
+}
+.panel-list::-webkit-scrollbar-thumb:hover,
+.fluxdown-quality-picker::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
 
 .panel-empty {
   display: flex;
@@ -451,6 +466,22 @@
   border-radius: 3px;
   font-weight: 600;
   font-size: 10px;
+}
+
+/* 轨道类型标注（m4s 等 stream 分片明确标注视频轨/音频轨，mimeType 驱动） */
+.resource-row .meta .track-tag {
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 600;
+  font-size: 10px;
+}
+.resource-row .meta .track-tag.video {
+  background: rgba(59, 130, 246, 0.14);
+  color: #60A5FA;
+}
+.resource-row .meta .track-tag.audio {
+  background: rgba(168, 85, 247, 0.14);
+  color: #C084FC;
 }
 
 .resource-row .meta .size {
@@ -595,4 +626,142 @@
   font-size: 12px;
   font-weight: 500;
   white-space: nowrap;
+}
+
+/* =========================================================
+ *  离散轨道清晰度选择小窗（音视频轨对下载）
+ * ========================================================= */
+.fluxdown-quality-picker {
+  position: fixed;
+  z-index: 2147483647;
+  width: 220px;
+  max-height: 280px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+  background: #0f172a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45),
+              0 0 0 1px rgba(255, 255, 255, 0.05);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 12px;
+  color: #e0e0e0;
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.94) translateY(-4px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.fluxdown-quality-picker.visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: scale(1) translateY(0);
+}
+
+.fluxdown-quality-picker .qp-header {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.fluxdown-quality-picker .qp-title {
+  flex: 1;
+  font-weight: 600;
+  color: #e0e0e0;
+}
+
+.fluxdown-quality-picker .qp-close {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  color: #64748B;
+  cursor: pointer;
+  padding: 0;
+}
+
+.fluxdown-quality-picker .qp-close:hover {
+  color: #e0e0e0;
+}
+
+.fluxdown-quality-picker .qp-close svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.fluxdown-quality-picker .qp-list {
+  padding: 4px 0;
+}
+
+.fluxdown-quality-picker .qp-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.fluxdown-quality-picker .qp-item:hover {
+  background: rgba(59, 130, 246, 0.16);
+}
+
+.fluxdown-quality-picker .qp-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.fluxdown-quality-picker .qp-quality {
+  font-weight: 500;
+  color: #e0e0e0;
+}
+
+.fluxdown-quality-picker .qp-size {
+  color: #64748B;
+  font-size: 11px;
+}
+
+.fluxdown-quality-picker .qp-kind {
+  color: #64748B;
+  font-size: 10px;
+}
+
+/* =========================================================
+ *  直链视频缩略预览（MSE/blob 无法预览独立分片，诚实跳过不生成此元素）
+ * ========================================================= */
+.fluxdown-preview {
+  position: fixed;
+  z-index: 2147483647;
+  width: 200px;
+  height: 112px;
+  overflow: hidden;
+  background: #000;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.fluxdown-preview.visible {
+  opacity: 1;
+}
+
+.fluxdown-preview video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
