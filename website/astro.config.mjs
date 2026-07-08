@@ -159,49 +159,12 @@ export default defineConfig({
         optional: true,
       }),
 
-      // ── 可选：Cloudflare R2 对象存储（下载加速，改善中国大陆速度）──
-      CF_R2_ACCESS_KEY_ID: envField.string({
-        context: "server",
-        access: "secret",
-        optional: true,
-      }),
-      CF_R2_SECRET_ACCESS_KEY: envField.string({
-        context: "server",
-        access: "secret",
-        optional: true,
-      }),
-      CF_R2_ENDPOINT: envField.string({
-        context: "server",
-        access: "secret",
-        optional: true,
-      }),
-      CF_R2_BUCKET: envField.string({
-        context: "server",
-        access: "secret",
-        optional: true,
-      }),
-      CF_R2_PUBLIC_URL: envField.string({
-        context: "server",
-        access: "secret",
-        optional: true,
-      }),
-
       // ── 可选：中国大陆 GitHub 下载加速镜像列表（逗号分隔，覆盖内置默认值）──
-      // 例: https://gh.ddlc.top（默认，WJQSERVER-STUDIO/ghproxy 公共实例）
+      // 例: https://ghproxy.net（默认，hunshcn/gh-proxy 公共实例，CF 加速）
       // 注意：入选前核查 Google Safe Browsing 状态（ghfast.top 曾被拉黑，
       // Chrome 弹全屏警告）；"地址发布页"如 ghproxy.link 不是代理，不可填
-      // 镜像不可用时下载路由自动按顺序降级，最终回退 R2 / GitHub 直连
+      // 镜像不可用时下载路由自动降级到 GitHub 直连
       DOWNLOAD_MIRRORS: envField.string({
-        context: "server",
-        access: "secret",
-        optional: true,
-      }),
-
-      // ── 可选：Cloudflare Analytics API（用于查询 R2 下载统计）──
-      // Account ID 自动从 CF_R2_ENDPOINT 解析（格式: https://<account_id>.r2.cloudflarestorage.com）
-      // 创建地址: https://dash.cloudflare.com/profile/api-tokens
-      // 权限: Account Analytics:Read
-      CF_API_TOKEN: envField.string({
         context: "server",
         access: "secret",
         optional: true,
