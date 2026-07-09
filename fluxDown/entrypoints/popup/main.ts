@@ -13,7 +13,7 @@
  */
 
 import { initI18n, applyI18nToDOM, t, getLocale, saveLocale } from '@/utils/i18n';
-import { checkFluxDownAvailable } from '@/utils/native-messaging';
+import { checkFluxDownAvailable } from '@/utils/download-dispatch';
 import { loadSettings, saveSettings } from '@/utils/settings';
 import { remotePing } from '@/utils/remote-server';
 
@@ -192,6 +192,38 @@ async function loadStats() {
   statFailed.textContent = String(stats.failed || 0);
 }
 
+// ===== 连接状态 =====
+// 并发守卫：设置变更可能连续触发刷新，只让最后一次的结果落到 UI。
+let _statusEpoch = 0;
+
+/**
+ * 按当前 remoteMode 刷新头部连接徽标（off=NMH / always=远程 / fallback=任一）。
+ * 探活逻辑复用 download-dispatch，与实际下载路由判定保持一致。
+ */
+async function refreshConnectionStatus(): Promise<void> {
+  const epoch = ++_statusEpoch;
+  statusBadge.className = 'status-badge';
+  statusText.textContent = t('header.checking');
+
+  const available = await checkFluxDownAvailable().catch(() => false);
+  if (epoch !== _statusEpoch) return; // 已有更新的刷新在途，丢弃本次结果
+
+  if (available) {
+    statusBadge.className = 'status-badge connected';
+    statusText.textContent = t('header.connected');
+    // 探活成功 → 通知 background 解除可用性熔断，让接管状态与这里显示的
+    // "已连接"保持一致，避免熔断期内 popup 显示已连接但下载仍被旁路到
+    // 浏览器（review 发现 #1/#4/#6）。fire-and-forget：不依赖返回值，
+    // 规避 Firefox MV2 下 sendMessage 收到 undefined 的问题。
+    browser.runtime
+      .sendMessage({ action: 'appConfirmedUp' })
+      .catch(() => {});
+  } else {
+    statusBadge.className = 'status-badge disconnected';
+    statusText.textContent = t('header.disconnected');
+  }
+}
+
 // ===== 初始化 =====
 async function init() {
   // 初始化 i18n（必须先于 UI 渲染）
@@ -207,26 +239,11 @@ async function init() {
   // 直接查询连接状态和加载设置，不经过 background sendMessage。
   // 原因：Firefox MV2 中 WXT 框架会注册自己的 onMessage 监听器（用于 HMR），
   // 它先于我们的监听器返回 undefined，导致 popup 的 sendMessage 始终收到 undefined。
-  const [available, settings] = await Promise.all([
-    checkFluxDownAvailable(),
+  // 探活走 download-dispatch：按 remoteMode 适配桌面（NMH）/ 远程 / 两者任一。
+  const [, settings] = await Promise.all([
+    refreshConnectionStatus(),
     loadSettings(),
   ]);
-
-  // 更新连接状态
-  if (available) {
-    statusBadge.className = 'status-badge connected';
-    statusText.textContent = t('header.connected');
-    // popup 直连 ping 成功 → 通知 background 解除可用性熔断，让接管状态与
-    // 这里显示的"已连接"保持一致，避免熔断期内 popup 显示已连接但下载仍被
-    // 旁路到浏览器（review 发现 #1/#4/#6）。fire-and-forget：不依赖返回值，
-    // 规避 Firefox MV2 下 sendMessage 收到 undefined 的问题。
-    browser.runtime
-      .sendMessage({ action: 'appConfirmedUp' })
-      .catch(() => {});
-  } else {
-    statusBadge.className = 'status-badge disconnected';
-    statusText.textContent = t('header.disconnected');
-  }
 
   // 更新设置 UI
   enableToggle.checked = settings.enabled;
@@ -347,6 +364,7 @@ remoteModeSelect.addEventListener('change', async () => {
   const mode = remoteModeSelect.value as 'off' | 'fallback' | 'always';
   updateRemoteModeHint(mode);
   await saveSettings({ remoteMode: mode });
+  await refreshConnectionStatus(); // 模式切换影响探活目标，立即刷新徽标
 });
 
 // 远程下载源 - 服务器地址（失焦保存；saveSettings 内部会去除尾部斜杠，
@@ -355,11 +373,13 @@ remoteUrlInput.addEventListener('change', async () => {
   await saveSettings({ remoteUrl: remoteUrlInput.value.trim() });
   const current = await loadSettings();
   remoteUrlInput.value = current.remoteUrl;
+  await refreshConnectionStatus();
 });
 
 // 远程下载源 - Token
 remoteTokenInput.addEventListener('change', async () => {
   await saveSettings({ remoteToken: remoteTokenInput.value });
+  await refreshConnectionStatus();
 });
 
 // 远程下载源 - 测试连接
@@ -393,6 +413,7 @@ remoteTestBtn.addEventListener('click', async () => {
   } finally {
     remoteTestBtn.disabled = false;
   }
+  await refreshConnectionStatus(); // 测试结果直接反映到头部徽标
 });
 // 域名 - 显示手动输入框
 addDomainManualBtn.addEventListener('click', () => {
