@@ -237,6 +237,10 @@ pub struct DownloadParams {
     /// 的推荐值：`effective = min(advisor, auto_max_connections)`。<=0 视为不限
     /// （回退 advisor 原值）。用户显式指定 segment_count 时本字段不参与。
     pub auto_max_connections: i32,
+    /// 下载完成后是否把文件修改时间设为服务器提供的 `Last-Modified` 时间
+    /// （config `use_server_time`）。服务器未提供该头、解析失败或写入失败时
+    /// 保留本地完成时间，绝不影响下载结果。
+    pub use_server_time: bool,
 }
 
 /// 将浏览器扩展捕获的额外 HTTP 头应用到请求构建器上。
@@ -3095,7 +3099,107 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         final_dest.display()
     );
 
+    if p.use_server_time {
+        // 单流路径优先用【实际响应】锁存的 Last-Modified：If-Range 失配（文件在
+        // 暂停/下载期间变更）会导致 200 全量重下新内容，此时 probe/DB validator
+        // 里的旧时间已不属于磁盘上的字节。多段路径无此偏差——validator 失配即
+        // 整体作废并回退单流（同样拿到锁存值），仍走多段完成的只能是原版本文件，
+        // probe/DB 值即正确值。
+        let last_modified = single_result
+            .as_ref()
+            .and_then(|r| r.latched_last_modified.as_deref())
+            .unwrap_or(&resume_last_modified);
+        apply_server_mtime(&final_dest, last_modified, &p.task_id).await;
+    }
+
     Ok((actual_total, finalize_renamed))
+}
+
+/// 将 HTTP 日期字符串解析为 [`std::time::SystemTime`]。
+///
+/// 覆盖 RFC 9110 §5.6.7 允许的三种格式：IMF-fixdate
+/// （`Sun, 06 Nov 1994 08:49:37 GMT`，RFC 2822 子集）、过时的 RFC 850
+/// （`Sunday, 06-Nov-94 08:49:37 GMT`）与 ANSI C `asctime()`
+/// （`Sun Nov  6 08:49:37 1994`，按 UTC 解释）。
+///
+/// 星期字段是冗余修饰，现实中偶见服务器生成与日期不符的星期——若做一致性
+/// 校验会整体拒绝本可用的时间戳，故解析前一律剥离星期、只信日期本身。
+/// 全部格式失败、或时间早于 Unix 纪元（无法表示为文件时间戳）时返回 `None`。
+fn parse_http_date(s: &str) -> Option<std::time::SystemTime> {
+    let s = s.trim();
+    let ts = if let Some((_, rest)) = s.split_once(',') {
+        // IMF-fixdate 与 RFC 850 都以「星期,」开头；剥离后按剩余字段解析
+        // （RFC 2822 的星期本就可选，直接解析剩余部分即合法输入）。
+        let rest = rest.trim();
+        chrono::DateTime::parse_from_rfc2822(rest)
+            .map(|dt| dt.timestamp())
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(rest, "%d-%b-%y %H:%M:%S GMT")
+                    .map(|dt| dt.and_utc().timestamp())
+            })
+            .ok()?
+    } else {
+        // 无逗号：标准 RFC 2822（省略星期）或 asctime（首个空格前为星期缩写）。
+        chrono::DateTime::parse_from_rfc2822(s)
+            .map(|dt| dt.timestamp())
+            .or_else(|_| {
+                let rest = s.split_once(' ').map_or(s, |(_, r)| r).trim();
+                chrono::NaiveDateTime::parse_from_str(rest, "%b %e %H:%M:%S %Y")
+                    .map(|dt| dt.and_utc().timestamp())
+            })
+            .ok()?
+    };
+    let secs = u64::try_from(ts).ok()?;
+    Some(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+/// 把已完成下载的最终文件修改时间设为服务器提供的 `Last-Modified` 时间。
+///
+/// 时间戳属于尽力而为的元数据：`last_modified` 为空（服务器未提供）、解析
+/// 失败或写入失败都只记日志直接返回——此刻文件数据已完整落盘，任何元数据
+/// 失败都不允许把成功的下载变成错误。
+async fn apply_server_mtime(dest: &Path, last_modified: &str, task_id: &str) {
+    if last_modified.is_empty() {
+        return;
+    }
+    let Some(mtime) = parse_http_date(last_modified) else {
+        log_info!(
+            "[download] task {} 无法解析 Last-Modified \"{}\"，保留本地完成时间",
+            task_id,
+            last_modified
+        );
+        return;
+    };
+    let path = dest.to_path_buf();
+    // set_times 是同步系统调用，且 Windows 上需要以写权限打开句柄。
+    let result = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {
+            log_info!(
+                "[download] task {} 文件修改时间已设为服务器时间 {}",
+                task_id,
+                last_modified
+            );
+        }
+        Ok(Err(e)) => {
+            log_info!(
+                "[download] task {} 设置服务器文件时间失败：{}（保留本地完成时间）",
+                task_id,
+                e
+            );
+        }
+        Err(e) => {
+            log_info!(
+                "[download] task {} 设置服务器文件时间的阻塞任务异常：{}",
+                task_id,
+                e
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3113,6 +3217,12 @@ struct SingleDownloadResult {
     /// *decompressed* size, which has no relation to the probe's (compressed)
     /// `total_bytes` — the caller MUST skip the file-size integrity check.
     decompressed: bool,
+    /// 服务器【实际响应】的 `Last-Modified`。仅当响应体从 byte 0 全量服务时为
+    /// `Some`（全新下载，或 If-Range 失配回退 200 重下新版本）——此时磁盘内容
+    /// 以该响应为准，probe/DB validator 可能描述的是旧版本，调用方设置文件
+    /// mtime 时必须优先采用本值（空串 = 该响应未携带此头，应放弃服务器时间）。
+    /// 真 206 续传为 `None`（磁盘内容与旧 validator 一致，沿用旧值）。
+    latched_last_modified: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3307,6 +3417,14 @@ async fn download_single(
             existing_len
         );
     }
+    // 从 0 服务的全量体：锁存实际响应的 Last-Modified（见字段 doc）。
+    let latched_last_modified = (!actual_resume).then(|| {
+        resp.headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    });
 
     // Capture the response's own Content-Length before consuming the body.
     // For resumed downloads (206), this is the *remaining* length, not total.
@@ -3435,6 +3553,7 @@ async fn download_single(
     Ok(SingleDownloadResult {
         response_content_length,
         decompressed: encoding.is_some(),
+        latched_last_modified,
     })
 }
 
@@ -3511,9 +3630,46 @@ mod tests {
     use super::{
         PROBE_MAX_RETRIES, PROBE_RETRY_BASE_DELAY, PROBE_TIMEOUT, TEMP_EXT, dedup_filename,
         extract_filename, extract_from_content_disposition, extract_from_url, format_probe_failure,
-        mime_to_ext, sanitize_filename, urlencoding_decode,
+        mime_to_ext, parse_http_date, sanitize_filename, urlencoding_decode,
     };
     use std::time::Duration;
+
+    // -----------------------------------------------------------------------
+    // parse_http_date
+    // -----------------------------------------------------------------------
+
+    /// 三种 HTTP 日期格式指向同一时刻（784111777 = 1994-11-06T08:49:37Z）。
+    #[test]
+    fn parse_http_date_accepts_all_three_http_formats() {
+        let expected = std::time::UNIX_EPOCH + Duration::from_secs(784_111_777);
+        for s in [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+        ] {
+            assert_eq!(parse_http_date(s), Some(expected), "format: {s}");
+        }
+    }
+
+    /// 星期与日期不符的头（现实中偶见）不应导致整个时间戳被拒绝。
+    /// 2025-10-21 实为周二，此处故意标注 Wed。
+    #[test]
+    fn parse_http_date_ignores_mismatched_weekday() {
+        let expected = std::time::UNIX_EPOCH + Duration::from_secs(1_761_031_680);
+        assert_eq!(
+            parse_http_date("Wed, 21 Oct 2025 07:28:00 GMT"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn parse_http_date_rejects_garbage_and_pre_epoch() {
+        assert_eq!(parse_http_date(""), None);
+        assert_eq!(parse_http_date("not a date"), None);
+        assert_eq!(parse_http_date("2025-01-01T00:00:00Z"), None);
+        // Unix 纪元之前的时间无法表示为 SystemTime 偏移，须整体放弃。
+        assert_eq!(parse_http_date("Wed, 01 Jan 1902 00:00:00 GMT"), None);
+    }
 
     // -----------------------------------------------------------------------
     // sanitize_filename
