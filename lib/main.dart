@@ -342,6 +342,7 @@ class _FluxDownAppState extends State<FluxDownApp>
   late final LocaleNotifier _localeNotifier;
   final _navigatorKey = GlobalKey<NavigatorState>();
   final _settingsForExternal = SettingsProvider(enableFileAssoc: false);
+  late final String? _appMenuLanguage;
 
   /// MethodChannel for receiving args from second instances (single-instance).
   static const _singleInstanceChannel = MethodChannel(
@@ -437,6 +438,12 @@ class _FluxDownAppState extends State<FluxDownApp>
     // file while the app is already running), the native C++ layer sends
     // the command-line args here via MethodChannel.
     _singleInstanceChannel.setMethodCallHandler(_handleSecondInstance);
+
+    if (Platform.isMacOS) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_getAppMenuLanguage());
+      });
+    }
 
     logInfo('FluxDownApp', 'initState done');
   }
@@ -1020,10 +1027,42 @@ class _FluxDownAppState extends State<FluxDownApp>
     return app;
   }
 
+  Future<void> _getAppMenuLanguage() async {
+    if (!Platform.isMacOS) return;
+
+    const channel = MethodChannel('com.fluxdown/language');
+    try {
+      final language = await channel.invokeMethod<String>('getAppLanguage');
+      if (!mounted) return;
+      setState(() {
+        _appMenuLanguage = language;
+      });
+    } on PlatformException catch (error, stack) {
+      logError('language', 'failed to get app language', error, stack);
+    } catch (error, stack) {
+      logError('language', 'failed to get app language', error, stack);
+    }
+  }
+
   /// 构建 macOS 应用菜单栏。
   /// [PlatformMenuItemGroup] 将相关菜单项分组，组与组之间自动插入分隔线。
   List<PlatformMenuItem> _buildMacMenus() {
-    final s = _localeNotifier.s;
+    // final s = _localeNotifier.s;
+    //
+    // Mac 菜单栏的语言不受选项控制，不应该通过语言选择器修改菜单栏的语言。
+    // 不应该使用系统的第一语言作为菜单栏的语言。
+    // 例如：此软件支持 zh-Hans, en 两种语言。
+    //       Mac 系统有第一语言 jp，第二语言 zh-Hans。
+    //       此软件因不支持第一语言 jp，回退至 en。
+    //       Mac 系统因第二语言 zh-Hans 受软件支持，将应用的当前运行时语言设置为 zh-Hans。
+    //       此时会出现菜单栏中系统添加的选项为中文，软件注入的选项为英文。
+    // 此处直接获取 Mac 系统为应用指定的语言代码，并绕过语言选择器锁定菜单栏语言。
+    final s = switch (_appMenuLanguage) {
+      // 简体中文
+      "zh-Hans" => S.of("zh"),
+      _ => S.of("en"),
+    };
+
     return [
       // ── FluxDown (应用菜单) ──
       PlatformMenu(

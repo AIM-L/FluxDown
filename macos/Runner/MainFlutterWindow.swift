@@ -77,6 +77,19 @@ class MainFlutterWindow: NSWindow {
             }
         }
 
+        // 获取 macOS 系统为当前应用指定的语言
+        FlutterMethodChannel(
+            name: "com.fluxdown/language",
+            binaryMessenger: flutterViewController.engine.binaryMessenger
+        ).setMethodCallHandler { (_ call: FlutterMethodCall, result: @escaping FlutterResult) in
+            switch call.method {
+            case "getAppLanguage":
+                result(Bundle.main.preferredLocalizations.first)
+            default:
+                result(FlutterMethodNotImplemented)
+            }
+        }
+
         RegisterGeneratedPlugins(registry: flutterViewController)
 
         super.awakeFromNib()
