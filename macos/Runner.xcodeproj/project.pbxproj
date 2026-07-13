@@ -21,19 +21,20 @@
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
+		056E52CCEA199E78A1FB289F /* FloatingBallPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF71FF5310267A6C98D2614A /* FloatingBallPanel.swift */; };
 		331C80D8294CF71000263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C80D7294CF71000263BE5 /* RunnerTests.swift */; };
 		335BBD1B22A9A15E00E9071D /* GeneratedPluginRegistrant.swift in Sources */ = {isa = PBXBuildFile; fileRef = 335BBD1A22A9A15E00E9071D /* GeneratedPluginRegistrant.swift */; };
-		FD01000000000001 /* fluxdown_nmh in CopyFiles */ = {isa = PBXBuildFile; fileRef = FD01000000000002 /* fluxdown_nmh */; settings = {ATTRIBUTES = (); }; };
-		FD02000000000001 /* fluxdown_updater in CopyFiles */ = {isa = PBXBuildFile; fileRef = FD02000000000002 /* fluxdown_updater */; settings = {ATTRIBUTES = (); }; };
-		FDLAL00000000001 /* LaunchAtLogin in Frameworks */ = {isa = PBXBuildFile; productRef = FDLAL00000000002 /* LaunchAtLogin */; };
 		33CC10F12044A3C60003C045 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33CC10F02044A3C60003C045 /* AppDelegate.swift */; };
 		33CC10F32044A3C60003C045 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 33CC10F22044A3C60003C045 /* Assets.xcassets */; };
 		33CC10F62044A3C60003C045 /* MainMenu.xib in Resources */ = {isa = PBXBuildFile; fileRef = 33CC10F42044A3C60003C045 /* MainMenu.xib */; };
 		33CC11132044BFA00003C045 /* MainFlutterWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33CC11122044BFA00003C045 /* MainFlutterWindow.swift */; };
-		056E52CCEA199E78A1FB289F /* FloatingBallPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF71FF5310267A6C98D2614A /* FloatingBallPanel.swift */; };
+		78A318202AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage in Frameworks */ = {isa = PBXBuildFile; productRef = 78A3181F2AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage */; };
 		8C7A7C18C30BC1FBC30E0878 /* PopupWindowHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA56ECEC6A11EA3DCB3BA1A1 /* PopupWindowHost.swift */; };
 		A745AF7170FC8141C255FAD8 /* Pods_Runner.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C2E347290CB42C9D68AE6A35 /* Pods_Runner.framework */; };
 		ED7D327E3E30AFE4D5FED464 /* Pods_RunnerTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2000DC82632F100EE42D96F7 /* Pods_RunnerTests.framework */; };
+		FD01000000000001 /* fluxdown_nmh in Copy NMH to Bundle */ = {isa = PBXBuildFile; fileRef = FD01000000000002 /* fluxdown_nmh */; settings = {ATTRIBUTES = (); }; };
+		FD02000000000001 /* fluxdown_updater in Copy Updater to Bundle */ = {isa = PBXBuildFile; fileRef = FD02000000000002 /* fluxdown_updater */; settings = {ATTRIBUTES = (); }; };
+		FDLAL00000000001 /* LaunchAtLogin in Frameworks */ = {isa = PBXBuildFile; productRef = FDLAL00000000002 /* LaunchAtLogin */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -70,7 +71,7 @@
 			dstPath = "";
 			dstSubfolderSpec = 6;
 			files = (
-				FD01000000000001 /* fluxdown_nmh in CopyFiles */,
+				FD01000000000001 /* fluxdown_nmh in Copy NMH to Bundle */,
 			);
 			name = "Copy NMH to Bundle";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -81,7 +82,7 @@
 			dstPath = "";
 			dstSubfolderSpec = 6;
 			files = (
-				FD02000000000001 /* fluxdown_updater in CopyFiles */,
+				FD02000000000001 /* fluxdown_updater in Copy Updater to Bundle */,
 			);
 			name = "Copy Updater to Bundle";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -95,16 +96,12 @@
 		331C80D7294CF71000263BE5 /* RunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerTests.swift; sourceTree = "<group>"; };
 		333000ED22D3DE5D00554162 /* Warnings.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Warnings.xcconfig; sourceTree = "<group>"; };
 		335BBD1A22A9A15E00E9071D /* GeneratedPluginRegistrant.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = GeneratedPluginRegistrant.swift; sourceTree = "<group>"; };
-		33CC10ED2044A3C60003C045 /* flux_down.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = flux_down.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		33CC10ED2044A3C60003C045 /* FluxDown.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FluxDown.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		33CC10F02044A3C60003C045 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		33CC10F22044A3C60003C045 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = Runner/Assets.xcassets; sourceTree = "<group>"; };
 		33CC10F52044A3C60003C045 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.xib; name = Base; path = Base.lproj/MainMenu.xib; sourceTree = "<group>"; };
 		33CC10F72044A3C60003C045 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = Runner/Info.plist; sourceTree = "<group>"; };
-		FD01000000000002 /* fluxdown_nmh */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; name = fluxdown_nmh; path = "../target/release/fluxdown_nmh"; sourceTree = SOURCE_ROOT; };
-		FD02000000000002 /* fluxdown_updater */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; name = fluxdown_updater; path = "../target/release/fluxdown_updater"; sourceTree = SOURCE_ROOT; };
 		33CC11122044BFA00003C045 /* MainFlutterWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainFlutterWindow.swift; sourceTree = "<group>"; };
-		FF71FF5310267A6C98D2614A /* FloatingBallPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingBallPanel.swift; sourceTree = "<group>"; };
-		AA56ECEC6A11EA3DCB3BA1A1 /* PopupWindowHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PopupWindowHost.swift; sourceTree = "<group>"; };
 		33CEB47222A05771004F2AC0 /* Flutter-Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "Flutter-Debug.xcconfig"; sourceTree = "<group>"; };
 		33CEB47422A05771004F2AC0 /* Flutter-Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "Flutter-Release.xcconfig"; sourceTree = "<group>"; };
 		33CEB47722A0578A004F2AC0 /* Flutter-Generated.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = "Flutter-Generated.xcconfig"; path = "ephemeral/Flutter-Generated.xcconfig"; sourceTree = "<group>"; };
@@ -112,12 +109,17 @@
 		33E51914231749380026EE4D /* Release.entitlements */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.entitlements; path = Release.entitlements; sourceTree = "<group>"; };
 		33E5194F232828860026EE4D /* AppInfo.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = AppInfo.xcconfig; sourceTree = "<group>"; };
 		55D9D490FE997A6CDE6B7C05 /* Pods-Runner.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.release.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"; sourceTree = "<group>"; };
+		78E0A7A72DC9AD7400C4905E /* FlutterGeneratedPluginSwiftPackage */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = FlutterGeneratedPluginSwiftPackage; path = ephemeral/Packages/FlutterGeneratedPluginSwiftPackage; sourceTree = "<group>"; };
 		7AFA3C8E1D35360C0083082E /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Release.xcconfig; sourceTree = "<group>"; };
 		9740EEB21CF90195004384FC /* Debug.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
 		A179576B10EA3EF94829C7B7 /* Pods-Runner.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.debug.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.debug.xcconfig"; sourceTree = "<group>"; };
+		AA56ECEC6A11EA3DCB3BA1A1 /* PopupWindowHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PopupWindowHost.swift; sourceTree = "<group>"; };
 		C2E347290CB42C9D68AE6A35 /* Pods_Runner.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Runner.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		DBF9A636A865E5132F07CE14 /* Pods-RunnerTests.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.debug.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.debug.xcconfig"; sourceTree = "<group>"; };
 		EB0F7CD84491F268D2B83CE2 /* Pods-RunnerTests.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.release.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.release.xcconfig"; sourceTree = "<group>"; };
+		FD01000000000002 /* fluxdown_nmh */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; name = fluxdown_nmh; path = ../target/release/fluxdown_nmh; sourceTree = SOURCE_ROOT; };
+		FD02000000000002 /* fluxdown_updater */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; name = fluxdown_updater; path = ../target/release/fluxdown_updater; sourceTree = SOURCE_ROOT; };
+		FF71FF5310267A6C98D2614A /* FloatingBallPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingBallPanel.swift; sourceTree = "<group>"; };
 		FF99364378639FE3368F3403 /* Pods-Runner.profile.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.profile.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.profile.xcconfig"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -134,6 +136,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				78A318202AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage in Frameworks */,
 				A745AF7170FC8141C255FAD8 /* Pods_Runner.framework in Frameworks */,
 				FDLAL00000000001 /* LaunchAtLogin in Frameworks */,
 			);
@@ -174,19 +177,10 @@
 			);
 			sourceTree = "<group>";
 		};
-		FD01000000000004 /* NMH */ = {
-			isa = PBXGroup;
-			children = (
-				FD01000000000002 /* fluxdown_nmh */,
-				FD02000000000002 /* fluxdown_updater */,
-			);
-			name = NMH;
-			sourceTree = "<group>";
-		};
 		33CC10EE2044A3C60003C045 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				33CC10ED2044A3C60003C045 /* flux_down.app */,
+				33CC10ED2044A3C60003C045 /* FluxDown.app */,
 				331C80D5294CF71000263BE5 /* RunnerTests.xctest */,
 			);
 			name = Products;
@@ -206,6 +200,7 @@
 		33CEB47122A05771004F2AC0 /* Flutter */ = {
 			isa = PBXGroup;
 			children = (
+				78E0A7A72DC9AD7400C4905E /* FlutterGeneratedPluginSwiftPackage */,
 				335BBD1A22A9A15E00E9071D /* GeneratedPluginRegistrant.swift */,
 				33CEB47222A05771004F2AC0 /* Flutter-Debug.xcconfig */,
 				33CEB47422A05771004F2AC0 /* Flutter-Release.xcconfig */,
@@ -239,7 +234,6 @@
 				EB0F7CD84491F268D2B83CE2 /* Pods-RunnerTests.release.xcconfig */,
 				0FB305D860AF8BB78807EC08 /* Pods-RunnerTests.profile.xcconfig */,
 			);
-			name = Pods;
 			path = Pods;
 			sourceTree = "<group>";
 		};
@@ -250,6 +244,15 @@
 				2000DC82632F100EE42D96F7 /* Pods_RunnerTests.framework */,
 			);
 			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		FD01000000000004 /* NMH */ = {
+			isa = PBXGroup;
+			children = (
+				FD01000000000002 /* fluxdown_nmh */,
+				FD02000000000002 /* fluxdown_updater */,
+			);
+			name = NMH;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -289,7 +292,7 @@
 				FD02000000000005 /* Build fluxdown_updater */,
 				FD02000000000003 /* Copy Updater to Bundle */,
 				EE0F816DB1BAF1F9CF6EB570 /* [CP] Embed Pods Frameworks */,
-				FDLAL00000000004 /* Copy Launch at Login Helper */,
+				FDLAL00000000004 /* Copy "Launch at Login Helper" */,
 			);
 			buildRules = (
 			);
@@ -298,10 +301,11 @@
 			);
 			name = Runner;
 			packageProductDependencies = (
+				78A3181F2AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage */,
 				FDLAL00000000002 /* LaunchAtLogin */,
 			);
 			productName = Runner;
-			productReference = 33CC10ED2044A3C60003C045 /* flux_down.app */;
+			productReference = 33CC10ED2044A3C60003C045 /* FluxDown.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -344,10 +348,11 @@
 				Base,
 			);
 			mainGroup = 33CC10E42044A3C60003C045;
-			productRefGroup = 33CC10EE2044A3C60003C045 /* Products */;
 			packageReferences = (
+				781AD8BC2B33823900A9FFBB /* XCLocalSwiftPackageReference "FlutterGeneratedPluginSwiftPackage" */,
 				FDLAL00000000003 /* XCRemoteSwiftPackageReference "LaunchAtLogin" */,
 			);
+			productRefGroup = 33CC10EE2044A3C60003C045 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -395,65 +400,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "echo \"$PRODUCT_NAME.app\" > \"$PROJECT_DIR\"/Flutter/ephemeral/.app_filename && \"$FLUTTER_ROOT\"/packages/flutter_tools/bin/macos_assemble.sh embed\n";
-		};
-		FDLAL00000000004 /* Copy Launch at Login Helper */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Copy \"Launch at Login Helper\"";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "\"${BUILT_PRODUCTS_DIR}/LaunchAtLogin_LaunchAtLogin.bundle/Contents/Resources/copy-helper-swiftpm.sh\"\n";
-			showEnvVarsInLog = 0;
-		};
-		FD02000000000005 /* Build fluxdown_updater */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Build fluxdown_updater";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-				"$(SRCROOT)/../target/release/fluxdown_updater",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "set -e\ncd \"$SRCROOT/..\"\ncargo build -p fluxdown_updater --release\ncodesign --force --sign - \"$SRCROOT/../target/release/fluxdown_updater\"\n";
-			showEnvVarsInLog = 0;
-		};
-		FD01000000000005 /* Build fluxdown_nmh */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Build fluxdown_nmh";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-				"$(SRCROOT)/../target/release/fluxdown_nmh",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "set -e\ncd \"$SRCROOT/..\"\ncargo build -p fluxdown_nmh --release\ncodesign --force --sign - \"$SRCROOT/../target/release/fluxdown_nmh\"\n";
 		};
 		33CC111E2044C6BF0003C045 /* ShellScript */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -534,6 +480,65 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		FD01000000000005 /* Build fluxdown_nmh */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build fluxdown_nmh";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/../target/release/fluxdown_nmh",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\ncd \"$SRCROOT/..\"\ncargo build -p fluxdown_nmh --release\ncodesign --force --sign - \"$SRCROOT/../target/release/fluxdown_nmh\"\n";
+		};
+		FD02000000000005 /* Build fluxdown_updater */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build fluxdown_updater";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/../target/release/fluxdown_updater",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\ncd \"$SRCROOT/..\"\ncargo build -p fluxdown_updater --release\ncodesign --force --sign - \"$SRCROOT/../target/release/fluxdown_updater\"\n";
+			showEnvVarsInLog = 0;
+		};
+		FDLAL00000000004 /* Copy "Launch at Login Helper" */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Copy \"Launch at Login Helper\"";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${BUILT_PRODUCTS_DIR}/LaunchAtLogin_LaunchAtLogin.bundle/Contents/Resources/copy-helper-swiftpm.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
@@ -673,6 +678,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MACOSX_DEPLOYMENT_TARGET = 10.15;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				SDKROOT = macosx;
@@ -755,6 +761,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MACOSX_DEPLOYMENT_TARGET = 10.15;
 				MTL_ENABLE_DEBUG_INFO = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -805,6 +812,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MACOSX_DEPLOYMENT_TARGET = 10.15;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				SDKROOT = macosx;
@@ -913,6 +921,13 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		781AD8BC2B33823900A9FFBB /* XCLocalSwiftPackageReference "FlutterGeneratedPluginSwiftPackage" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Flutter/ephemeral/Packages/FlutterGeneratedPluginSwiftPackage;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCRemoteSwiftPackageReference section */
 		FDLAL00000000003 /* XCRemoteSwiftPackageReference "LaunchAtLogin" */ = {
 			isa = XCRemoteSwiftPackageReference;
@@ -925,6 +940,10 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		78A3181F2AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = FlutterGeneratedPluginSwiftPackage;
+		};
 		FDLAL00000000002 /* LaunchAtLogin */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = FDLAL00000000003 /* XCRemoteSwiftPackageReference "LaunchAtLogin" */;
